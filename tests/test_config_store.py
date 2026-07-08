@@ -10,10 +10,12 @@ from curatorx.config_store import (
     load_dotenv_file,
     load_merged_settings,
     model_looks_openai,
+    reconcile_llm_provider,
     resolve_llm_base_url,
     resolve_llm_model,
     save_settings,
     secret_field_sources,
+    validate_llm_settings,
 )
 
 
@@ -31,15 +33,56 @@ class ConfigStoreTests(unittest.TestCase):
         settings = Settings.from_mapping({"plex_url": "x", "unknown": "y"})
         self.assertEqual(settings.plex_url, "x")
 
-    def test_env_overrides_file(self) -> None:
+    def test_env_overrides_file_when_field_not_in_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             save_settings(data_dir, Settings(llm_api_key="from-file"))
             os.environ["LLM_API_KEY"] = "from-env"
             try:
                 loaded = load_merged_settings(data_dir)
-                self.assertEqual(loaded.llm_api_key, "from-env")
+                self.assertEqual(loaded.llm_api_key, "from-file")
             finally:
+                del os.environ["LLM_API_KEY"]
+
+    def test_env_fills_missing_file_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            os.environ["LLM_PROVIDER"] = "openai_compatible"
+            os.environ["LLM_MODEL"] = "gpt-4o-mini"
+            try:
+                loaded = load_merged_settings(data_dir)
+                self.assertEqual(loaded.llm_provider, "openai_compatible")
+                self.assertEqual(loaded.llm_model, "gpt-4o-mini")
+            finally:
+                del os.environ["LLM_PROVIDER"]
+                del os.environ["LLM_MODEL"]
+
+    def test_file_overrides_env_for_llm_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            save_settings(
+                data_dir,
+                Settings(
+                    llm_provider="anthropic",
+                    llm_base_url="https://api.anthropic.com",
+                    llm_model="claude-sonnet-4-6",
+                    llm_api_key="file-key",
+                ),
+            )
+            os.environ["LLM_PROVIDER"] = "openai_compatible"
+            os.environ["LLM_BASE_URL"] = "https://api.openai.com/v1"
+            os.environ["LLM_MODEL"] = "gpt-4o-mini"
+            os.environ["LLM_API_KEY"] = "env-key"
+            try:
+                loaded = load_merged_settings(data_dir)
+                self.assertEqual(loaded.llm_provider, "anthropic")
+                self.assertEqual(loaded.llm_base_url, "https://api.anthropic.com")
+                self.assertEqual(loaded.llm_model, "claude-sonnet-4-6")
+                self.assertEqual(loaded.llm_api_key, "file-key")
+            finally:
+                del os.environ["LLM_PROVIDER"]
+                del os.environ["LLM_BASE_URL"]
+                del os.environ["LLM_MODEL"]
                 del os.environ["LLM_API_KEY"]
 
     def test_empty_env_does_not_clear_file_secret(self) -> None:
@@ -60,9 +103,20 @@ class ConfigStoreTests(unittest.TestCase):
             os.environ["LLM_API_KEY"] = "env-key"
             try:
                 sources = secret_field_sources(data_dir)
-                self.assertEqual(sources["llm_api_key"], "env")
                 self.assertEqual(sources["tmdb_api_key"], "file")
+                self.assertEqual(sources["llm_api_key"], "env")
                 self.assertEqual(sources["plex_token"], "")
+            finally:
+                del os.environ["LLM_API_KEY"]
+
+    def test_secret_field_sources_prefers_file_over_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            save_settings(data_dir, Settings(llm_api_key="file-key"))
+            os.environ["LLM_API_KEY"] = "env-key"
+            try:
+                sources = secret_field_sources(data_dir)
+                self.assertEqual(sources["llm_api_key"], "file")
             finally:
                 del os.environ["LLM_API_KEY"]
 
@@ -106,6 +160,47 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertEqual(loaded.llm_model, "claude-sonnet-4-6")
             self.assertEqual(loaded.llm_base_url, "https://api.anthropic.com")
 
+    def test_reconcile_llm_provider_from_anthropic_api_key(self) -> None:
+        settings = Settings(
+            llm_provider="openai",
+            llm_base_url="https://api.openai.com/v1",
+            llm_model="gpt-4o-mini",
+            llm_api_key="sk-ant-test-key",
+        )
+        reconciled = reconcile_llm_provider(settings)
+        self.assertEqual(reconciled.llm_provider, "anthropic")
+
+    def test_load_merged_settings_reconciles_anthropic_key_with_openai_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            save_settings(
+                data_dir,
+                Settings(
+                    llm_provider="openai",
+                    llm_base_url="https://api.openai.com/v1",
+                    llm_model="gpt-4o-mini",
+                    llm_api_key="sk-ant-test-key",
+                ),
+            )
+            loaded = load_merged_settings(data_dir)
+            self.assertEqual(loaded.llm_provider, "anthropic")
+            self.assertEqual(loaded.llm_model, "claude-sonnet-4-6")
+            self.assertEqual(loaded.llm_base_url, "https://api.anthropic.com")
+
+    def test_validate_llm_settings_flags_openai_provider_with_anthropic_key(self) -> None:
+        settings = Settings(
+            llm_provider="openai",
+            llm_api_key="sk-ant-test-key",
+        )
+        message = validate_llm_settings(settings)
+        self.assertIsNotNone(message)
+        self.assertIn("Anthropic", message or "")
+
+    def test_validate_llm_settings_requires_api_key(self) -> None:
+        message = validate_llm_settings(Settings(llm_provider="openai"))
+        self.assertIsNotNone(message)
+        self.assertIn("API key", message or "")
+
     def test_resolve_llm_base_url_anthropic_without_chat_completions(self) -> None:
         self.assertEqual(resolve_llm_base_url("anthropic", ""), "https://api.anthropic.com")
         self.assertEqual(
@@ -132,6 +227,23 @@ class ConfigStoreTests(unittest.TestCase):
                 else:
                     os.environ["LLM_API_KEY"] = original
 
+    def test_load_dotenv_file_skips_empty_and_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_env = Path(tmp) / "empty.env"
+            empty_env.write_text("# only comments\n\n", encoding="utf-8")
+            fallback_env = Path(tmp) / "fallback.env"
+            fallback_env.write_text("LLM_API_KEY=fallback-key\n", encoding="utf-8")
+            original = os.environ.pop("LLM_API_KEY", None)
+            try:
+                load_dotenv_file(empty_env)
+                self.assertNotIn("LLM_API_KEY", os.environ)
+                load_dotenv_file(fallback_env)
+                self.assertEqual(os.environ["LLM_API_KEY"], "fallback-key")
+            finally:
+                if original is None:
+                    os.environ.pop("LLM_API_KEY", None)
+                else:
+                    os.environ["LLM_API_KEY"] = original
 
 if __name__ == "__main__":
     unittest.main()

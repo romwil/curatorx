@@ -85,8 +85,10 @@ def semantic_search(
     scores: List[Tuple[int, float]] = []
     items = {int(row["id"]): row for row in db.all_library_items()}
     for item_id, vector in db.get_embeddings():
-        if media_type and items.get(item_id, {}).get("media_type") != media_type:
-            continue
+        if media_type:
+            row = items.get(item_id)
+            if row is None or row["media_type"] != media_type:
+                continue
         score = cosine_similarity(query_vector, vector)
         scores.append((item_id, score))
     scores.sort(key=lambda item: item[1], reverse=True)

@@ -107,20 +107,47 @@ class ActiveLensPayload(BaseModel):
     lens_id: str
 
 
+class PersonaPresetSummary(BaseModel):
+    id: str
+    name: str
+    description: str
+    val_bro_prof: float
+    val_dipl_snark: float
+    val_pass_auto: float
+    identity_blurb: str = ""
+
+
 class PersonaMetrics(BaseModel):
     metric_id: str = "current_profile"
     curator_name: str = "Curator"
+    persona_identity: str = ""
     val_bro_prof: float = Field(default=0.5, ge=0.0, le=1.0)
     val_dipl_snark: float = Field(default=0.5, ge=0.0, le=1.0)
     val_pass_auto: float = Field(default=0.5, ge=0.0, le=1.0)
+    persona_preset_id: Optional[str] = None
+    persona_prompt_override: Optional[str] = None
+    persona_mode: str = "sliders"
+    behavioral_prompt: str = ""
+    assembled_prompt: str = ""
     last_modified: Optional[str] = None
 
 
 class PersonaMetricsUpdate(BaseModel):
     curator_name: Optional[str] = None
+    persona_identity: Optional[str] = None
     val_bro_prof: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     val_dipl_snark: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     val_pass_auto: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    persona_preset_id: Optional[str] = None
+    persona_prompt_override: Optional[str] = None
+    clear_persona_override: bool = False
+    apply_preset: Optional[str] = None
+
+
+class PersonaPreviewResponse(BaseModel):
+    persona_mode: str
+    behavioral_prompt: str
+    assembled_prompt: str
 
 
 class SystemConfigEntry(BaseModel):

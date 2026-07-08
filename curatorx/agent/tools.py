@@ -514,22 +514,12 @@ async def execute_confirmed_action(db: Database, settings: Settings, token: str)
 
 
 def _persona_prompt_block(db: Database) -> str:
+    from curatorx.persona import build_persona_prompt, persona_row_to_dict
+
     persona = db.get_persona()
     if not persona:
         return ""
-    name = str(persona["curator_name"] or "Curator")
-    bro = float(persona["val_bro_prof"] or 0.5)
-    snark = float(persona["val_dipl_snark"] or 0.5)
-    auto = float(persona["val_pass_auto"] or 0.5)
-    vocab = "casual and colloquial" if bro < 0.35 else ("professorial and precise" if bro > 0.65 else "balanced")
-    friction = "diplomatic and supportive" if snark < 0.35 else ("snarky and blunt" if snark > 0.65 else "even-tempered")
-    autonomy = "passive — suggest only" if auto < 0.35 else ("autonomous — propose concrete next steps" if auto > 0.65 else "collaborative")
-    return (
-        f"Your name is {name}. "
-        f"Vocabulary density: {vocab} ({bro:.2f}). "
-        f"Interaction friction: {friction} ({snark:.2f}). "
-        f"Automation autonomy: {autonomy} ({auto:.2f}).\n"
-    )
+    return build_persona_prompt(persona_row_to_dict(persona))
 
 
 def build_system_prompt(db: Database, lens_id: Optional[str] = None) -> str:

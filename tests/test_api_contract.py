@@ -16,6 +16,7 @@ class ApiContractTests(unittest.TestCase):
         self._tmpdir = tempfile.TemporaryDirectory()
         os.environ["DATA_DIR"] = self._tmpdir.name
         os.environ["CURATORX_SKIP_DOTENV"] = "1"
+        os.environ["LLM_PROVIDER"] = "ollama"
         import curatorx.web.jobs as jobs
 
         jobs._manager = None
@@ -29,6 +30,7 @@ class ApiContractTests(unittest.TestCase):
 
         jobs._manager = None
         os.environ.pop("CURATORX_SKIP_DOTENV", None)
+        os.environ.pop("LLM_PROVIDER", None)
         self._tmpdir.cleanup()
 
     def test_health_includes_version(self) -> None:
@@ -51,6 +53,8 @@ class ApiContractTests(unittest.TestCase):
         body = resp.json()
         self.assertEqual(body["curator_name"], "Curator")
         self.assertEqual(body["val_bro_prof"], 0.5)
+        self.assertEqual(body["persona_mode"], "sliders")
+        self.assertIn("assembled_prompt", body)
 
     def test_create_lens_and_switch_active(self) -> None:
         create = self.client.post(
@@ -77,6 +81,25 @@ class ApiContractTests(unittest.TestCase):
             json={"message": "hello", "lens_id": "does-not-exist"},
         )
         self.assertEqual(resp.status_code, 404)
+        body = resp.json()
+        self.assertIn("detail", body)
+
+    def test_chat_returns_json_error_on_llm_failure(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        with patch("curatorx.web.app.CuratorAgent") as agent_cls:
+            agent = AsyncMock()
+            agent.run = AsyncMock(side_effect=RuntimeError("LLM provider unavailable"))
+            agent_cls.return_value = agent
+
+            resp = self.client.post(
+                "/api/chat",
+                json={"message": "hello"},
+            )
+            self.assertEqual(resp.status_code, 500)
+            body = resp.json()
+            self.assertIn("detail", body)
+            self.assertIn("LLM provider unavailable", body["detail"])
 
     def test_wizard_status_shape(self) -> None:
         resp = self.client.get("/api/setup/wizard")
@@ -84,11 +107,10 @@ class ApiContractTests(unittest.TestCase):
         body = resp.json()
         self.assertIn("current_step", body)
         self.assertIn("steps", body)
-        self.assertIn("identity_llm", body["steps"])
-        self.assertIn("media_core", body["steps"])
-        self.assertIn("automation", body["steps"])
-        self.assertIn("persona", body["steps"])
-        self.assertIn("optional_services", body["steps"])
+        self.assertIn("identity_seed", body["steps"])
+        self.assertIn("infrastructure", body["steps"])
+        self.assertIn("dropdown_mapping", body["steps"])
+        self.assertNotIn("persona", body["steps"])
         self.assertFalse(body["onboarding_complete"])
 
     def test_llm_test_requires_api_key(self) -> None:
@@ -134,6 +156,13 @@ class ApiContractTests(unittest.TestCase):
         body = resp.json()
         self.assertIn("certifications", body)
         self.assertIn("llm", body["certifications"])
+
+    def test_active_context_defaults_to_general(self) -> None:
+        resp = self.client.get("/api/context/active")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["context_hash"], "general")
+        self.assertEqual(body["inferred_label"], "General Exploration")
 
     def test_service_integration_certified_on_llm_success(self) -> None:
         from unittest.mock import AsyncMock, patch
@@ -294,6 +323,113 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(db.get_config("llm_provider"), "openrouter")
         self.assertEqual(db.get_config("llm_base_url"), "https://openrouter.ai/api/v1")
         self.assertEqual(db.get_config("llm_model"), "deepseek-chat")
+
+    def test_saved_llm_settings_override_env_on_get(self) -> None:
+        os.environ["LLM_PROVIDER"] = "openai_compatible"
+        os.environ["LLM_BASE_URL"] = "https://api.openai.com/v1"
+        os.environ["LLM_MODEL"] = "gpt-4o-mini"
+        try:
+            put = self.client.put(
+                "/api/settings",
+                json={
+                    "llm_provider": "anthropic",
+                    "llm_base_url": "https://api.anthropic.com",
+                    "llm_model": "claude-sonnet-4-6",
+                    "llm_api_key": "test-key",
+                },
+            )
+            self.assertEqual(put.status_code, 200)
+            self.assertEqual(put.json()["llm_provider"], "anthropic")
+            self.assertEqual(put.json()["llm_model"], "claude-sonnet-4-6")
+
+            get = self.client.get("/api/settings")
+            self.assertEqual(get.status_code, 200)
+            body = get.json()
+            self.assertEqual(body["llm_provider"], "anthropic")
+            self.assertEqual(body["llm_base_url"], "https://api.anthropic.com")
+            self.assertEqual(body["llm_model"], "claude-sonnet-4-6")
+            self.assertTrue(body["llm_api_key_set"])
+            self.assertEqual(body["llm_api_key_source"], "file")
+        finally:
+            del os.environ["LLM_PROVIDER"]
+            del os.environ["LLM_BASE_URL"]
+            del os.environ["LLM_MODEL"]
+
+    def test_chat_threads_crud_contract(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        create = self.client.post("/api/chat/threads", json={"thread_title": "Neo-noir hunt"})
+        self.assertEqual(create.status_code, 200)
+        created = create.json()
+        self.assertIn("session_id", created)
+        self.assertEqual(created["thread_title"], "Neo-noir hunt")
+        session_id = created["session_id"]
+
+        listed = self.client.get("/api/chat/threads")
+        self.assertEqual(listed.status_code, 200)
+        threads = listed.json()
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["id"], session_id)
+        self.assertEqual(threads[0]["thread_title"], "Neo-noir hunt")
+
+        with patch("curatorx.web.app.CuratorAgent") as agent_cls:
+            agent = AsyncMock()
+            agent.run = AsyncMock(
+                return_value={
+                    "session_id": session_id,
+                    "lens_id": "general",
+                    "message": {
+                        "id": "assistant-1",
+                        "role": "assistant",
+                        "blocks": [{"type": "text", "content": "Try Blade Runner."}],
+                        "lens_id": "general",
+                    },
+                    "pending_tokens": [],
+                }
+            )
+            agent_cls.return_value = agent
+
+            chat = self.client.post(
+                "/api/chat",
+                json={"message": "Find neo-noir films", "session_id": session_id},
+            )
+            self.assertEqual(chat.status_code, 200)
+
+            import curatorx.web.jobs as jobs
+
+            db = jobs.get_job_manager().db
+            db.save_chat_message(
+                session_id,
+                "user-1",
+                "user",
+                [{"type": "text", "content": "Find neo-noir films"}],
+            )
+            db.save_chat_message(
+                session_id,
+                "assistant-1",
+                "assistant",
+                [{"type": "text", "content": "Try Blade Runner."}],
+            )
+
+        messages = self.client.get(f"/api/chat/threads/{session_id}/messages")
+        self.assertEqual(messages.status_code, 200)
+        body = messages.json()
+        self.assertEqual(body["session_id"], session_id)
+        self.assertGreaterEqual(len(body["messages"]), 1)
+
+        renamed = self.client.patch(
+            f"/api/chat/threads/{session_id}",
+            json={"thread_title": "Rainy city picks"},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["thread_title"], "Rainy city picks")
+
+        deleted = self.client.delete(f"/api/chat/threads/{session_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(deleted.json()["deleted"])
+
+        missing = self.client.get(f"/api/chat/threads/{session_id}/messages")
+        self.assertEqual(missing.status_code, 404)
 
 
 if __name__ == "__main__":

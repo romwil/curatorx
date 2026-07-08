@@ -195,6 +195,7 @@ Toggle with expansion hotkey, `/expand`, or viewport card click. Details in [Des
 | [Onboarding](docs/ONBOARDING.md) | First-run checklist |
 | [Docker / Unraid](docs/DOCKER.md) | Container deployment |
 | [Web UI](docs/WEB_UI.md) | Routes and API highlights |
+| [Testing](docs/TESTING.md) | Unit tests, Playwright E2E, CI |
 
 ---
 

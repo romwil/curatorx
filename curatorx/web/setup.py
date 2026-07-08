@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
 from curatorx.agent.providers import get_chat_provider
-from curatorx.config_store import Settings, resolve_llm_base_url, resolve_llm_model
+from curatorx.config_store import Settings, resolve_llm_base_url, resolve_llm_model, validate_llm_settings
 from curatorx.connectors.fanart import FanartClient
 from curatorx.connectors.plex import PlexClient
 from curatorx.connectors.radarr import RadarrClient
@@ -40,10 +40,9 @@ CERTIFIED_SERVICES = (
 )
 
 ONBOARDING_HINTS = [
-    "Provide your local environment paths so I can read your storage structures.",
-    "Connect Plex next — I'll map your movie and TV libraries to the right sections.",
-    "Link Radarr and Sonarr so I can propose adds with your confirmation.",
-    "Tune my voice with the persona sliders, then add optional metadata services.",
+    "Name me — I'll adapt my voice as we explore your library together.",
+    "Verify LLM, Plex, Radarr, and Sonarr so I can read and act on your collection.",
+    "Pick your movie and TV Plex libraries — I'll handle the rest automatically.",
 ]
 
 PLEX_TYPE_ALIASES = {
@@ -202,6 +201,9 @@ def test_llm(
         llm_api_key=str(llm_api_key or "").strip(),
         llm_model=model,
     )
+    config_error = validate_llm_settings(settings)
+    if config_error:
+        return {"ok": False, "message": config_error}
     try:
         asyncio.run(_ping_llm(settings))
         return {
@@ -245,6 +247,17 @@ def build_certifications_status(db: Database) -> Dict[str, Any]:
     return {"services": services}
 
 
+def _incoming_secret_changed(
+    incoming: Mapping[str, Any],
+    field: str,
+    before_value: str,
+) -> bool:
+    incoming_value = str(incoming.get(field) or "").strip()
+    if not incoming_value:
+        return False
+    return incoming_value != str(before_value or "").strip()
+
+
 def invalidate_certifications_on_settings_change(
     db: Database,
     before: Settings,
@@ -256,31 +269,31 @@ def invalidate_certifications_on_settings_change(
             before.llm_base_url != after.llm_base_url
             or before.llm_provider != after.llm_provider
             or before.llm_model != after.llm_model
-            or bool(str(incoming.get("llm_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "llm_api_key", before.llm_api_key)
         ),
         "plex": (
             before.plex_url != after.plex_url
-            or bool(str(incoming.get("plex_token") or "").strip())
+            or _incoming_secret_changed(incoming, "plex_token", before.plex_token)
         ),
         "radarr": (
             before.radarr_url != after.radarr_url
-            or bool(str(incoming.get("radarr_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "radarr_api_key", before.radarr_api_key)
         ),
         "sonarr": (
             before.sonarr_url != after.sonarr_url
-            or bool(str(incoming.get("sonarr_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "sonarr_api_key", before.sonarr_api_key)
         ),
         "tmdb": (
             before.tmdb_api_key != after.tmdb_api_key
-            or bool(str(incoming.get("tmdb_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "tmdb_api_key", before.tmdb_api_key)
         ),
         "fanart": (
             before.fanart_api_key != after.fanart_api_key
-            or bool(str(incoming.get("fanart_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "fanart_api_key", before.fanart_api_key)
         ),
         "tautulli": (
             before.tautulli_url != after.tautulli_url
-            or bool(str(incoming.get("tautulli_api_key") or "").strip())
+            or _incoming_secret_changed(incoming, "tautulli_api_key", before.tautulli_api_key)
         ),
     }
     for service_name, changed in checks.items():
@@ -295,37 +308,39 @@ def build_wizard_status(settings: Settings, db: Database) -> Dict[str, Any]:
     radarr_verified = _integration_certified(db, "radarr")
     sonarr_verified = _integration_certified(db, "sonarr")
     persona = db.get_persona()
-    persona_complete = bool(persona and str(persona["curator_name"] or "").strip())
+    identity_complete = bool(persona and str(persona["curator_name"] or "").strip())
 
-    identity_complete = llm_verified and persona_complete
-    media_complete = plex_verified and sections_set
-    automation_complete = radarr_verified and sonarr_verified
+    infrastructure_complete = (
+        llm_verified and plex_verified and radarr_verified and sonarr_verified
+    )
+    mapping_complete = plex_verified and sections_set
 
     steps = {
-        "identity_llm": {"complete": identity_complete, "llm_verified": llm_verified},
-        "media_core": {
-            "complete": media_complete,
-            "plex_verified": plex_verified,
-            "sections_set": sections_set,
+        "identity_seed": {
+            "complete": identity_complete,
+            "curator_name_set": identity_complete,
         },
-        "automation": {
-            "complete": automation_complete,
+        "infrastructure": {
+            "complete": infrastructure_complete,
+            "llm_verified": llm_verified,
+            "plex_verified": plex_verified,
             "radarr_verified": radarr_verified,
             "sonarr_verified": sonarr_verified,
         },
-        "persona": {"complete": persona_complete},
-        "optional_services": {"complete": settings.onboarding_complete},
+        "dropdown_mapping": {
+            "complete": mapping_complete,
+            "plex_verified": plex_verified,
+            "sections_set": sections_set,
+        },
     }
 
     if settings.onboarding_complete:
-        current_step = 5
-    elif automation_complete:
-        current_step = 4
-    elif media_complete:
         current_step = 3
-    elif identity_complete:
+    elif mapping_complete and infrastructure_complete and identity_complete:
         current_step = 2
-    elif llm_verified:
+    elif infrastructure_complete:
+        current_step = 2
+    elif identity_complete:
         current_step = 1
     else:
         current_step = 0
@@ -374,6 +389,8 @@ def resolve_test_payload(payload: Mapping[str, Any], existing: Settings) -> Dict
             merged[field] = getattr(existing, field)
     if not str(merged.get("llm_provider") or "").strip():
         merged["llm_provider"] = existing.llm_provider
+    if not str(merged.get("llm_model") or "").strip():
+        merged["llm_model"] = existing.llm_model
     return merged
 
 

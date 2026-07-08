@@ -42,14 +42,26 @@ def _assistant_message_from_response(response: Mapping[str, Any]) -> Dict[str, A
 def _extract_text(response: Mapping[str, Any]) -> str:
     if "choices" in response:
         message = response["choices"][0]["message"]
-        return str(message.get("content") or "")
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+            return "".join(parts)
+        return str(content or "")
     if "content" in response:
         parts = []
         for block in response.get("content") or []:
-            if block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text") or ""))
         return "".join(parts)
     return ""
+
+
+MAX_TOOL_ROUNDS = 8
 
 
 class CuratorAgent:
@@ -97,6 +109,7 @@ class CuratorAgent:
             self.db.save_chat_message(
                 session_id, user_id, "user", [{"type": "text", "content": user_message}], lens_id=self.lens_id
             )
+            self.db.maybe_auto_title_thread(session_id, user_message)
             self.db.save_chat_message(session_id, assistant_id, "assistant", blocks, lens_id=self.lens_id)
             return {
                 "session_id": session_id,
@@ -119,10 +132,13 @@ class CuratorAgent:
 
         registry = ToolRegistry(self.db, self.settings, self.lens_id)
         use_tools = bool(self.settings.llm_api_key or self.settings.llm_provider == "ollama")
-        response = await self.provider.chat(messages, tools=TOOL_DEFINITIONS if use_tools else None)
-        tool_calls = _extract_tool_calls(response)
+        tool_defs = TOOL_DEFINITIONS if use_tools else None
+        response = await self.provider.chat(messages, tools=tool_defs)
 
-        if tool_calls:
+        for _ in range(MAX_TOOL_ROUNDS):
+            tool_calls = _extract_tool_calls(response)
+            if not tool_calls:
+                break
             messages.append(_assistant_message_from_response(response))
             for call in tool_calls:
                 fn = call.get("function") or {}
@@ -136,12 +152,34 @@ class CuratorAgent:
                         "content": result,
                     }
                 )
-            response = await self.provider.chat(messages)
+            response = await self.provider.chat(messages, tools=tool_defs)
 
         text = _extract_text(response)
         blocks: List[Dict[str, Any]] = []
         if text:
             blocks.append({"type": "text", "content": text})
+        elif registry.cards:
+            blocks.append({"type": "text", "content": "Here are the results I found."})
+        elif _extract_tool_calls(response):
+            blocks.append(
+                {
+                    "type": "text",
+                    "content": (
+                        "The curator used tools but did not finish with a summary. "
+                        "Try asking again or check your LLM model configuration."
+                    ),
+                }
+            )
+        else:
+            blocks.append(
+                {
+                    "type": "text",
+                    "content": (
+                        "The curator returned an empty response. "
+                        "Check your LLM provider, API key, and model ID in Settings."
+                    ),
+                }
+            )
         if registry.cards:
             blocks.append({"type": "title_cards", "items": [card.model_dump() for card in registry.cards]})
             blocks.append(
@@ -157,6 +195,7 @@ class CuratorAgent:
         self.db.save_chat_message(
             session_id, user_id, "user", [{"type": "text", "content": user_message}], lens_id=self.lens_id
         )
+        self.db.maybe_auto_title_thread(session_id, user_message)
         self.db.save_chat_message(session_id, assistant_id, "assistant", blocks, lens_id=self.lens_id)
 
         return {

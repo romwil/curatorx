@@ -99,6 +99,7 @@ LLM_MODEL_DEFAULTS: Dict[str, str] = {
 }
 
 _OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "text-embedding", "chatgpt-")
+_OPENAI_COMPAT_PROVIDERS = frozenset({"openai", "openai_compatible", "custom_openai_compatible"})
 
 
 def model_looks_openai(model: str) -> bool:
@@ -150,19 +151,67 @@ def resolve_llm_model(provider: str, model: str = "") -> str:
     return cleaned
 
 
+def api_key_implies_provider(api_key: str) -> str | None:
+    """Infer LLM vendor from common API key prefixes when unambiguous."""
+    cleaned = str(api_key or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("sk-ant-"):
+        return "anthropic"
+    return None
+
+
+def reconcile_llm_provider(settings: Settings) -> Settings:
+    """Align provider with API key prefix when the mismatch is unambiguous."""
+    implied = api_key_implies_provider(settings.llm_api_key)
+    if not implied:
+        return settings
+    provider = (settings.llm_provider or "openai").lower().strip()
+    if implied == "anthropic" and provider in _OPENAI_COMPAT_PROVIDERS:
+        return Settings.from_mapping({**asdict(settings), "llm_provider": "anthropic"})
+    return settings
+
+
+def validate_llm_settings(settings: Settings) -> str | None:
+    """Return a user-facing error when LLM settings cannot authenticate."""
+    provider = (settings.llm_provider or "openai").lower().strip()
+    api_key = str(settings.llm_api_key or "").strip()
+    if provider == "ollama":
+        return None
+    if not api_key:
+        return (
+            "LLM API key is not configured. "
+            "Open Configuration → LLM, enter your API key, verify, and save."
+        )
+    implied = api_key_implies_provider(api_key)
+    if implied == "anthropic" and provider in _OPENAI_COMPAT_PROVIDERS:
+        return (
+            "Your API key is for Anthropic, but LLM provider is set to OpenAI. "
+            "Open Configuration → LLM, select Anthropic, verify, and save."
+        )
+    if provider == "anthropic" and api_key.startswith("sk-") and not api_key.startswith("sk-ant-"):
+        return (
+            "Your API key looks like an OpenAI key, but LLM provider is set to Anthropic. "
+            "Open Configuration → LLM, select OpenAI, verify, and save."
+        )
+    return None
+
+
 def normalize_settings_llm(settings: Settings) -> Settings:
+    settings = reconcile_llm_provider(settings)
     provider = (settings.llm_provider or "openai").lower().strip()
     resolved_model = resolve_llm_model(provider, settings.llm_model)
     resolved_base = resolve_llm_base_url(provider, settings.llm_base_url)
-    if resolved_model == settings.llm_model and resolved_base == settings.llm_base_url:
+    updates: Dict[str, Any] = {}
+    if (settings.llm_provider or "openai").lower().strip() != provider:
+        updates["llm_provider"] = provider
+    if resolved_model != settings.llm_model:
+        updates["llm_model"] = resolved_model
+    if resolved_base != settings.llm_base_url:
+        updates["llm_base_url"] = resolved_base
+    if not updates:
         return settings
-    return Settings.from_mapping(
-        {
-            **asdict(settings),
-            "llm_model": resolved_model,
-            "llm_base_url": resolved_base,
-        }
-    )
+    return Settings.from_mapping({**asdict(settings), **updates})
 
 
 def load_dotenv_file(path: Path | None = None) -> None:
@@ -176,6 +225,7 @@ def load_dotenv_file(path: Path | None = None) -> None:
     for candidate in candidates:
         if not candidate.is_file():
             continue
+        loaded_any = False
         for raw_line in candidate.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line or line.startswith("#"):
@@ -191,7 +241,9 @@ def load_dotenv_file(path: Path | None = None) -> None:
                 value = value[1:-1]
             if key and key not in os.environ:
                 os.environ[key] = value
-        return
+                loaded_any = True
+        if loaded_any:
+            return
 
 
 def resolve_llm_base_url(provider: str, base_url: str = "") -> str:
@@ -299,16 +351,42 @@ class Settings:
         path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def load_merged_settings(data_dir: Path) -> Settings:
+def _load_settings_file_data(data_dir: Path) -> Dict[str, Any]:
     settings_path = data_dir / "settings.json"
-    settings = Settings.load(settings_path)
+    if not settings_path.exists():
+        return {}
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+def _file_field_explicitly_set(file_data: Mapping[str, Any], field_name: str) -> bool:
+    if field_name not in file_data:
+        return False
+    value = file_data[field_name]
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def load_merged_settings(data_dir: Path) -> Settings:
+    """Merge settings.json with environment variables.
+
+    Values explicitly saved in settings.json take precedence. Environment
+    variables fill gaps when a field is missing or empty in the file.
+    """
+    file_data = _load_settings_file_data(data_dir)
+    settings = Settings.from_mapping(file_data) if file_data else Settings()
     merged = asdict(settings)
     for env_name, field_name in ENV_TO_FIELD.items():
         if env_name not in os.environ:
             continue
         env_value = os.environ[env_name]
-        if env_value is not None and str(env_value).strip() != "":
-            merged[field_name] = env_value
+        if env_value is None or str(env_value).strip() == "":
+            continue
+        if _file_field_explicitly_set(file_data, field_name):
+            continue
+        merged[field_name] = env_value
     for int_field in (
         "radarr_quality_profile_id",
         "sonarr_quality_profile_id",
@@ -316,14 +394,17 @@ def load_merged_settings(data_dir: Path) -> Settings:
         "tv_page_size",
     ):
         env_key = FIELD_TO_ENV.get(int_field, "")
-        if env_key in os.environ and str(os.environ[env_key]).strip() != "":
-            merged[int_field] = int(os.environ[env_key])
+        if env_key not in os.environ or str(os.environ[env_key]).strip() == "":
+            continue
+        if _file_field_explicitly_set(file_data, int_field):
+            continue
+        merged[int_field] = int(os.environ[env_key])
     return normalize_settings_llm(Settings.from_mapping(merged))
 
 
 def secret_field_sources(data_dir: Path) -> Dict[str, str]:
     """Return per-secret source: 'env', 'file', or '' (unset)."""
-    file_settings = Settings.load(data_dir / "settings.json")
+    file_data = _load_settings_file_data(data_dir)
     sources: Dict[str, str] = {}
     secret_fields = (
         "plex_token",
@@ -336,11 +417,12 @@ def secret_field_sources(data_dir: Path) -> Dict[str, str]:
         "llm_api_key",
     )
     for field in secret_fields:
+        if _file_field_explicitly_set(file_data, field):
+            sources[field] = "file"
+            continue
         env_key = FIELD_TO_ENV.get(field, "")
         if env_key in os.environ and str(os.environ[env_key]).strip():
             sources[field] = "env"
-        elif str(getattr(file_settings, field) or "").strip():
-            sources[field] = "file"
         else:
             sources[field] = ""
     return sources

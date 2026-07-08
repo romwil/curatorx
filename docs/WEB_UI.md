@@ -13,7 +13,7 @@ CuratorX toggles between two operational states without leaving the browser:
 Lightweight overlay optimized for fast intent entry:
 
 - **Command lane** — borderless monospace input; auto-focus on load.
-- **Lens prefix** — persistent indicator of active lens, e.g. `⧉ [General] > _`.
+- **Ambient context prefix** — inferred context indicator, e.g. `⧉ [Neo-noir exploration] > _`.
 - **Thoughtstream feed** — compact activity log (sync status, job pulse) capped at ~320px height.
 
 Expand to Immersive via hotkey, `/expand` token, or viewport card click.
@@ -22,11 +22,11 @@ Expand to Immersive via hotkey, `/expand` token, or viewport card click.
 
 Full workspace for deep curation:
 
-- **Sidebar (240px)** — lens switcher, integration status, settings link, job monitor (`.agent-pulse`).
-- **Chat pane (~45%)** — message thread scoped to active `lens_id`.
+- **Sidebar (240px)** — ambient context label, thoughtstream, settings link, job pulse (`.agent-pulse`).
+- **Chat pane (~45%)** — message thread with ambient context tag in composer.
 - **Visual array (~55%)** — title cards clustered by genre, trope, or recommendation context.
 
-Lens activation updates theme accents (`.lens-active`) so you always know which taste sandbox is active.
+Context is inferred automatically from conversation — no manual lens switching in the UI.
 
 ---
 
@@ -53,7 +53,7 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 - **Turnstyle viewport** — horizontal scroll overlay for expanded result sets
 - **Add to Radarr/Sonarr** — browser confirm + server confirmation token
 - **Not interested** — `POST /api/preferences` with `dismiss` signal
-- **Lens-scoped history** — pass `lens_id` on chat requests; history filtered per lens
+- **Ambient context** — inferred from conversation; backend may still accept `lens_id` for compatibility
 
 ---
 
@@ -68,6 +68,7 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 | POST | `/api/library/sync` | Start Plex index job |
 | GET | `/api/library/stats` | Item counts and last sync |
 | GET | `/api/title/{media_type}/{id}` | Title detail (`id_type` query) |
+| GET | `/api/context/active` | Inferred ambient context label |
 
 ### Setup and wizard
 
@@ -80,15 +81,12 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 | POST | `/api/setup/test/{service}` | Live connection test (`plex`, `radarr`, `sonarr`, `tmdb`, `fanart`, `tautulli`, `llm`) |
 | GET/PUT | `/api/settings` | Connection settings (secrets masked on read) |
 
-### Lenses and persona
+### Persona and lenses (backend)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/lenses` | List curation lenses |
-| GET | `/api/lenses/active` | Active lens |
-| PUT | `/api/lenses/active` | Switch active lens |
-| POST | `/api/lenses` | Create lens |
-| GET/PUT | `/api/persona` | Curator name and tone sliders |
+| GET | `/api/lenses` | List curation lenses (API only; no UI switcher) |
+| GET/PUT | `/api/persona` | Curator name and tone sliders (advanced config) |
 | GET/PUT | `/api/system-config` | Key-value config (includes `curator_name`) |
 
 ### Actions

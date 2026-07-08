@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from curatorx.library.db import DEFAULT_LENS_ID, Database
+from curatorx.library.db import CURATOR_NAME_CONFIG_KEY, DEFAULT_LENS_ID, Database
+from curatorx.library.embeddings import semantic_search
 
 
 class DatabaseTests(unittest.TestCase):
@@ -123,6 +124,41 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(float(rows[0]["weight"]), 2.0)
             self.assertEqual(int(rows[0]["explicit_lock"]), 1)
+
+    def test_curator_name_config_seeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            with db.connect() as conn:
+                row = conn.execute(
+                    "SELECT config_value FROM curator_system_config WHERE config_key = ?",
+                    (CURATOR_NAME_CONFIG_KEY,),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["config_value"], "Curator")
+
+    def test_semantic_search_filters_by_media_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            movie_id = db.upsert_library_item(
+                {
+                    "rating_key": "1",
+                    "media_type": "movie",
+                    "title": "Movie One",
+                    "genres": ["Drama"],
+                }
+            )
+            show_id = db.upsert_library_item(
+                {
+                    "rating_key": "2",
+                    "media_type": "show",
+                    "title": "Show One",
+                    "genres": ["Drama"],
+                }
+            )
+            db.set_embedding(movie_id, [1.0, 0.0])
+            db.set_embedding(show_id, [0.0, 1.0])
+            hits = semantic_search(db, [1.0, 0.0], limit=10, media_type="movie")
+            self.assertEqual([item_id for item_id, _ in hits], [movie_id])
 
 
 if __name__ == "__main__":

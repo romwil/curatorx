@@ -1,0 +1,31 @@
+import { defineConfig, devices } from "@playwright/test";
+
+const port = process.env.E2E_PORT || "8788";
+const baseURL = process.env.E2E_BASE_URL || `http://127.0.0.1:${port}`;
+
+export default defineConfig({
+  testDir: "./e2e",
+  fullyParallel: false,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 1 : 0,
+  workers: 1,
+  reporter: process.env.CI ? [["github"], ["list"]] : [["list"]],
+  timeout: 60_000,
+  use: {
+    baseURL,
+    trace: "on-first-retry",
+    screenshot: "only-on-failure",
+  },
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+  ],
+  webServer: {
+    command: "bash scripts/start-e2e-server.sh",
+    url: `${baseURL}/api/health`,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+  },
+});

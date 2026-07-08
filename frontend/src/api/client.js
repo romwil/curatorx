@@ -1,6 +1,34 @@
 const API = "/api";
 const SESSION_KEY = "curatorx_session";
 const ACTIVE_LENS_KEY = "curatorx_active_lens";
+const CHAT_TIMEOUT_MS = 120_000;
+
+function parseApiErrorBody(text, statusText) {
+  if (!text) return statusText || "Request failed";
+  try {
+    const data = JSON.parse(text);
+    if (typeof data.detail === "string") return data.detail;
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((entry) => entry?.msg || entry?.message || String(entry))
+        .join("; ");
+    }
+    if (data.error) return String(data.error);
+    if (data.message) return String(data.message);
+  } catch {
+    // Plain-text or HTML error body
+  }
+  const trimmed = text.trim();
+  return trimmed || statusText || "Request failed";
+}
+
+export function formatApiError(error) {
+  if (!error) return "Request failed";
+  if (error.name === "AbortError") {
+    return "Request timed out. Check your LLM provider or try again.";
+  }
+  return error.message || "Request failed";
+}
 
 export async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
@@ -9,7 +37,7 @@ export async function api(path, options = {}) {
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || response.statusText);
+    throw new Error(parseApiErrorBody(text, response.statusText));
   }
   if (response.status === 204) return null;
   return response.json();
@@ -22,6 +50,42 @@ export function sessionId() {
     localStorage.setItem(SESSION_KEY, value);
   }
   return value;
+}
+
+export function setActiveSession(sessionId) {
+  if (sessionId) {
+    localStorage.setItem(SESSION_KEY, sessionId);
+  } else {
+    localStorage.removeItem(SESSION_KEY);
+  }
+}
+
+export async function listThreads() {
+  return api("/chat/threads");
+}
+
+export async function createThread(payload = {}) {
+  return api("/chat/threads", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getThreadMessages(sessionId) {
+  return api(`/chat/threads/${encodeURIComponent(sessionId)}/messages`);
+}
+
+export async function updateThreadTitle(sessionId, threadTitle) {
+  return api(`/chat/threads/${encodeURIComponent(sessionId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ thread_title: threadTitle }),
+  });
+}
+
+export async function deleteThread(sessionId) {
+  return api(`/chat/threads/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function getStoredActiveLensId() {
@@ -71,6 +135,21 @@ export async function getPersona() {
   return api("/persona");
 }
 
+export async function getPersonaPresets() {
+  return api("/persona/presets");
+}
+
+export async function getPersonaPreview(params = {}) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      query.set(key, String(value));
+    }
+  }
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return api(`/persona/preview${suffix}`);
+}
+
 export async function putPersona(payload) {
   return api("/persona", {
     method: "PUT",
@@ -93,13 +172,20 @@ export async function listJobs() {
   return api("/jobs");
 }
 
-export async function sendChat(message, lensId) {
-  const body = { message, session_id: sessionId() };
+export async function sendChat(message, lensId, { timeoutMs = CHAT_TIMEOUT_MS, sessionId: explicitSessionId } = {}) {
+  const body = { message, session_id: explicitSessionId || sessionId() };
   if (lensId) body.lens_id = lensId;
-  return api("/chat", {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await api("/chat", {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function relativeTime(timestamp) {
@@ -234,11 +320,9 @@ export const LLM_PROVIDER_OPTIONS = [
 ];
 
 export const WIZARD_STEPS = [
-  "identity_llm",
-  "media_core",
-  "automation",
-  "persona",
-  "optional_services",
+  "identity_seed",
+  "infrastructure",
+  "dropdown_mapping",
 ];
 
 export const AUTO_CERTIFY_SERVICES = [
@@ -253,6 +337,14 @@ export const AUTO_CERTIFY_SERVICES = [
 
 export async function getWizardStatus() {
   return api("/setup/wizard");
+}
+
+export async function getActiveContext() {
+  return api("/context/active");
+}
+
+export async function getPlexSections() {
+  return api("/plex/sections");
 }
 
 export async function getCertifications() {

@@ -1,8 +1,13 @@
 import TitleCard from "./TitleCard";
+import InlineAlert from "./InlineAlert";
+import MessageText from "./MessageText";
 
-function renderBlock(block, handlers) {
+function renderBlock(block, handlers, role) {
   if (block.type === "text") {
-    return <p className="message-text">{block.content}</p>;
+    return <MessageText content={block.content} markdown={role === "assistant"} />;
+  }
+  if (block.type === "error") {
+    return <MessageText content={block.content} className="message-text message-error-text" />;
   }
   if (block.type === "title_cards") {
     return (
@@ -23,14 +28,23 @@ function renderBlock(block, handlers) {
   return null;
 }
 
-export default function ChatThread({ messages, onAdd, onDismiss, onOpenViewport }) {
+export default function ChatThread({
+  messages,
+  chatError,
+  onAdd,
+  onDismiss,
+  onOpenViewport,
+  variant = "immersive",
+  showErrors = true,
+}) {
   return (
-    <div className="chat-thread">
+    <div className={`chat-thread ${variant === "compact" ? "chat-thread-compact" : ""}`}>
+      {showErrors && chatError ? <InlineAlert type="error" message={chatError} /> : null}
       {messages.map((message) => (
-        <div key={message.id} className={`message ${message.role}`}>
+        <div key={message.id} className={`message ${message.role}`} data-testid={`chat-message-${message.role}`}>
           <div className="message-inner">
             {message.blocks.map((block, index) => (
-              <div key={index}>{renderBlock(block, { onAdd, onDismiss, onOpenViewport })}</div>
+              <div key={index}>{renderBlock(block, { onAdd, onDismiss, onOpenViewport }, message.role)}</div>
             ))}
           </div>
         </div>

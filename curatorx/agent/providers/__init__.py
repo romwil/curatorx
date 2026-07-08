@@ -23,6 +23,156 @@ def _anthropic_message_content(content: Any) -> Any:
     return str(content or "")
 
 
+def _parse_tool_call_input(arguments: Any) -> Dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _convert_messages_for_anthropic(
+    messages: List[Mapping[str, Any]],
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Convert OpenAI-style chat messages to Anthropic Messages API format.
+
+    - ``system`` messages are extracted to the top-level ``system`` parameter.
+    - OpenAI ``tool`` role messages become ``user`` messages with ``tool_result`` blocks.
+    - OpenAI assistant ``tool_calls`` become ``tool_use`` content blocks.
+    """
+    system_parts: List[str] = []
+    converted: List[Dict[str, Any]] = []
+    pending_tool_results: List[Dict[str, Any]] = []
+
+    def flush_tool_results() -> None:
+        nonlocal pending_tool_results
+        if pending_tool_results:
+            converted.append({"role": "user", "content": pending_tool_results})
+            pending_tool_results = []
+
+    for message in messages:
+        role = str(message.get("role") or "")
+        if role == "system":
+            flush_tool_results()
+            text = str(message.get("content") or "")
+            if text:
+                system_parts.append(text)
+            continue
+
+        if role == "tool":
+            pending_tool_results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": str(message.get("tool_call_id") or message.get("tool_use_id") or ""),
+                    "content": str(message.get("content") or ""),
+                }
+            )
+            continue
+
+        flush_tool_results()
+
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                blocks: List[Dict[str, Any]] = []
+                content = message.get("content")
+                if content:
+                    blocks.append({"type": "text", "text": str(content)})
+                for call in tool_calls:
+                    fn = call.get("function") or {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": str(call.get("id") or ""),
+                            "name": str(fn.get("name") or ""),
+                            "input": _parse_tool_call_input(fn.get("arguments")),
+                        }
+                    )
+                converted.append({"role": "assistant", "content": blocks})
+                continue
+
+        if role in {"user", "assistant"}:
+            converted.append(
+                {
+                    "role": role,
+                    "content": _anthropic_message_content(message.get("content")),
+                }
+            )
+
+    flush_tool_results()
+    return "\n\n".join(system_parts), converted
+
+
+def _normalize_anthropic_response(response: Mapping[str, Any]) -> Dict[str, Any]:
+    """Convert Anthropic Messages API payload to OpenAI chat completion shape."""
+    if "choices" in response:
+        return dict(response)
+
+    content_blocks = response.get("content") or []
+    if not isinstance(content_blocks, list):
+        content_blocks = []
+
+    text_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text_parts.append(str(block.get("text") or ""))
+        elif block_type == "tool_use":
+            tool_calls.append(
+                {
+                    "id": str(block.get("id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(block.get("name") or ""),
+                        "arguments": json.dumps(block.get("input") or {}),
+                    },
+                }
+            )
+
+    message: Dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    stop_reason = str(response.get("stop_reason") or "")
+    finish_reason = "tool_calls" if tool_calls else stop_reason or "stop"
+
+    return {
+        "id": response.get("id"),
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "model": response.get("model"),
+        "usage": response.get("usage"),
+    }
+
+
+def _format_openai_compatible_error(response: httpx.Response, base_url: str) -> str:
+    host = base_url.rstrip("/") or "the configured LLM endpoint"
+    if response.status_code == 401:
+        return (
+            f"Authentication failed (401) calling {host}. "
+            "Check LLM provider and API key in Configuration."
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        if message:
+            return f"LLM API error ({response.status_code}) calling {host}: {message}"
+    detail = response.text.strip()
+    if detail:
+        return f"LLM API error ({response.status_code}) calling {host}: {detail}"
+    return f"LLM API error ({response.status_code}) calling {host}"
+
+
 def _format_anthropic_error(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -93,7 +243,8 @@ class OpenAICompatibleProvider:
                 headers=self._headers(),
                 json=body,
             )
-            response.raise_for_status()
+            if response.is_error:
+                raise LLMProviderError(_format_openai_compatible_error(response, self.base_url))
             return response.json()
 
     async def stream(
@@ -154,18 +305,7 @@ class AnthropicProvider:
         messages: List[Mapping[str, Any]],
         tools: Optional[List[Mapping[str, Any]]] = None,
     ) -> Mapping[str, Any]:
-        system = ""
-        converted: List[Dict[str, Any]] = []
-        for message in messages:
-            if message["role"] == "system":
-                system = str(message.get("content") or "")
-                continue
-            converted.append(
-                {
-                    "role": message["role"],
-                    "content": _anthropic_message_content(message.get("content")),
-                }
-            )
+        system, converted = _convert_messages_for_anthropic(messages)
         body: Dict[str, Any] = {
             "model": self.model,
             "max_tokens": 4096,
@@ -194,7 +334,7 @@ class AnthropicProvider:
             )
             if response.is_error:
                 raise LLMProviderError(_format_anthropic_error(response))
-            return response.json()
+            return _normalize_anthropic_response(response.json())
 
     async def stream(
         self,

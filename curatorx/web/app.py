@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -18,6 +19,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from curatorx import __version__
 from curatorx.agent.curator import CuratorAgent, stream_agent
+from curatorx.agent.providers import LLMProviderError
 from curatorx.agent.tools import execute_confirmed_action
 from curatorx.config_store import (
     ANTHROPIC_MODEL_OPTIONS,
@@ -30,6 +32,7 @@ from curatorx.config_store import (
     resolve_llm_model,
     save_settings,
     secret_field_sources,
+    validate_llm_settings,
 )
 from curatorx.connectors.plex import PlexClient
 from curatorx.library.db import DEFAULT_LENS_ID
@@ -43,8 +46,18 @@ from curatorx.models.schemas import (
     LensUpdate,
     PersonaMetrics,
     PersonaMetricsUpdate,
+    PersonaPresetSummary,
+    PersonaPreviewResponse,
     PreferenceSignal,
     SystemConfigUpdate,
+)
+from curatorx.persona import (
+    build_assembled_persona_prompt,
+    build_behavioral_prompt_from_sliders,
+    derive_persona_mode,
+    get_preset,
+    list_presets,
+    persona_row_to_dict,
 )
 from curatorx.preferences.store import remember_preference
 from curatorx.web.jobs import get_job_manager, get_sync_scheduler
@@ -58,6 +71,7 @@ from curatorx.web.setup import (
     record_service_integration,
     resolve_test_payload,
     sync_settings_to_db,
+    normalize_plex_type,
     test_fanart,
     test_llm,
     test_plex,
@@ -75,6 +89,7 @@ if os.environ.get("CURATORX_SKIP_DOTENV") != "1":
     load_dotenv_file()
 
 app = FastAPI(title="CuratorX", version=__version__)
+logger = logging.getLogger(__name__)
 
 
 def _row_to_lens(row: Any) -> Lens:
@@ -86,14 +101,37 @@ def _row_to_lens(row: Any) -> Lens:
     )
 
 
+def _persona_dict(row: Any) -> dict[str, Any]:
+    data = persona_row_to_dict(row)
+    mode = derive_persona_mode(data)
+    override = str(data.get("persona_prompt_override") or "").strip()
+    behavioral = override if override else build_behavioral_prompt_from_sliders(data)
+    assembled = build_assembled_persona_prompt(data)
+    return {
+        **data,
+        "persona_mode": mode,
+        "behavioral_prompt": behavioral,
+        "assembled_prompt": assembled,
+    }
+
+
 def _row_to_persona(row: Any) -> PersonaMetrics:
+    data = _persona_dict(row)
     return PersonaMetrics(
-        metric_id=str(row["metric_id"]),
-        curator_name=str(row["curator_name"] or "Curator"),
-        val_bro_prof=float(row["val_bro_prof"]),
-        val_dipl_snark=float(row["val_dipl_snark"]),
-        val_pass_auto=float(row["val_pass_auto"]),
-        last_modified=str(row["last_modified"]) if row["last_modified"] is not None else None,
+        metric_id=str(data.get("metric_id") or "current_profile"),
+        curator_name=str(data.get("curator_name") or "Curator"),
+        persona_identity=str(data.get("persona_identity") or ""),
+        val_bro_prof=float(data.get("val_bro_prof") or 0.5),
+        val_dipl_snark=float(data.get("val_dipl_snark") or 0.5),
+        val_pass_auto=float(data.get("val_pass_auto") or 0.5),
+        persona_preset_id=str(data["persona_preset_id"]) if data.get("persona_preset_id") else None,
+        persona_prompt_override=str(data["persona_prompt_override"])
+        if data.get("persona_prompt_override") is not None
+        else None,
+        persona_mode=str(data.get("persona_mode") or "sliders"),
+        behavioral_prompt=str(data.get("behavioral_prompt") or ""),
+        assembled_prompt=str(data.get("assembled_prompt") or ""),
+        last_modified=str(data["last_modified"]) if data.get("last_modified") is not None else None,
     )
 
 
@@ -147,6 +185,16 @@ class SettingsPayload(BaseModel):
     onboarding_complete: bool = False
     library_sync_interval_hours: int = Field(default=24, ge=1, le=168)
     tv_page_size: int = Field(default=500, ge=50, le=2000)
+
+
+class ThreadCreatePayload(BaseModel):
+    thread_title: Optional[str] = None
+    lens_id: Optional[str] = None
+    context_hash: Optional[str] = None
+
+
+class ThreadUpdatePayload(BaseModel):
+    thread_title: str = Field(min_length=1, max_length=200)
 
 
 class TestPayload(BaseModel):
@@ -245,10 +293,12 @@ def get_settings() -> Dict[str, Any]:
 
 @app.put("/api/settings")
 def put_settings(payload: SettingsPayload) -> Dict[str, Any]:
+    settings_path = DATA_DIR / "settings.json"
+    before = Settings.load(settings_path)
     existing = _settings()
     merged = merge_secret_fields(payload.model_dump(), existing)
     settings = normalize_settings_llm(Settings.from_mapping(merged))
-    invalidate_certifications_on_settings_change(_db(), existing, settings, payload.model_dump())
+    invalidate_certifications_on_settings_change(_db(), before, settings, payload.model_dump())
     save_settings(DATA_DIR, settings)
     sync_settings_to_db(_db(), settings)
     return _mask_settings(settings)
@@ -361,7 +411,23 @@ def plex_sections() -> List[Dict[str, str]]:
     if not settings.plex_url or not settings.plex_token:
         raise HTTPException(status_code=400, detail="Plex not configured")
     client = PlexClient(settings.plex_url, settings.plex_token)
-    return [{"key": s.key, "title": s.title, "type": s.type} for s in client.list_sections()]
+    return [
+        {
+            "key": s.key,
+            "title": s.title,
+            "type": normalize_plex_type(s.type),
+        }
+        for s in client.list_sections()
+    ]
+
+
+@app.get("/api/context/active")
+def active_derived_context() -> Dict[str, Any]:
+    row = _db().get_active_derived_context()
+    return {
+        "context_hash": str(row["context_hash"]),
+        "inferred_label": str(row["inferred_label"] or "General Exploration"),
+    }
 
 
 @app.get("/api/jobs")
@@ -447,6 +513,62 @@ def update_lens(lens_id: str, payload: LensUpdate) -> Lens:
     return _row_to_lens(row)
 
 
+@app.get("/api/persona/presets", response_model=List[PersonaPresetSummary])
+def get_persona_presets() -> List[PersonaPresetSummary]:
+    return [
+        PersonaPresetSummary(
+            id=preset.id,
+            name=preset.name,
+            description=preset.description,
+            val_bro_prof=preset.val_bro_prof,
+            val_dipl_snark=preset.val_dipl_snark,
+            val_pass_auto=preset.val_pass_auto,
+            identity_blurb=preset.identity_blurb,
+        )
+        for preset in list_presets()
+    ]
+
+
+@app.get("/api/persona/preview", response_model=PersonaPreviewResponse)
+def get_persona_preview(
+    persona_identity: Optional[str] = None,
+    val_bro_prof: Optional[float] = None,
+    val_dipl_snark: Optional[float] = None,
+    val_pass_auto: Optional[float] = None,
+    persona_preset_id: Optional[str] = None,
+    persona_prompt_override: Optional[str] = None,
+    curator_name: Optional[str] = None,
+) -> PersonaPreviewResponse:
+    row = _db().get_persona()
+    if not row:
+        _db().ensure_seed_data()
+        row = _db().get_persona()
+    base = persona_row_to_dict(row)
+    draft = {
+        **base,
+        "curator_name": curator_name if curator_name is not None else base.get("curator_name"),
+        "persona_identity": persona_identity if persona_identity is not None else base.get("persona_identity"),
+        "val_bro_prof": val_bro_prof if val_bro_prof is not None else base.get("val_bro_prof"),
+        "val_dipl_snark": val_dipl_snark if val_dipl_snark is not None else base.get("val_dipl_snark"),
+        "val_pass_auto": val_pass_auto if val_pass_auto is not None else base.get("val_pass_auto"),
+        "persona_preset_id": persona_preset_id if persona_preset_id is not None else base.get("persona_preset_id"),
+        "persona_prompt_override": (
+            persona_prompt_override
+            if persona_prompt_override is not None
+            else base.get("persona_prompt_override")
+        ),
+    }
+    mode = derive_persona_mode(draft)
+    override = str(draft.get("persona_prompt_override") or "").strip()
+    behavioral = override if override else build_behavioral_prompt_from_sliders(draft)
+    assembled = build_assembled_persona_prompt(draft)
+    return PersonaPreviewResponse(
+        persona_mode=mode,
+        behavioral_prompt=behavioral,
+        assembled_prompt=assembled,
+    )
+
+
 @app.get("/api/persona", response_model=PersonaMetrics)
 def get_persona() -> PersonaMetrics:
     row = _db().get_persona()
@@ -460,11 +582,50 @@ def get_persona() -> PersonaMetrics:
 
 @app.put("/api/persona", response_model=PersonaMetrics)
 def put_persona(payload: PersonaMetricsUpdate) -> PersonaMetrics:
-    row = _db().upsert_persona(
+    db = _db()
+    preset_id = payload.persona_preset_id
+    identity = payload.persona_identity
+    bro = payload.val_bro_prof
+    snark = payload.val_dipl_snark
+    auto = payload.val_pass_auto
+    clear_override = payload.clear_persona_override
+    override = payload.persona_prompt_override
+
+    if override is not None and not str(override).strip():
+        clear_override = True
+        override = None
+
+    if payload.apply_preset:
+        preset = get_preset(payload.apply_preset)
+        if not preset:
+            raise HTTPException(status_code=400, detail=f"Unknown persona preset: {payload.apply_preset}")
+        preset_id = preset.id
+        bro = preset.val_bro_prof
+        snark = preset.val_dipl_snark
+        auto = preset.val_pass_auto
+        current = db.get_persona()
+        if identity is None and current and not str(current["persona_identity"] or "").strip():
+            identity = preset.identity_blurb
+        clear_override = True
+
+    slider_changed = any(value is not None for value in (bro, snark, auto))
+    if slider_changed and not clear_override:
+        current = db.get_persona()
+        if current and str(current["persona_prompt_override"] or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail="Custom behavioral prompt is active. Confirm slider change with clear_persona_override=true.",
+            )
+
+    row = db.upsert_persona(
         curator_name=payload.curator_name,
-        val_bro_prof=payload.val_bro_prof,
-        val_dipl_snark=payload.val_dipl_snark,
-        val_pass_auto=payload.val_pass_auto,
+        persona_identity=identity,
+        val_bro_prof=bro,
+        val_dipl_snark=snark,
+        val_pass_auto=auto,
+        persona_preset_id=preset_id,
+        persona_prompt_override=override,
+        clear_persona_override=clear_override,
     )
     return _row_to_persona(row)
 
@@ -498,10 +659,64 @@ def put_system_config(payload: SystemConfigUpdate) -> Dict[str, str]:
 async def chat(payload: ChatRequest) -> Dict[str, Any]:
     session_id = payload.session_id or uuid.uuid4().hex
     lens_id = _resolve_lens_id(payload.lens_id)
+    db = _db()
+    db.ensure_chat_session(session_id, lens_id)
+    settings = _settings()
+    config_error = validate_llm_settings(settings)
+    if config_error:
+        raise HTTPException(status_code=400, detail=config_error)
     try:
-        return await CuratorAgent(_db(), _settings(), lens_id=lens_id).run(session_id, payload.message)
+        return await CuratorAgent(db, settings, lens_id=lens_id).run(session_id, payload.message)
+    except LLMProviderError as error:
+        logger.warning("Chat LLM error for session %s: %s", session_id, error)
+        raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:  # noqa: BLE001
+        logger.exception("Chat request failed for session %s", session_id)
         raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.get("/api/chat/threads")
+def list_chat_threads() -> List[Dict[str, Any]]:
+    return _db().list_chat_threads()
+
+
+@app.post("/api/chat/threads")
+def create_chat_thread(payload: ThreadCreatePayload = ThreadCreatePayload()) -> Dict[str, Any]:
+    session_id = uuid.uuid4().hex
+    lens_id = _resolve_lens_id(payload.lens_id)
+    context_hash = (payload.context_hash or "general").strip() or "general"
+    thread = _db().create_chat_thread(
+        session_id,
+        lens_id=lens_id,
+        context_hash=context_hash,
+        thread_title=payload.thread_title,
+    )
+    return {"session_id": session_id, **thread}
+
+
+@app.get("/api/chat/threads/{session_id}/messages")
+def get_chat_thread_messages(session_id: str, limit: int = 100) -> Dict[str, Any]:
+    db = _db()
+    thread = db.get_chat_thread(session_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    messages = db.chat_history(session_id, limit=limit)
+    return {"session_id": session_id, "messages": messages, "thread": thread}
+
+
+@app.patch("/api/chat/threads/{session_id}")
+def update_chat_thread(session_id: str, payload: ThreadUpdatePayload) -> Dict[str, Any]:
+    try:
+        return _db().update_thread_title(session_id, payload.thread_title)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
+@app.delete("/api/chat/threads/{session_id}")
+def delete_chat_thread(session_id: str) -> Dict[str, bool]:
+    if not _db().delete_chat_thread(session_id):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return {"deleted": True}
 
 
 @app.get("/api/chat/stream")
