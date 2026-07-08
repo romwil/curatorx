@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mediacurator.config_store import Settings, load_merged_settings, save_settings
+from curatorx.config_store import Settings, load_merged_settings, save_settings
 
 
 class ConfigStoreTests(unittest.TestCase):

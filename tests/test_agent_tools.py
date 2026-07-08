@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mediacurator.agent.tools import TOOL_DEFINITIONS, ToolRegistry, build_system_prompt
-from mediacurator.config_store import Settings
-from mediacurator.library.db import Database
+from curatorx.agent.tools import TOOL_DEFINITIONS, ToolRegistry, build_system_prompt
+from curatorx.config_store import Settings
+from curatorx.library.db import DEFAULT_LENS_ID, Database
 
 
 class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
@@ -45,6 +45,17 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             "analyze_watch_patterns",
         ):
             self.assertIn(expected, names)
+
+    def test_system_prompt_includes_persona_and_lens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.upsert_persona(curator_name="Atlas", val_bro_prof=0.9)
+            db.create_lens("noir", "Noir Studies", "Hardboiled crime cinema")
+            prompt = build_system_prompt(db, lens_id="noir")
+            self.assertIn("Atlas", prompt)
+            self.assertIn("Noir Studies", prompt)
+            self.assertIn("Hardboiled", prompt)
+            self.assertIn(DEFAULT_LENS_ID, build_system_prompt(db, lens_id=DEFAULT_LENS_ID) or "")
 
 
 if __name__ == "__main__":

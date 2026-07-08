@@ -2,6 +2,8 @@
 config/settings.json
 config/mediacurator.db
 config/mediacurator.db-*
+config/curatorx.db
+config/curatorx.db-*
 build/
 dist/
 frontend/node_modules/

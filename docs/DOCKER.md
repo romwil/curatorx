@@ -1,8 +1,12 @@
-# Docker / Unraid
+# CuratorX — Docker / Unraid
+
+Deploy CuratorX as a single container with a persistent `/config` volume for `settings.json` and `curatorx.db`.
+
+---
 
 ## Mac (Homebrew)
 
-`brew install docker` installs only the **Docker CLI**. It does not install Compose, Buildx, or a container runtime. Without those, `docker compose up -d --build` fails with errors like `unknown shorthand flag: 'd' in -d` (the CLI treats `compose` as invalid and misparses flags).
+`brew install docker` installs only the **Docker CLI**. It does not install Compose, Buildx, or a container runtime. Without those, `docker compose up -d --build` fails with errors like `unknown shorthand flag: 'd' in -d`.
 
 Choose **one** runtime:
 
@@ -17,8 +21,8 @@ Wait until the whale icon in the menu bar is steady, then:
 
 ```bash
 docker compose version
-cd /path/to/mediacurator
-cp .env.example .env   # if you have not already
+cd /path/to/curatorx
+cp .env.example .env
 docker compose up -d --build
 ```
 
@@ -27,7 +31,7 @@ docker compose up -d --build
 ```bash
 brew install colima docker-compose
 colima start
-docker context use colima   # if `docker info` still cannot connect
+docker context use colima
 ```
 
 Homebrew’s `docker-compose` formula is a **CLI plugin**. Tell the Docker client where to find it (once per user):
@@ -52,44 +56,78 @@ docker compose version
 docker info | head -5
 ```
 
-Then run MediaCurator:
+Then run CuratorX:
 
 ```bash
-cd /path/to/mediacurator
-cp .env.example .env   # if you have not already
-docker compose up -d --build
-```
-
-After reboot, start the VM again: `colima start` (or `brew services start colima`).
-
-Open `http://localhost:8788`.
-
-## Docker Compose (all platforms)
-
-```bash
+cd /path/to/curatorx
 cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://localhost:8788`.
+After reboot: `colima start` (or `brew services start colima`).
+
+Open **http://localhost:8788**.
+
+---
+
+## Docker Compose (all platforms)
+
+```bash
+git clone https://github.com/romwil/curatorx.git
+cd curatorx
+cp .env.example .env
+docker compose up -d --build
+```
+
+Open **http://localhost:8788**.
+
+Environment variables in `.env` seed first-run settings (Plex, *arr, TMDB, LLM). See [CONFIGURATION.md](CONFIGURATION.md).
+
+---
 
 ## Unraid
 
-Install from the Community Applications template (`templates/mediacurator.xml`) or add manually:
+Install from the Community Applications template (`templates/curatorx.xml` or `unraid/curatorx.xml`) or add manually:
 
-- **Port:** 8788
-- **Config path:** `/mnt/user/appdata/mediacurator/config` → `/config`
+| Setting | Value |
+|---------|-------|
+| **Port** | 8788 |
+| **Config path** | `/mnt/user/appdata/curatorx/config` → `/config` |
+| **Image** | Build from repo `Dockerfile` or published image when available |
 
-Seed optional environment variables for Plex, *arr, TMDB, and LLM keys on first run.
+### Ollama on the Unraid host
+
+Point CuratorX at the host LLM:
+
+```
+LLM_PROVIDER=ollama
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+```
+
+Or use the host LAN IP if `host.docker.internal` is unavailable.
+
+---
 
 ## Data layout
 
 | Path | Contents |
 |------|----------|
-| `/config/settings.json` | User settings |
-| `/config/mediacurator.db` | Library index, chat, preferences, embeddings |
+| `/config/settings.json` | Connection settings, LLM config, onboarding flags |
+| `/config/curatorx.db` | Library index, embeddings, chat (with `lens_id`), persona, lenses |
+
+Back up the entire `/config` directory before upgrades.
+
+---
 
 ## Resources
 
-- LLM via Ollama: allocate RAM on the Unraid host for your chosen model.
-- Library sync: CPU-bound during TMDB enrichment; runs as a background job.
+- **LLM via Ollama** — allocate RAM on the host for your chosen model.
+- **Library sync** — CPU/network-bound during TMDB enrichment; runs as a background job.
+- **Embeddings** — optional cloud embedding API; hash fallback works offline.
+
+---
+
+## Related documentation
+
+- [ONBOARDING.md](ONBOARDING.md) — first-run wizard
+- [ARCHITECTURE.md](ARCHITECTURE.md) — deployment diagram

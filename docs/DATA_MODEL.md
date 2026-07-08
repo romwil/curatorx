@@ -1,6 +1,6 @@
-# MediaCurator — Data Model
+# CuratorX — Data Model
 
-Reference for persistent storage: SQLite tables, settings fields, and key Pydantic schemas. Schema definitions live in `mediacurator/library/db.py` and `mediacurator/models/schemas.py`.
+Reference for persistent storage: SQLite tables, settings fields, and Pydantic schemas. Schema definitions live in `curatorx/library/db.py` and `curatorx/models/schemas.py`.
 
 ---
 
@@ -8,8 +8,8 @@ Reference for persistent storage: SQLite tables, settings fields, and key Pydant
 
 | Path | Format | Contents |
 |------|--------|----------|
-| `{DATA_DIR}/mediacurator.db` | SQLite 3 | Library index, embeddings, chat, preferences, pending actions |
-| `{DATA_DIR}/settings.json` | JSON | User configuration (secrets on disk) |
+| `{DATA_DIR}/curatorx.db` | SQLite 3 | Library, embeddings, chat (lens-scoped), persona, lenses, preferences |
+| `{DATA_DIR}/settings.json` | JSON | Connection settings and secrets |
 
 Default `DATA_DIR`: `/config` in Docker, `./config` in local dev.
 
@@ -17,9 +17,11 @@ Default `DATA_DIR`: `/config` in Docker, `./config` in local dev.
 
 ## SQLite schema
 
-### `library_items`
+### Core library (Phase 1)
 
-Canonical index of Plex movies and shows, enriched during sync.
+#### `library_items`
+
+Canonical Plex index enriched during sync.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -28,37 +30,27 @@ Canonical index of Plex movies and shows, enriched during sync.
 | `media_type` | TEXT | `movie` or `show` |
 | `title` | TEXT | Display title |
 | `year` | INTEGER | Release / first air year |
-| `summary` | TEXT | Overview from Plex |
-| `genres` | TEXT | JSON array of genre strings |
-| `cast` | TEXT | JSON array |
-| `directors` | TEXT | JSON array |
-| `keywords` | TEXT | JSON array (TMDB keywords for movies) |
-| `tmdb_id` | INTEGER | TMDB ID |
-| `tvdb_id` | INTEGER | TVDB ID |
-| `imdb_id` | TEXT | IMDB ID |
-| `poster_url` | TEXT | Resolved poster URL |
-| `backdrop_url` | TEXT | Resolved backdrop URL |
-| `view_count` | INTEGER | Plex view count |
+| `summary` | TEXT | Overview |
+| `genres` | TEXT | JSON array |
+| `cast` / `directors` / `keywords` | TEXT | JSON arrays |
+| `tmdb_id` / `tvdb_id` / `imdb_id` | | External IDs |
+| `poster_url` / `backdrop_url` | TEXT | Art URLs |
+| `view_count` | INTEGER | Plex plays |
 | `last_viewed_at` | INTEGER | Unix timestamp |
-| `file_size` | INTEGER | Bytes on disk (Plex) |
-| `in_radarr` | INTEGER | 0/1 flag from sync |
-| `in_sonarr` | INTEGER | 0/1 flag from sync |
-| `updated_at` | REAL | Last upsert timestamp |
+| `file_size` | INTEGER | Bytes on disk |
+| `in_radarr` / `in_sonarr` | INTEGER | 0/1 queue flags |
+| `updated_at` | REAL | Last upsert |
 
 **Indexes:** `tmdb_id`, `tvdb_id`, `media_type`.
 
-### `embeddings`
-
-One vector per library item for semantic search.
+#### `embeddings`
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `item_id` | INTEGER PK FK | References `library_items.id` |
-| `vector` | TEXT | JSON array of floats |
+| `vector` | TEXT | JSON float array (384-dim hash or provider length) |
 
-Vectors are typically 384 dimensions (hash fallback) or provider-defined length (e.g. 1536 for `text-embedding-3-small`).
-
-### `preference_facts`
+#### `preference_facts`
 
 Taste signals for agent context and purge scoring.
 
@@ -66,186 +58,170 @@ Taste signals for agent context and purge scoring.
 |--------|------|-------------|
 | `id` | INTEGER PK | |
 | `signal_type` | TEXT | `explicit`, `positive`, `negative`, `add`, `dismiss` |
-| `text` | TEXT | Natural language or description |
-| `weight` | REAL | Signed weight (see DESIGN.md) |
-| `tmdb_id` | INTEGER | Optional title scope |
-| `tvdb_id` | INTEGER | Optional title scope |
-| `media_type` | TEXT | Optional `movie` / `show` |
+| `text` | TEXT | Natural language description |
+| `weight` | REAL | Signed weight |
+| `tmdb_id` / `tvdb_id` / `media_type` | | Optional title scope |
 | `created_at` | REAL | Unix timestamp |
 
-### `chat_sessions`
+#### `chat_sessions`
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | TEXT PK | Client-provided or server-generated session UUID |
-| `created_at` | REAL | |
-| `updated_at` | REAL | Updated on each message |
+| `id` | TEXT PK | Session UUID |
+| `created_at` / `updated_at` | REAL | |
+| **`lens_id`** | TEXT | **Curation lens scope** (default `general`) |
 
-### `chat_messages`
+#### `chat_messages`
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | TEXT PK | Message UUID |
 | `session_id` | TEXT FK | References `chat_sessions.id` |
-| `role` | TEXT | `user`, `assistant`, or `system` |
-| `blocks_json` | TEXT | JSON array of message blocks |
+| `role` | TEXT | `user`, `assistant`, `system` |
+| `blocks_json` | TEXT | JSON message blocks |
 | `created_at` | REAL | |
+| **`lens_id`** | TEXT | **Lens filter for history queries** (default `general`) |
 
-Blocks follow the schema in [DESIGN.md](DESIGN.md#message-block-schema).
+Chat history API and agent context load messages filtered by `lens_id` so lenses remain isolated within a session.
 
-### `pending_actions`
+#### `pending_actions`
 
-Confirmation-gated *arr operations.
+Confirmation-gated *arr operations (10-minute TTL).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `token` | TEXT PK | UUID hex token |
+| `token` | TEXT PK | UUID hex |
 | `action_type` | TEXT | `add_radarr`, `add_sonarr`, `remove_arr` |
 | `payload_json` | TEXT | Action-specific JSON |
-| `created_at` | REAL | |
-| `expires_at` | REAL | Default TTL 600 seconds from creation |
+| `created_at` / `expires_at` | REAL | |
 
-### `sync_state`
+#### `sync_state`
 
-Key-value store for job metadata.
+Key-value job metadata (e.g. `last_sync` JSON with item/embedding counts).
+
+---
+
+### PRD cognitive tables (Phase 1)
+
+From [curatorx_prd.md](curatorx_prd.md):
+
+#### `curator_system_config`
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `key` | TEXT PK | e.g. `last_sync` |
-| `value` | TEXT | JSON string |
-| `updated_at` | REAL | |
+| `config_key` | TEXT PK | e.g. `active_lens_id`, `curator_name` |
+| `config_value` | TEXT | |
+| `updated_at` | DATETIME | |
 
-`last_sync` value example:
+#### `service_integrations`
 
-```json
-{"items": 1240, "embeddings": 1240, "timestamp": 1710000000.0}
-```
+| Column | Type | Description |
+|--------|------|-------------|
+| `service_name` | TEXT PK | `plex`, `radarr`, `sonarr`, `tmdb`, … |
+| `base_url` | TEXT | |
+| `api_token_encrypted` | TEXT | Reserved for encrypted storage |
+| `connection_status` | TEXT | `unverified`, `verified`, `error` |
+| `last_tested_at` | DATETIME | |
+
+#### `curator_persona_metrics`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `metric_id` | TEXT PK | Default `current_profile` |
+| `curator_name` | TEXT | Display name (default `Curator`) |
+| `val_bro_prof` | REAL | Vocabulary: bro (0) → professorial (1) |
+| `val_dipl_snark` | REAL | Tone: diplomatic (0) → snarky (1) |
+| `val_pass_auto` | REAL | Autonomy: passive (0) → autonomous (1) |
+| `last_modified` | DATETIME | |
+
+#### `curation_lenses`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `lens_id` | TEXT PK | e.g. `general`, `directors` |
+| `lens_name` | TEXT | Display name |
+| `description` | TEXT | Optional |
+| `created_at` | DATETIME | |
+
+Seeded on init: **`general`** lens.
+
+#### `lens_taste_profile`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `lens_id` | TEXT FK | References `curation_lenses` |
+| `cluster_tag` | TEXT | Taste cluster identifier |
+| `weight` | REAL | Default 1.0 |
+| `explicit_lock` | INTEGER | 1 = block automatic telemetry updates |
+| `last_updated` | DATETIME | |
+
+**Primary key:** `(lens_id, cluster_tag)`.
+
+#### `interaction_telemetry`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | |
+| `title_id` | TEXT | Library or external title reference |
+| `lens_id` | TEXT FK | Lens context |
+| `source` | TEXT | `chat_thread`, `tautulli_webhook`, `widget_input`, … |
+| `event_type` | TEXT | `watch_complete`, `deep_query`, … |
+| `watch_duration_seconds` | INTEGER | |
+| `completion_percentage` | REAL | |
+| `timestamp` | DATETIME | |
+
+#### `agent_blueprints`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `blueprint_id` | TEXT PK | |
+| `name` | TEXT | e.g. Midnight Scavenger |
+| `cron_schedule` | TEXT | Crontab string |
+| `active_lens_id` | TEXT FK | Lens context for scheduled runs |
+| `instructions_json` | TEXT | Serialized agent instructions |
+| `is_enabled` | INTEGER | 0/1 |
+| `last_run_status` / `last_run_timestamp` | | Job telemetry |
 
 ---
 
 ## Settings model
 
-Python dataclass `Settings` in `mediacurator/config_store.py`, persisted as `settings.json`. Environment variables override file values when set.
+Python dataclass `Settings` in `curatorx/config_store.py`, persisted as `settings.json`. Environment variables override file values.
 
-### Connection settings
+See [CONFIGURATION.md](CONFIGURATION.md) for the full field list. Secret fields are masked on `GET /api/settings` with `{field}_set` booleans.
 
-| Field | Env var | Description |
-|-------|---------|-------------|
-| `plex_url` | `PLEX_URL` | Plex server base URL |
-| `plex_token` | `PLEX_TOKEN` | Plex token |
-| `plex_movie_section` | `PLEX_MOVIE_SECTION` | Movie library section key |
-| `plex_tv_section` | `PLEX_TV_SECTION` | TV library section key |
-| `radarr_url` | `RADARR_URL` | Radarr base URL |
-| `radarr_api_key` | `RADARR_API_KEY` | Radarr API key |
-| `sonarr_url` | `SONARR_URL` | Sonarr base URL |
-| `sonarr_api_key` | `SONARR_API_KEY` | Sonarr API key |
-
-### Paths and *arr defaults
-
-| Field | Env var | Default | Description |
-|-------|---------|---------|-------------|
-| `movies_root` | `MOVIES_ROOT` | `/media/movies` | Legacy path hint |
-| `tv_root` | `TV_ROOT` | `/media/tv` | Legacy path hint |
-| `radarr_root_folder` | `RADARR_ROOT_FOLDER` | `/media/movies` | Add-movie root |
-| `sonarr_root_folder` | `SONARR_ROOT_FOLDER` | `/media/tv` | Add-series root |
-| `radarr_quality_profile_id` | `RADARR_QUALITY_PROFILE_ID` | `1` | Quality profile for adds |
-| `sonarr_quality_profile_id` | `SONARR_QUALITY_PROFILE_ID` | `1` | Quality profile for adds |
-
-### Metadata APIs
-
-| Field | Env var | Description |
-|-------|---------|-------------|
-| `tmdb_api_key` | `TMDB_API_KEY` | Required for discovery |
-| `tvdb_api_key` | `TVDB_API_KEY` | Configured; **not yet used in sync** |
-| `fanart_api_key` | `FANART_API_KEY` | Optional poster/backdrop art |
-| `tautulli_url` | `TAUTULLI_URL` | Optional watch stats |
-| `tautulli_api_key` | `TAUTULLI_API_KEY` | Tautulli API key |
-
-### LLM settings
-
-| Field | Env var | Default | Description |
-|-------|---------|---------|-------------|
-| `llm_provider` | `LLM_PROVIDER` | `openai_compatible` | `openai_compatible`, `anthropic`, `ollama` |
-| `llm_base_url` | `LLM_BASE_URL` | `https://api.openai.com/v1` | Chat completions base |
-| `llm_api_key` | `LLM_API_KEY` | | Provider API key |
-| `llm_model` | `LLM_MODEL` | `gpt-4o-mini` | Chat model name |
-| `llm_embedding_model` | `LLM_EMBEDDING_MODEL` | `text-embedding-3-small` | Embeddings model |
-| `llm_embedding_base_url` | `LLM_EMBEDDING_BASE_URL` | | Overrides embedding endpoint |
-
-### Application flags
-
-| Field | Description |
-|-------|-------------|
-| `onboarding_complete` | User finished setup wizard |
-| `setup_wizard_pending` | Internal wizard state |
-| `library_sync_interval_hours` | Auto-sync interval (1–168, default 24) |
-| `tv_page_size` | Plex TV fetch page size (50–2000, default 500) |
-
-Secret fields masked on API read: `plex_token`, `radarr_api_key`, `sonarr_api_key`, `tmdb_api_key`, `tvdb_api_key`, `fanart_api_key`, `tautulli_api_key`, `llm_api_key`. Response includes `{field}_set: bool` instead.
+Persona sliders and curator name are **not** in `settings.json` — they live in `curator_persona_metrics` and `curator_system_config`.
 
 ---
 
 ## Pydantic schemas
 
-Defined in `mediacurator/models/schemas.py`.
+Defined in `curatorx/models/schemas.py`.
 
-### `TitleCard`
+### Lens and persona
 
-Display model for cards. See [DESIGN.md](DESIGN.md#titlecard-and-titledetail).
+| Model | Key fields |
+|-------|------------|
+| `Lens` | `lens_id`, `lens_name`, `description`, `created_at` |
+| `LensCreate` | `lens_id`, `lens_name`, `description` |
+| `ActiveLensUpdate` | `lens_id` |
+| `PersonaMetrics` | `curator_name`, `val_bro_prof`, `val_dipl_snark`, `val_pass_auto` |
 
-### `TitleDetail`
+### Chat (lens-aware)
 
-Extends `TitleCard` with `cast`, `directors`, `keywords`, `file_size_bytes`, `view_count`, `last_viewed_at`, `arr_id`, `purge_score`, `purge_reason`.
+| Model | Key fields |
+|-------|------------|
+| `ChatRequest` | `message`, `session_id`, **`lens_id`** (optional) |
+| `ChatMessage` | `id`, `role`, `blocks`, **`lens_id`** |
+| `ChatMessageBlock` | `type`, `content`, `items`, `action`, `payload` |
 
-### `ChatMessageBlock`
+### Titles and actions
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `type` | `text` \| `title_cards` \| `action_prompt` | Block discriminator |
-| `content` | str | For `text` |
-| `items` | `TitleCard[]` | For `title_cards` |
-| `action` | str | For `action_prompt`, e.g. `open_viewport` |
-| `payload` | dict | Action-specific data |
-
-### `ChatMessage`
-
-| Field | Type |
-|-------|------|
-| `id` | str |
-| `role` | `user` \| `assistant` \| `system` |
-| `blocks` | `ChatMessageBlock[]` |
-| `created_at` | float |
-
-### `ChatRequest`
-
-| Field | Type |
-|-------|------|
-| `message` | str |
-| `session_id` | str? |
-
-### `ActionConfirmRequest`
-
-| Field | Type | Default |
-|-------|------|---------|
-| `token` | str | |
-| `confirmed` | bool | `true` |
-
-### `PreferenceSignal`
-
-| Field | Type |
-|-------|------|
-| `signal_type` | `explicit` \| `positive` \| `negative` \| `add` \| `dismiss` |
-| `text` | str |
-| `tmdb_id` | int? |
-| `tvdb_id` | int? |
-| `media_type` | `movie` \| `show`? |
-
-### `ViewportPayload`
-
-| Field | Type |
-|-------|------|
-| `title` | str |
-| `items` | `TitleCard[]` |
+| Model | Purpose |
+|-------|---------|
+| `TitleCard` / `TitleDetail` | Card and detail page payloads |
+| `PreferenceSignal` | Taste signals; optional `lens_id` |
+| `ActionConfirmRequest` | Confirmation token execution |
 
 ---
 
@@ -253,34 +229,30 @@ Extends `TitleCard` with `cast`, `directors`, `keywords`, `file_size_bytes`, `vi
 
 ```mermaid
 erDiagram
+    curation_lenses ||--o{ chat_sessions : scopes
+    curation_lenses ||--o{ chat_messages : filters
+    curation_lenses ||--o{ lens_taste_profile : weights
+    curation_lenses ||--o{ interaction_telemetry : tracks
+    curation_lenses ||--o{ agent_blueprints : schedules
     library_items ||--o| embeddings : has
     chat_sessions ||--o{ chat_messages : contains
-    library_items {
-        int id PK
-        text rating_key UK
-        text media_type
-        int tmdb_id
-        int tvdb_id
-    }
-    embeddings {
-        int item_id PK
-        text vector
-    }
-    preference_facts {
-        int id PK
-        text signal_type
-        text text
-    }
-    pending_actions {
-        text token PK
-        text action_type
-    }
-    chat_sessions {
-        text id PK
+    curation_lenses {
+        text lens_id PK
+        text lens_name
     }
     chat_messages {
         text id PK
         text session_id FK
+        text lens_id
+    }
+    lens_taste_profile {
+        text lens_id FK
+        text cluster_tag
+        real weight
+    }
+    curator_persona_metrics {
+        text metric_id PK
+        text curator_name
     }
 ```
 
@@ -288,6 +260,6 @@ erDiagram
 
 ## Related documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — how data flows through sync and chat
-- [DESIGN.md](DESIGN.md) — API and block schema usage
-- [CONFIGURATION.md](CONFIGURATION.md) — operator-facing settings guide
+- [ARCHITECTURE.md](ARCHITECTURE.md) — sync and chat data flows
+- [DESIGN.md](DESIGN.md) — block schema and API usage
+- [curatorx_prd.md](curatorx_prd.md) — product source spec

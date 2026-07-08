@@ -14,7 +14,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md LICENSE ./
-COPY mediacurator ./mediacurator
+COPY curatorx ./curatorx
 COPY --from=frontend /frontend/dist ./frontend/dist
 
 RUN pip install --no-cache-dir ".[web]"
@@ -29,4 +29,4 @@ VOLUME ["/config"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8788/api/health')" || exit 1
 
-CMD ["python", "-m", "mediacurator.web"]
+CMD ["python", "-m", "curatorx.web"]

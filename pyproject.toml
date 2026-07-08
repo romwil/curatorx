@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mediacurator"
+name = "curatorx"
 version = "0.1.0"
 description = "Agentic Plex collection curator with BYOP LLM, RAG, and Radarr/Sonarr integration."
 readme = "README.md"
@@ -33,16 +33,16 @@ web = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/romwil/mediacurator"
-Repository = "https://github.com/romwil/mediacurator"
-Issues = "https://github.com/romwil/mediacurator/issues"
+Homepage = "https://github.com/romwil/curatorx"
+Repository = "https://github.com/romwil/curatorx"
+Issues = "https://github.com/romwil/curatorx/issues"
 
 [project.scripts]
-mediacurator-web = "mediacurator.web.__main__:main"
+curatorx-web = "curatorx.web.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mediacurator*"]
+include = ["curatorx*"]
 
 [tool.setuptools.package-data]
-"mediacurator.web" = ["static/**/*"]
+"curatorx.web" = ["static/**/*"]

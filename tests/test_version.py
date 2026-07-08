@@ -2,7 +2,7 @@
 
 import unittest
 
-from mediacurator import __version__
+from curatorx import __version__
 
 
 class VersionTests(unittest.TestCase):

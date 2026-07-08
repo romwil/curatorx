@@ -2,8 +2,8 @@
 
 import unittest
 
-from mediacurator.connectors.http import parse_plex_guid
-from mediacurator.connectors.tvdb import TVDBClient
+from curatorx.connectors.http import parse_plex_guid
+from curatorx.connectors.tvdb import TVDBClient
 
 
 class HttpHelperTests(unittest.TestCase):
