@@ -78,7 +78,7 @@ class CuratorAgent:
 
     async def run(self, session_id: str, user_message: str) -> Dict[str, Any]:
         self.db.ensure_chat_session(session_id, self.lens_id)
-        registry = ToolRegistry(self.db, self.settings)
+        registry = ToolRegistry(self.db, self.settings, self.lens_id)
 
         if not self.provider:
             text = await self._fallback_run(registry, user_message)
@@ -117,7 +117,7 @@ class CuratorAgent:
                 messages.append({"role": entry["role"], "content": text})
         messages.append({"role": "user", "content": user_message})
 
-        registry = ToolRegistry(self.db, self.settings)
+        registry = ToolRegistry(self.db, self.settings, self.lens_id)
         use_tools = bool(self.settings.llm_api_key or self.settings.llm_provider == "ollama")
         response = await self.provider.chat(messages, tools=TOOL_DEFINITIONS if use_tools else None)
         tool_calls = _extract_tool_calls(response)

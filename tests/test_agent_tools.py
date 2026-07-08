@@ -14,10 +14,27 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_remember_preference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "test.db")
-            registry = ToolRegistry(db, Settings())
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
             result = await registry.execute("remember_preference", {"text": "loves 70s sci-fi"})
             self.assertIn("saved", result)
-            self.assertIn("70s", build_system_prompt(db))
+            self.assertIn("70s", build_system_prompt(db, lens_id=DEFAULT_LENS_ID))
+
+    async def test_remember_preference_uses_agent_lens_not_active_lens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.create_lens("noir", "Noir Studies", "Hardboiled crime cinema")
+            db.set_active_lens_id(DEFAULT_LENS_ID)
+
+            registry = ToolRegistry(db, Settings(), "noir")
+            result = await registry.execute("remember_preference", {"text": "loves neo-noir"})
+            self.assertIn("saved", result)
+
+            noir_taste = db.get_lens_taste_profile("noir")
+            general_taste = db.get_lens_taste_profile(DEFAULT_LENS_ID)
+            self.assertEqual(len(noir_taste), 1)
+            self.assertIn("neo-noir", noir_taste[0]["cluster_tag"])
+            self.assertEqual(len(general_taste), 0)
+            self.assertIn("neo-noir", build_system_prompt(db, lens_id="noir"))
 
     async def test_analyze_watch_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -31,7 +48,7 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
                     "view_count": 0,
                 }
             )
-            registry = ToolRegistry(db, Settings())
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
             result = await registry.execute("analyze_watch_patterns", {})
             payload = json.loads(result)
             self.assertEqual(payload["unwatched_count"], 1)

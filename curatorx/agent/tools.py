@@ -217,9 +217,10 @@ def _tmdb_card(item: Mapping[str, Any], media_type: str, tmdb: TMDBClient, *, re
 
 
 class ToolRegistry:
-    def __init__(self, db: Database, settings: Settings) -> None:
+    def __init__(self, db: Database, settings: Settings, lens_id: str) -> None:
         self.db = db
         self.settings = settings
+        self.lens_id = lens_id
         self._cards: List[TitleCard] = []
         self._pending_tokens: List[str] = []
 
@@ -326,7 +327,11 @@ class ToolRegistry:
 
         remember_preference(
             self.db,
-            PreferenceSignal(signal_type="explicit", text=str(args.get("text") or "")),
+            PreferenceSignal(
+                signal_type="explicit",
+                text=str(args.get("text") or ""),
+                lens_id=self.lens_id,
+            ),
         )
         return json.dumps({"saved": True})
 
