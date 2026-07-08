@@ -1,0 +1,103 @@
+"""Title detail assembly."""
+
+from __future__ import annotations
+
+import json
+from typing import Optional
+
+from mediacurator.config_store import Settings
+from mediacurator.connectors.fanart import FanartClient
+from mediacurator.connectors.tmdb import TMDBClient
+from mediacurator.library.db import Database
+from mediacurator.models.schemas import TitleDetail
+from mediacurator.preferences.purge import suggest_purge_candidates
+
+
+def get_title_detail(
+    db: Database,
+    settings: Settings,
+    *,
+    media_type: str,
+    tmdb_id: Optional[int] = None,
+    tvdb_id: Optional[int] = None,
+    rating_key: Optional[str] = None,
+) -> TitleDetail:
+    row = None
+    if rating_key:
+        for item in db.all_library_items():
+            if item["rating_key"] == rating_key:
+                row = item
+                break
+    elif tmdb_id:
+        row = db.library_item_by_tmdb(tmdb_id, media_type)
+    elif tvdb_id:
+        row = db.library_item_by_tvdb(tvdb_id)
+
+    detail = TitleDetail(
+        media_type=media_type,  # type: ignore[arg-type]
+        title="",
+        in_library=row is not None,
+    )
+
+    if row:
+        detail.title = row["title"]
+        detail.year = row["year"]
+        detail.tmdb_id = row["tmdb_id"]
+        detail.tvdb_id = row["tvdb_id"]
+        detail.rating_key = row["rating_key"]
+        detail.poster_url = row["poster_url"] or ""
+        detail.backdrop_url = row["backdrop_url"] or ""
+        detail.overview = row["summary"] or ""
+        detail.genres = json.loads(row["genres"]) if row["genres"] else []
+        detail.cast = json.loads(row["cast"]) if row["cast"] else []
+        detail.directors = json.loads(row["directors"]) if row["directors"] else []
+        detail.keywords = json.loads(row["keywords"]) if row["keywords"] else []
+        detail.file_size_bytes = int(row["file_size"] or 0)
+        detail.view_count = int(row["view_count"] or 0)
+        detail.last_viewed_at = row["last_viewed_at"]
+        detail.in_radarr = bool(row["in_radarr"])
+        detail.in_sonarr = bool(row["in_sonarr"])
+
+    if settings.tmdb_api_key and tmdb_id:
+        tmdb = TMDBClient(settings.tmdb_api_key)
+        if media_type == "movie":
+            meta = tmdb.movie_details(tmdb_id)
+            detail.title = detail.title or str(meta.get("title") or "")
+            detail.overview = detail.overview or str(meta.get("overview") or "")
+            detail.rating = float(meta.get("vote_average") or 0) or None
+            if not detail.poster_url:
+                detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
+            if not detail.backdrop_url:
+                detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
+            detail.runtime_minutes = int((meta.get("runtime") or 0) or 0) or None
+            credits = meta.get("credits") or {}
+            if not detail.cast:
+                detail.cast = [c.get("name", "") for c in credits.get("cast", [])[:8]]
+            if not detail.directors:
+                detail.directors = [c.get("name", "") for c in credits.get("crew", []) if c.get("job") == "Director"]
+            keywords = (meta.get("keywords") or {}).get("keywords") or []
+            detail.keywords = detail.keywords or [k.get("name", "") for k in keywords if k.get("name")]
+        else:
+            meta = tmdb.tv_details(tmdb_id)
+            detail.title = detail.title or str(meta.get("name") or "")
+            detail.overview = detail.overview or str(meta.get("overview") or "")
+            detail.rating = float(meta.get("vote_average") or 0) or None
+            if not detail.poster_url:
+                detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
+            if not detail.backdrop_url:
+                detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
+
+    if settings.fanart_api_key and tmdb_id and media_type == "movie":
+        art = FanartClient(settings.fanart_api_key).movie(tmdb_id)
+        if not detail.poster_url:
+            detail.poster_url = FanartClient(settings.fanart_api_key).best_poster(art)
+
+    if row:
+        purge_cards = suggest_purge_candidates(db, settings, limit=100)
+        for card in purge_cards:
+            if card.rating_key == row["rating_key"]:
+                detail.purge_reason = card.recommendation_reason
+                detail.purge_score = 0.8
+                break
+
+    return detail

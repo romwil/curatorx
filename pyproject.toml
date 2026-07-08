@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mediacurator"
+version = "0.1.0"
+description = "Agentic Plex collection curator with BYOP LLM, RAG, and Radarr/Sonarr integration."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "romwil" }]
+keywords = ["plex", "radarr", "sonarr", "media", "curator", "ai", "unraid"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.0.0",
+    "sse-starlette>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/romwil/mediacurator"
+Repository = "https://github.com/romwil/mediacurator"
+Issues = "https://github.com/romwil/mediacurator/issues"
+
+[project.scripts]
+mediacurator-web = "mediacurator.web.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mediacurator*"]
+
+[tool.setuptools.package-data]
+"mediacurator.web" = ["static/**/*"]
