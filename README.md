@@ -50,6 +50,9 @@ DATA_DIR=./config python -m mediacurator.web
 
 ## Documentation
 
+- [Architecture](docs/ARCHITECTURE.md) — platform design, data flows, deployment, security
+- [Design](docs/DESIGN.md) — product principles, UX, agent tools, API surface
+- [Data model](docs/DATA_MODEL.md) — SQLite schema, settings, Pydantic types
 - [Configuration](docs/CONFIGURATION.md)
 - [Onboarding](docs/ONBOARDING.md)
 - [Docker / Unraid](docs/DOCKER.md)
