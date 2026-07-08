@@ -19,7 +19,18 @@ from sse_starlette.sse import EventSourceResponse
 from curatorx import __version__
 from curatorx.agent.curator import CuratorAgent, stream_agent
 from curatorx.agent.tools import execute_confirmed_action
-from curatorx.config_store import Settings, load_merged_settings, save_settings
+from curatorx.config_store import (
+    ANTHROPIC_MODEL_OPTIONS,
+    LLM_MODEL_DEFAULTS,
+    LLM_PROVIDER_DEFAULTS,
+    Settings,
+    load_dotenv_file,
+    load_merged_settings,
+    normalize_settings_llm,
+    resolve_llm_model,
+    save_settings,
+    secret_field_sources,
+)
 from curatorx.connectors.plex import PlexClient
 from curatorx.library.db import DEFAULT_LENS_ID
 from curatorx.library.titles import get_title_detail
@@ -39,8 +50,16 @@ from curatorx.preferences.store import remember_preference
 from curatorx.web.jobs import get_job_manager, get_sync_scheduler
 from curatorx.web.setup import (
     SECRET_FIELDS,
+    build_certifications_status,
     build_setup_status,
+    build_wizard_status,
+    invalidate_certifications_on_settings_change,
     merge_secret_fields,
+    record_service_integration,
+    resolve_test_payload,
+    sync_settings_to_db,
+    test_fanart,
+    test_llm,
     test_plex,
     test_radarr,
     test_sonarr,
@@ -51,6 +70,9 @@ from curatorx.web.setup import (
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/config"))
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+
+if os.environ.get("CURATORX_SKIP_DOTENV") != "1":
+    load_dotenv_file()
 
 app = FastAPI(title="CuratorX", version=__version__)
 
@@ -116,7 +138,7 @@ class SettingsPayload(BaseModel):
     fanart_api_key: str = ""
     tautulli_url: str = ""
     tautulli_api_key: str = ""
-    llm_provider: str = "openai_compatible"
+    llm_provider: str = "openai"
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
@@ -135,8 +157,13 @@ class TestPayload(BaseModel):
     sonarr_url: str = ""
     sonarr_api_key: str = ""
     tmdb_api_key: str = ""
+    fanart_api_key: str = ""
     tautulli_url: str = ""
     tautulli_api_key: str = ""
+    llm_provider: str = "openai"
+    llm_base_url: str = ""
+    llm_api_key: str = ""
+    llm_model: str = ""
 
 
 def _settings() -> Settings:
@@ -145,8 +172,10 @@ def _settings() -> Settings:
 
 def _mask_settings(settings: Settings) -> Dict[str, Any]:
     payload = asdict(settings)
+    sources = secret_field_sources(DATA_DIR)
     for field in SECRET_FIELDS:
         payload[f"{field}_set"] = bool(getattr(settings, field))
+        payload[f"{field}_source"] = sources.get(field, "")
         payload[field] = ""
     return payload
 
@@ -190,6 +219,25 @@ def setup_status() -> Dict[str, Any]:
     return build_setup_status(_settings())
 
 
+@app.get("/api/setup/wizard")
+def setup_wizard() -> Dict[str, Any]:
+    return build_wizard_status(_settings(), _db())
+
+
+@app.get("/api/setup/certifications")
+def setup_certifications() -> Dict[str, Any]:
+    return build_certifications_status(_db())
+
+
+@app.get("/api/setup/llm-providers")
+def llm_providers() -> Dict[str, Any]:
+    return {
+        "base_urls": LLM_PROVIDER_DEFAULTS,
+        "models": LLM_MODEL_DEFAULTS,
+        "anthropic_models": list(ANTHROPIC_MODEL_OPTIONS),
+    }
+
+
 @app.get("/api/settings")
 def get_settings() -> Dict[str, Any]:
     return _mask_settings(_settings())
@@ -199,34 +247,112 @@ def get_settings() -> Dict[str, Any]:
 def put_settings(payload: SettingsPayload) -> Dict[str, Any]:
     existing = _settings()
     merged = merge_secret_fields(payload.model_dump(), existing)
-    settings = Settings.from_mapping(merged)
+    settings = normalize_settings_llm(Settings.from_mapping(merged))
+    invalidate_certifications_on_settings_change(_db(), existing, settings, payload.model_dump())
     save_settings(DATA_DIR, settings)
+    sync_settings_to_db(_db(), settings)
     return _mask_settings(settings)
 
 
 @app.post("/api/setup/test/plex")
 def api_test_plex(payload: TestPayload) -> Dict[str, Any]:
-    return test_plex(payload.plex_url, payload.plex_token)
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_plex(resolved["plex_url"], resolved["plex_token"])
+    record_service_integration(
+        _db(),
+        "plex",
+        base_url=payload.plex_url or resolved["plex_url"],
+        api_token=resolved["plex_token"],
+        ok=bool(result.get("ok")),
+    )
+    return result
 
 
 @app.post("/api/setup/test/radarr")
 def api_test_radarr(payload: TestPayload) -> Dict[str, Any]:
-    return test_radarr(payload.radarr_url, payload.radarr_api_key)
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_radarr(resolved["radarr_url"], resolved["radarr_api_key"])
+    record_service_integration(
+        _db(),
+        "radarr",
+        base_url=resolved["radarr_url"],
+        api_token=resolved["radarr_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
 
 
 @app.post("/api/setup/test/sonarr")
 def api_test_sonarr(payload: TestPayload) -> Dict[str, Any]:
-    return test_sonarr(payload.sonarr_url, payload.sonarr_api_key)
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_sonarr(resolved["sonarr_url"], resolved["sonarr_api_key"])
+    record_service_integration(
+        _db(),
+        "sonarr",
+        base_url=resolved["sonarr_url"],
+        api_token=resolved["sonarr_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
 
 
 @app.post("/api/setup/test/tmdb")
 def api_test_tmdb(payload: TestPayload) -> Dict[str, Any]:
-    return test_tmdb(payload.tmdb_api_key)
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_tmdb(resolved["tmdb_api_key"])
+    record_service_integration(
+        _db(),
+        "tmdb",
+        api_token=resolved["tmdb_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
+
+
+@app.post("/api/setup/test/fanart")
+def api_test_fanart(payload: TestPayload) -> Dict[str, Any]:
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_fanart(resolved["fanart_api_key"])
+    record_service_integration(
+        _db(),
+        "fanart",
+        api_token=resolved["fanart_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
 
 
 @app.post("/api/setup/test/tautulli")
 def api_test_tautulli(payload: TestPayload) -> Dict[str, Any]:
-    return test_tautulli(payload.tautulli_url, payload.tautulli_api_key)
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_tautulli(resolved["tautulli_url"], resolved["tautulli_api_key"])
+    record_service_integration(
+        _db(),
+        "tautulli",
+        base_url=resolved["tautulli_url"],
+        api_token=resolved["tautulli_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
+
+
+@app.post("/api/setup/test/llm")
+def api_test_llm(payload: TestPayload) -> Dict[str, Any]:
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_llm(
+        resolved["llm_provider"],
+        resolved["llm_base_url"],
+        resolved["llm_api_key"],
+        resolved["llm_model"],
+    )
+    record_service_integration(
+        _db(),
+        "llm",
+        base_url=resolved["llm_base_url"],
+        api_token=resolved["llm_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
 
 
 @app.get("/api/plex/sections")

@@ -22,9 +22,10 @@ Settings persist to `{DATA_DIR}/settings.json` (default `/config/settings.json` 
 |---------|---------|-------------|
 | Radarr URL / key | `RADARR_URL`, `RADARR_API_KEY` | Add movies after confirmation |
 | Sonarr URL / key | `SONARR_URL`, `SONARR_API_KEY` | Add TV shows after confirmation |
-| LLM provider | `LLM_PROVIDER` | `openai_compatible`, `anthropic`, or `ollama` |
+| LLM provider | `LLM_PROVIDER` | Preset: `openai`, `anthropic`, `gemini`, `groq`, `mistral`, `together`, `deepseek`, `openrouter`, `ollama`, or `custom_openai_compatible` |
+| LLM base URL | `LLM_BASE_URL` | Optional when using a preset provider (defaults apply) |
 | LLM API key | `LLM_API_KEY` | Provider key (not required for Ollama) |
-| LLM model | `LLM_MODEL` | e.g. `gpt-4o-mini`, `claude-3-5-sonnet-latest` |
+| LLM model | `LLM_MODEL` | e.g. `gpt-4o-mini`, `claude-sonnet-4-20250514`, `gemini-2.0-flash` |
 
 ---
 
@@ -45,11 +46,18 @@ Settings persist to `{DATA_DIR}/settings.json` (default `/config/settings.json` 
 
 ## LLM providers
 
-| Provider | Configuration |
-|----------|---------------|
-| **openai_compatible** | OpenAI, OpenRouter, LiteLLM, etc. Set `LLM_BASE_URL` and `LLM_API_KEY`. |
-| **anthropic** | Set `LLM_API_KEY` and `LLM_MODEL`. |
-| **ollama** | Local inference on the homelab host. `LLM_BASE_URL=http://host:11434/v1`, provider `ollama`. |
+| Provider | Default base URL | Notes |
+|----------|------------------|-------|
+| **openai** | `https://api.openai.com/v1` | OpenAI API |
+| **anthropic** | `https://api.anthropic.com` | Native Claude API (`LLM_API_KEY` + `LLM_MODEL`) |
+| **gemini** | `https://generativelanguage.googleapis.com/v1beta/openai` | Google Gemini via OpenAI-compatible layer |
+| **groq** | `https://api.groq.com/openai/v1` | Groq inference |
+| **mistral** | `https://api.mistral.ai/v1` | Mistral API |
+| **together** | `https://api.together.xyz/v1` | Together AI |
+| **deepseek** | `https://api.deepseek.com/v1` | DeepSeek API |
+| **openrouter** | `https://openrouter.ai/api/v1` | OpenRouter gateway |
+| **ollama** | `http://localhost:11434/v1` | Local inference; no API key required |
+| **custom_openai_compatible** | User-defined | Set `LLM_BASE_URL` manually (LiteLLM, vLLM, etc.) |
 
 Embeddings use `LLM_EMBEDDING_MODEL` and optional `LLM_EMBEDDING_BASE_URL`. Without an embedding API, deterministic hash embeddings (384-dim) are used.
 
@@ -85,7 +93,11 @@ Default lens: **`general`**.
 
 ## Secrets handling
 
-API keys are stored in `settings.json` on the config volume. `GET /api/settings` masks secret fields and returns `{field}_set: true` instead of values. The browser never receives raw tokens after save.
+API keys are stored in `settings.json` on the config volume when saved via the UI. Environment variables (including values from `.env` when running locally or via Docker `env_file`) override file values at runtime and are **not** written back unless you explicitly save a new value in Settings.
+
+`GET /api/settings` masks secret fields and returns `{field}_set: true` plus `{field}_source` (`env` or `file`) instead of raw values. The config UI shows placeholders such as “Configured via environment (.env)” for env-backed secrets.
+
+Local dev: copy `.env.example` to `.env` — the web app loads it on startup (`load_dotenv_file`). Docker Compose also passes `.env` via `env_file`.
 
 ---
 

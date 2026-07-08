@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
-from curatorx.config_store import Settings
+from curatorx.agent.providers import get_chat_provider
+from curatorx.config_store import Settings, resolve_llm_base_url, resolve_llm_model
+from curatorx.connectors.fanart import FanartClient
 from curatorx.connectors.plex import PlexClient
 from curatorx.connectors.radarr import RadarrClient
 from curatorx.connectors.sonarr import SonarrClient
 from curatorx.connectors.tautulli import TautulliClient
 from curatorx.connectors.tmdb import TMDBClient
+from curatorx.library.db import Database
 
 CheckResult = Dict[str, Any]
 
@@ -24,14 +29,72 @@ SECRET_FIELDS = (
     "llm_api_key",
 )
 
+CERTIFIED_SERVICES = (
+    "llm",
+    "plex",
+    "radarr",
+    "sonarr",
+    "tmdb",
+    "fanart",
+    "tautulli",
+)
+
+ONBOARDING_HINTS = [
+    "Provide your local environment paths so I can read your storage structures.",
+    "Connect Plex next — I'll map your movie and TV libraries to the right sections.",
+    "Link Radarr and Sonarr so I can propose adds with your confirmation.",
+    "Tune my voice with the persona sliders, then add optional metadata services.",
+]
+
+PLEX_TYPE_ALIASES = {
+    "movie": "movie",
+    "movies": "movie",
+    "show": "show",
+    "shows": "show",
+    "tv": "show",
+}
+
+
+def normalize_plex_type(raw_type: str) -> str:
+    return PLEX_TYPE_ALIASES.get(str(raw_type or "").lower().strip(), str(raw_type or "").lower().strip())
+
+
+def _integration_token_marker(token: str) -> str:
+    cleaned = str(token or "").strip()
+    if not cleaned:
+        return ""
+    return "***configured***"
+
+
+def record_service_integration(
+    db: Database,
+    service_name: str,
+    *,
+    base_url: str = "",
+    api_token: str = "",
+    ok: bool,
+) -> None:
+    db.upsert_service_integration(
+        service_name,
+        base_url=base_url.strip().rstrip("/"),
+        api_token_encrypted=_integration_token_marker(api_token),
+        connection_status="verified" if ok else "failed",
+        last_tested_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        certified=1 if ok else 0,
+    )
+
 
 def test_plex(plex_url: str, plex_token: str) -> CheckResult:
     if not plex_url or not plex_token:
-        return {"ok": False, "message": "Plex URL and token are required."}
+        return {"ok": False, "message": "Plex URL and token are required.", "sections": []}
     try:
         client = PlexClient(plex_url.strip().rstrip("/"), plex_token.strip())
         sections = [
-            {"key": s.key, "title": s.title, "type": s.type}
+            {
+                "key": s.key,
+                "title": s.title,
+                "type": normalize_plex_type(s.type),
+            }
             for s in client.list_sections()
         ]
         return {
@@ -50,10 +113,13 @@ def test_radarr(radarr_url: str, radarr_api_key: str) -> CheckResult:
         client = RadarrClient(radarr_url.strip().rstrip("/"), radarr_api_key.strip())
         status = client.system_status()
         movies = client.movies()
+        version = status.get("version", "unknown")
+        count = len(movies)
         return {
             "ok": True,
-            "message": f"Radarr {status.get('version', 'unknown')} — {len(movies)} movies.",
-            "movie_count": len(movies),
+            "message": f"Connected — Radarr v{version} | {count:,} Movies Found",
+            "version": version,
+            "movie_count": count,
         }
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "message": str(error)}
@@ -66,10 +132,13 @@ def test_sonarr(sonarr_url: str, sonarr_api_key: str) -> CheckResult:
         client = SonarrClient(sonarr_url.strip().rstrip("/"), sonarr_api_key.strip())
         status = client.system_status()
         series = client.series_list()
+        version = status.get("version", "unknown")
+        count = len(series)
         return {
             "ok": True,
-            "message": f"Sonarr {status.get('version', 'unknown')} — {len(series)} series.",
-            "series_count": len(series),
+            "message": f"Connected — Sonarr v{version} | {count:,} Series Found",
+            "version": version,
+            "series_count": count,
         }
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "message": str(error)}
@@ -85,6 +154,16 @@ def test_tmdb(api_key: str) -> CheckResult:
         return {"ok": False, "message": str(error)}
 
 
+def test_fanart(api_key: str) -> CheckResult:
+    if not api_key:
+        return {"ok": False, "message": "Fanart API key is required."}
+    try:
+        FanartClient(api_key.strip()).movie(550)
+        return {"ok": True, "message": "Fanart.tv connected."}
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "message": str(error)}
+
+
 def test_tautulli(url: str, api_key: str) -> CheckResult:
     if not url or not api_key:
         return {"ok": False, "message": "Tautulli URL and API key are required."}
@@ -93,6 +172,170 @@ def test_tautulli(url: str, api_key: str) -> CheckResult:
         return {"ok": True, "message": f"Tautulli connected — {len(libraries)} libraries."}
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "message": str(error)}
+
+
+async def _ping_llm(settings: Settings) -> None:
+    provider = get_chat_provider(settings)
+    response = await provider.chat([{"role": "user", "content": "ping"}])
+    if not response:
+        raise RuntimeError("Empty response from LLM provider.")
+
+
+def test_llm(
+    llm_provider: str,
+    llm_base_url: str,
+    llm_api_key: str,
+    llm_model: str,
+) -> CheckResult:
+    provider = (llm_provider or "openai").lower().strip()
+    model = resolve_llm_model(provider, llm_model)
+    if not model:
+        return {"ok": False, "message": "LLM model identifier is required."}
+    if provider != "ollama" and not str(llm_api_key or "").strip():
+        return {"ok": False, "message": "LLM API key is required for this provider."}
+    resolved_base = resolve_llm_base_url(provider, llm_base_url)
+    if provider == "custom_openai_compatible" and not resolved_base:
+        return {"ok": False, "message": "Base URL is required for custom OpenAI-compatible providers."}
+    settings = Settings(
+        llm_provider=provider,
+        llm_base_url=resolved_base,
+        llm_api_key=str(llm_api_key or "").strip(),
+        llm_model=model,
+    )
+    try:
+        asyncio.run(_ping_llm(settings))
+        return {
+            "ok": True,
+            "message": f"LLM connected — {provider} / {model}",
+            "hint": ONBOARDING_HINTS[0],
+            "hints": ONBOARDING_HINTS,
+        }
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "message": str(error)}
+
+
+def _integration_certified(db: Database, service_name: str) -> bool:
+    row = db.get_service_integration(service_name)
+    if not row:
+        return False
+    keys = row.keys()
+    if "certified" in keys:
+        return bool(row["certified"])
+    return str(row["connection_status"]) == "verified"
+
+
+def build_certifications_status(db: Database) -> Dict[str, Any]:
+    services: Dict[str, Any] = {}
+    for service_name in CERTIFIED_SERVICES:
+        row = db.get_service_integration(service_name)
+        if row:
+            services[service_name] = {
+                "certified": _integration_certified(db, service_name),
+                "connection_status": str(row["connection_status"] or "unverified"),
+                "message": "",
+                "last_tested_at": row["last_tested_at"],
+            }
+        else:
+            services[service_name] = {
+                "certified": False,
+                "connection_status": "unverified",
+                "message": "",
+                "last_tested_at": None,
+            }
+    return {"services": services}
+
+
+def invalidate_certifications_on_settings_change(
+    db: Database,
+    before: Settings,
+    after: Settings,
+    incoming: Mapping[str, Any],
+) -> None:
+    checks = {
+        "llm": (
+            before.llm_base_url != after.llm_base_url
+            or before.llm_provider != after.llm_provider
+            or before.llm_model != after.llm_model
+            or bool(str(incoming.get("llm_api_key") or "").strip())
+        ),
+        "plex": (
+            before.plex_url != after.plex_url
+            or bool(str(incoming.get("plex_token") or "").strip())
+        ),
+        "radarr": (
+            before.radarr_url != after.radarr_url
+            or bool(str(incoming.get("radarr_api_key") or "").strip())
+        ),
+        "sonarr": (
+            before.sonarr_url != after.sonarr_url
+            or bool(str(incoming.get("sonarr_api_key") or "").strip())
+        ),
+        "tmdb": (
+            before.tmdb_api_key != after.tmdb_api_key
+            or bool(str(incoming.get("tmdb_api_key") or "").strip())
+        ),
+        "fanart": (
+            before.fanart_api_key != after.fanart_api_key
+            or bool(str(incoming.get("fanart_api_key") or "").strip())
+        ),
+        "tautulli": (
+            before.tautulli_url != after.tautulli_url
+            or bool(str(incoming.get("tautulli_api_key") or "").strip())
+        ),
+    }
+    for service_name, changed in checks.items():
+        if changed:
+            db.invalidate_service_certification(service_name)
+
+
+def build_wizard_status(settings: Settings, db: Database) -> Dict[str, Any]:
+    llm_verified = _integration_certified(db, "llm")
+    plex_verified = _integration_certified(db, "plex")
+    sections_set = bool(settings.plex_movie_section and settings.plex_tv_section)
+    radarr_verified = _integration_certified(db, "radarr")
+    sonarr_verified = _integration_certified(db, "sonarr")
+    persona = db.get_persona()
+    persona_complete = bool(persona and str(persona["curator_name"] or "").strip())
+
+    identity_complete = llm_verified and persona_complete
+    media_complete = plex_verified and sections_set
+    automation_complete = radarr_verified and sonarr_verified
+
+    steps = {
+        "identity_llm": {"complete": identity_complete, "llm_verified": llm_verified},
+        "media_core": {
+            "complete": media_complete,
+            "plex_verified": plex_verified,
+            "sections_set": sections_set,
+        },
+        "automation": {
+            "complete": automation_complete,
+            "radarr_verified": radarr_verified,
+            "sonarr_verified": sonarr_verified,
+        },
+        "persona": {"complete": persona_complete},
+        "optional_services": {"complete": settings.onboarding_complete},
+    }
+
+    if settings.onboarding_complete:
+        current_step = 5
+    elif automation_complete:
+        current_step = 4
+    elif media_complete:
+        current_step = 3
+    elif identity_complete:
+        current_step = 2
+    elif llm_verified:
+        current_step = 1
+    else:
+        current_step = 0
+
+    return {
+        "current_step": current_step,
+        "steps": steps,
+        "onboarding_complete": settings.onboarding_complete,
+        "certifications": build_certifications_status(db)["services"],
+    }
 
 
 def build_setup_status(settings: Settings) -> Dict[str, Any]:
@@ -121,3 +364,25 @@ def merge_secret_fields(incoming: Mapping[str, Any], existing: Settings) -> Dict
         if not str(merged.get(field) or "").strip():
             merged[field] = getattr(existing, field)
     return merged
+
+
+def resolve_test_payload(payload: Mapping[str, Any], existing: Settings) -> Dict[str, Any]:
+    """Fill empty test payload fields from merged settings (incl. env-backed secrets)."""
+    merged = merge_secret_fields(payload, existing)
+    for field in ("plex_url", "radarr_url", "sonarr_url", "tautulli_url", "llm_base_url"):
+        if not str(merged.get(field) or "").strip():
+            merged[field] = getattr(existing, field)
+    if not str(merged.get("llm_provider") or "").strip():
+        merged["llm_provider"] = existing.llm_provider
+    return merged
+
+
+def sync_settings_to_db(db: Database, settings: Settings) -> None:
+    db.sync_llm_config(
+        llm_provider=settings.llm_provider,
+        llm_base_url=settings.llm_base_url,
+        llm_model=settings.llm_model,
+    )
+    persona = db.get_persona()
+    if persona:
+        db.set_config("curator_name", str(persona["curator_name"] or "Curator"))

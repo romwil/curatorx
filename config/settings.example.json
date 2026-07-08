@@ -18,7 +18,7 @@
   "fanart_api_key": "",
   "tautulli_url": "",
   "tautulli_api_key": "",
-  "llm_provider": "openai_compatible",
+  "llm_provider": "openai",
   "llm_base_url": "https://api.openai.com/v1",
   "llm_api_key": "",
   "llm_model": "gpt-4o-mini",

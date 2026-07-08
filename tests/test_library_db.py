@@ -57,6 +57,25 @@ class DatabaseTests(unittest.TestCase):
                 names = {str(r["name"]) for r in rows}
             self.assertTrue(expected.issubset(names))
 
+    def test_service_integrations_certified_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.upsert_service_integration(
+                "plex",
+                base_url="http://plex.local",
+                api_token_encrypted="***configured***",
+                connection_status="verified",
+                certified=1,
+            )
+            row = db.get_service_integration("plex")
+            self.assertIsNotNone(row)
+            self.assertEqual(int(row["certified"]), 1)
+
+            db.invalidate_service_certification("plex")
+            row = db.get_service_integration("plex")
+            self.assertEqual(int(row["certified"]), 0)
+            self.assertEqual(str(row["connection_status"]), "unverified")
+
     def test_persona_and_general_lens_seeded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "test.db")

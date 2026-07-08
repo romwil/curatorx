@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping
@@ -38,6 +39,182 @@ ENV_TO_FIELD = {
 
 FIELD_TO_ENV = {value: key for key, value in ENV_TO_FIELD.items()}
 
+LLM_PROVIDER_DEFAULTS: Dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "together": "https://api.together.xyz/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "ollama": "http://localhost:11434/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "custom_openai_compatible": "",
+    "openai_compatible": "https://api.openai.com/v1",
+}
+
+ANTHROPIC_MODEL_OPTIONS: tuple[str, ...] = (
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5-20250929",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+    "claude-haiku-4-5",
+)
+
+ANTHROPIC_MODEL_ALIASES: Dict[str, str] = {
+    "claude-sonnet-4": "claude-sonnet-4-6",
+    "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-0": "claude-sonnet-4-6",
+    "claude-3-5-sonnet": "claude-sonnet-4-6",
+    "claude-3-5-sonnet-latest": "claude-sonnet-4-6",
+    "claude-3-sonnet": "claude-sonnet-4-6",
+    "claude-3-5-haiku": "claude-3-5-haiku-20241022",
+    "claude-3-5-haiku-latest": "claude-3-5-haiku-20241022",
+    "claude-3-haiku": "claude-3-haiku-20240307",
+    "claude-3-haiku-latest": "claude-3-haiku-20240307",
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+}
+
+_DEPRECATED_ANTHROPIC_MODELS: Dict[str, str] = {
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4-6",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4-6",
+    "claude-3-opus-20240229": "claude-sonnet-4-6",
+}
+
+_ANTHROPIC_DATED_MODEL = re.compile(r"^claude-[a-z0-9.-]+-\d{8}$", re.IGNORECASE)
+
+LLM_MODEL_DEFAULTS: Dict[str, str] = {
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-6",
+    "gemini": "gemini-2.0-flash",
+    "groq": "llama-3.3-70b-versatile",
+    "mistral": "mistral-small-latest",
+    "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "deepseek": "deepseek-chat",
+    "ollama": "llama3",
+    "openrouter": "openai/gpt-4o-mini",
+    "custom_openai_compatible": "gpt-4o-mini",
+    "openai_compatible": "gpt-4o-mini",
+}
+
+_OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "text-embedding", "chatgpt-")
+
+
+def model_looks_openai(model: str) -> bool:
+    cleaned = str(model or "").lower().strip()
+    return any(cleaned.startswith(prefix) for prefix in _OPENAI_MODEL_PREFIXES)
+
+
+def model_looks_anthropic(model: str) -> bool:
+    return str(model or "").lower().strip().startswith("claude")
+
+
+def normalize_anthropic_model(model: str) -> str:
+    """Map stale or alias Anthropic model IDs to pinned, API-valid snapshots."""
+    default = LLM_MODEL_DEFAULTS["anthropic"]
+    cleaned = str(model or "").strip()
+    if not cleaned:
+        return default
+    if model_looks_openai(cleaned):
+        return default
+
+    lowered = cleaned.lower()
+    if lowered in ANTHROPIC_MODEL_ALIASES:
+        return ANTHROPIC_MODEL_ALIASES[lowered]
+    if lowered in _DEPRECATED_ANTHROPIC_MODELS:
+        return _DEPRECATED_ANTHROPIC_MODELS[lowered]
+    if lowered.endswith("-latest"):
+        return default
+    if lowered in {option.lower() for option in ANTHROPIC_MODEL_OPTIONS}:
+        for option in ANTHROPIC_MODEL_OPTIONS:
+            if option.lower() == lowered:
+                return option
+    if _ANTHROPIC_DATED_MODEL.match(lowered):
+        return lowered
+    if model_looks_anthropic(lowered):
+        return default
+    return default
+
+
+def resolve_llm_model(provider: str, model: str = "") -> str:
+    normalized = (provider or "openai").lower().strip()
+    cleaned = str(model or "").strip()
+    default = LLM_MODEL_DEFAULTS.get(normalized, LLM_MODEL_DEFAULTS["openai"])
+    if not cleaned:
+        return default
+    if normalized == "anthropic":
+        return normalize_anthropic_model(cleaned)
+    if normalized in {"openai", "openai_compatible", "custom_openai_compatible"} and model_looks_anthropic(cleaned):
+        return LLM_MODEL_DEFAULTS["openai"]
+    return cleaned
+
+
+def normalize_settings_llm(settings: Settings) -> Settings:
+    provider = (settings.llm_provider or "openai").lower().strip()
+    resolved_model = resolve_llm_model(provider, settings.llm_model)
+    resolved_base = resolve_llm_base_url(provider, settings.llm_base_url)
+    if resolved_model == settings.llm_model and resolved_base == settings.llm_base_url:
+        return settings
+    return Settings.from_mapping(
+        {
+            **asdict(settings),
+            "llm_model": resolved_model,
+            "llm_base_url": resolved_base,
+        }
+    )
+
+
+def load_dotenv_file(path: Path | None = None) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (existing vars win)."""
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(path)
+    else:
+        candidates.append(Path.cwd() / ".env")
+        candidates.append(Path(__file__).resolve().parents[1] / ".env")
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        for raw_line in candidate.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = value
+        return
+
+
+def resolve_llm_base_url(provider: str, base_url: str = "") -> str:
+    normalized = (provider or "openai").lower().strip()
+    if normalized == "anthropic":
+        cleaned = base_url.strip().rstrip("/")
+        default = LLM_PROVIDER_DEFAULTS["anthropic"]
+        if not cleaned:
+            return default
+        stripped = cleaned.removesuffix("/v1")
+        openai_hosts = {
+            LLM_PROVIDER_DEFAULTS["openai"].removesuffix("/v1"),
+            LLM_PROVIDER_DEFAULTS["openai_compatible"].removesuffix("/v1"),
+        }
+        if stripped in openai_hosts:
+            return default
+        return stripped
+    if normalized == "custom_openai_compatible":
+        return base_url.strip().rstrip("/")
+    if base_url.strip():
+        return base_url.strip().rstrip("/")
+    return LLM_PROVIDER_DEFAULTS.get(normalized, LLM_PROVIDER_DEFAULTS["openai"])
+
 
 @dataclass
 class Settings:
@@ -60,7 +237,7 @@ class Settings:
     fanart_api_key: str = ""
     tautulli_url: str = ""
     tautulli_api_key: str = ""
-    llm_provider: str = "openai_compatible"
+    llm_provider: str = "openai"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
@@ -129,7 +306,9 @@ def load_merged_settings(data_dir: Path) -> Settings:
     for env_name, field_name in ENV_TO_FIELD.items():
         if env_name not in os.environ:
             continue
-        merged[field_name] = os.environ[env_name]
+        env_value = os.environ[env_name]
+        if env_value is not None and str(env_value).strip() != "":
+            merged[field_name] = env_value
     for int_field in (
         "radarr_quality_profile_id",
         "sonarr_quality_profile_id",
@@ -137,9 +316,34 @@ def load_merged_settings(data_dir: Path) -> Settings:
         "tv_page_size",
     ):
         env_key = FIELD_TO_ENV.get(int_field, "")
-        if env_key in os.environ:
+        if env_key in os.environ and str(os.environ[env_key]).strip() != "":
             merged[int_field] = int(os.environ[env_key])
-    return Settings.from_mapping(merged)
+    return normalize_settings_llm(Settings.from_mapping(merged))
+
+
+def secret_field_sources(data_dir: Path) -> Dict[str, str]:
+    """Return per-secret source: 'env', 'file', or '' (unset)."""
+    file_settings = Settings.load(data_dir / "settings.json")
+    sources: Dict[str, str] = {}
+    secret_fields = (
+        "plex_token",
+        "radarr_api_key",
+        "sonarr_api_key",
+        "tmdb_api_key",
+        "tvdb_api_key",
+        "fanart_api_key",
+        "tautulli_api_key",
+        "llm_api_key",
+    )
+    for field in secret_fields:
+        env_key = FIELD_TO_ENV.get(field, "")
+        if env_key in os.environ and str(os.environ[env_key]).strip():
+            sources[field] = "env"
+        elif str(getattr(file_settings, field) or "").strip():
+            sources[field] = "file"
+        else:
+            sources[field] = ""
+    return sources
 
 
 def save_settings(data_dir: Path, settings: Settings) -> Path:

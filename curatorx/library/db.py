@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS service_integrations (
     base_url TEXT,
     api_token_encrypted TEXT,
     connection_status TEXT DEFAULT 'unverified',
-    last_tested_at DATETIME
+    last_tested_at DATETIME,
+    certified INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS curator_persona_metrics (
@@ -167,6 +168,7 @@ class Database:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
             self._migrate_chat_lens_columns(conn)
+            self._migrate_service_integrations_certified(conn)
             self._seed_defaults(conn)
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -192,6 +194,20 @@ class Database:
             "UPDATE chat_messages SET lens_id = ? WHERE lens_id IS NULL OR lens_id = ''",
             (DEFAULT_LENS_ID,),
         )
+
+    def _migrate_service_integrations_certified(self, conn: sqlite3.Connection) -> None:
+        cols = self._table_columns(conn, "service_integrations")
+        if "certified" not in cols:
+            conn.execute(
+                "ALTER TABLE service_integrations ADD COLUMN certified INTEGER DEFAULT 0"
+            )
+            conn.execute(
+                """
+                UPDATE service_integrations
+                SET certified = 1
+                WHERE connection_status = 'verified'
+                """
+            )
 
     def _seed_defaults(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -451,6 +467,81 @@ class Database:
                 "SELECT config_key, config_value FROM curator_system_config ORDER BY config_key"
             ).fetchall()
             return {str(r["config_key"]): str(r["config_value"]) for r in rows}
+
+    def sync_llm_config(
+        self,
+        *,
+        llm_provider: str,
+        llm_base_url: str,
+        llm_model: str,
+    ) -> None:
+        self.set_config("llm_provider", llm_provider)
+        self.set_config("llm_base_url", llm_base_url)
+        self.set_config("llm_model", llm_model)
+
+    # --- Service integrations ---
+
+    def upsert_service_integration(
+        self,
+        service_name: str,
+        *,
+        base_url: str = "",
+        api_token_encrypted: str = "",
+        connection_status: str = "unverified",
+        last_tested_at: Optional[str] = None,
+        certified: Optional[int] = None,
+    ) -> None:
+        tested_at = last_tested_at or time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        certified_value = 0 if certified is None else int(bool(certified))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO service_integrations (
+                    service_name, base_url, api_token_encrypted, connection_status,
+                    last_tested_at, certified
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(service_name) DO UPDATE SET
+                    base_url=excluded.base_url,
+                    api_token_encrypted=excluded.api_token_encrypted,
+                    connection_status=excluded.connection_status,
+                    last_tested_at=excluded.last_tested_at,
+                    certified=excluded.certified
+                """,
+                (
+                    service_name,
+                    base_url,
+                    api_token_encrypted,
+                    connection_status,
+                    tested_at,
+                    certified_value,
+                ),
+            )
+
+    def invalidate_service_certification(self, service_name: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE service_integrations
+                SET certified = 0, connection_status = 'unverified'
+                WHERE service_name = ?
+                """,
+                (service_name,),
+            )
+
+    def get_service_integration(self, service_name: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM service_integrations WHERE service_name = ?",
+                (service_name,),
+            ).fetchone()
+
+    def get_service_integrations(self) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM service_integrations ORDER BY service_name ASC"
+                ).fetchall()
+            )
 
     def get_active_lens_id(self) -> str:
         return self.get_config(ACTIVE_LENS_CONFIG_KEY, DEFAULT_LENS_ID) or DEFAULT_LENS_ID

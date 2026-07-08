@@ -35,10 +35,14 @@ Lens activation updates theme accents (`.lens-active`) so you always know which 
 | Route | Purpose |
 |-------|---------|
 | `/` | Curator chat — Turnstyle or Immersive depending on view state |
-| `/config` | Setup wizard, persona sliders, service validation |
+| `/config` | Onboarding wizard (first run) or maintenance dashboard |
 | `/title/{movie\|show}/{id}` | Title detail — backdrop hero, metadata, purge notes |
 
 Session ID persists in `localStorage` for chat continuity across reloads.
+
+### Configuration page auto-certification
+
+On `/config` load, the UI fetches certification status and sequentially tests any **uncertified** service that has credentials configured (including env-backed secrets). Results appear inline per service card; successful tests set `certified` in SQLite so repeat visits skip re-testing until credentials change.
 
 ---
 
@@ -64,6 +68,17 @@ Session ID persists in `localStorage` for chat continuity across reloads.
 | POST | `/api/library/sync` | Start Plex index job |
 | GET | `/api/library/stats` | Item counts and last sync |
 | GET | `/api/title/{media_type}/{id}` | Title detail (`id_type` query) |
+
+### Setup and wizard
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/setup/status` | High-level readiness flags |
+| GET | `/api/setup/wizard` | Gated wizard step progress (includes `certifications`) |
+| GET | `/api/setup/certifications` | Per-service `certified` / `connection_status` / `last_tested_at` |
+| GET | `/api/setup/llm-providers` | Default base URLs per provider |
+| POST | `/api/setup/test/{service}` | Live connection test (`plex`, `radarr`, `sonarr`, `tmdb`, `fanart`, `tautulli`, `llm`) |
+| GET/PUT | `/api/settings` | Connection settings (secrets masked on read) |
 
 ### Lenses and persona
 

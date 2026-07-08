@@ -7,7 +7,45 @@ from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Protocol
 
 import httpx
 
-from curatorx.config_store import Settings
+from curatorx.config_store import Settings, resolve_llm_base_url, resolve_llm_model
+
+
+class LLMProviderError(RuntimeError):
+    """Raised when an LLM provider returns a structured API error."""
+
+
+def _anthropic_message_content(content: Any) -> Any:
+    """Use plain string content for simple messages (Anthropic API default)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return content
+    return str(content or "")
+
+
+def _format_anthropic_error(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        error_type = str(error.get("type") or "").strip()
+        message = str(error.get("message") or "").strip()
+        if response.status_code == 404 and error_type == "not_found_error":
+            if message.lower().startswith("model:"):
+                model_id = message.split(":", 1)[-1].strip()
+                return (
+                    f"Anthropic model not found: {model_id}. "
+                    "Use a pinned model ID such as claude-sonnet-4-6 or claude-sonnet-4-20250514."
+                )
+            return (
+                "Anthropic API endpoint or model not found. "
+                "Check LLM_BASE_URL (use https://api.anthropic.com) and LLM_MODEL."
+            )
+        if message:
+            return f"Anthropic API error ({response.status_code}): {message}"
+    return f"Anthropic API error ({response.status_code}): {response.text.strip() or 'request failed'}"
 
 
 class EmbeddingProvider(Protocol):
@@ -106,9 +144,10 @@ class OpenAIEmbeddingProvider:
 
 
 class AnthropicProvider:
-    def __init__(self, api_key: str, model: str) -> None:
+    def __init__(self, api_key: str, model: str, base_url: str = "https://api.anthropic.com") -> None:
         self.api_key = api_key
         self.model = model
+        self.base_url = base_url.rstrip("/").removesuffix("/v1")
 
     async def chat(
         self,
@@ -124,7 +163,7 @@ class AnthropicProvider:
             converted.append(
                 {
                     "role": message["role"],
-                    "content": [{"type": "text", "text": str(message.get("content") or "")}],
+                    "content": _anthropic_message_content(message.get("content")),
                 }
             )
         body: Dict[str, Any] = {
@@ -145,7 +184,7 @@ class AnthropicProvider:
             ]
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
-                "https://api.anthropic.com/v1/messages",
+                f"{self.base_url}/v1/messages",
                 headers={
                     "x-api-key": self.api_key,
                     "anthropic-version": "2023-06-01",
@@ -153,7 +192,8 @@ class AnthropicProvider:
                 },
                 json=body,
             )
-            response.raise_for_status()
+            if response.is_error:
+                raise LLMProviderError(_format_anthropic_error(response))
             return response.json()
 
     async def stream(
@@ -167,12 +207,12 @@ class AnthropicProvider:
 
 def get_chat_provider(settings: Settings) -> ChatProvider:
     provider = settings.llm_provider.lower()
+    model = resolve_llm_model(provider, settings.llm_model)
     if provider == "anthropic":
-        return AnthropicProvider(settings.llm_api_key, settings.llm_model)
-    base_url = settings.llm_base_url or "http://localhost:11434/v1"
-    if provider == "ollama":
-        base_url = settings.llm_base_url or "http://localhost:11434/v1"
-    return OpenAICompatibleProvider(base_url, settings.llm_api_key, settings.llm_model)
+        base_url = resolve_llm_base_url(provider, settings.llm_base_url)
+        return AnthropicProvider(settings.llm_api_key, model, base_url)
+    base_url = resolve_llm_base_url(provider, settings.llm_base_url)
+    return OpenAICompatibleProvider(base_url, settings.llm_api_key, model)
 
 
 def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
