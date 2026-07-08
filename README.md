@@ -208,7 +208,7 @@ Contributions welcome — especially lens presets, agent blueprints, connector h
 4. Run tests: `python -m unittest discover -s tests -v`
 5. Open a PR with a clear description and test plan
 
-Phase 1 ships backend foundations (`curatorx` package, default `general` lens, persona API). Frontend dual UI is evolving in parallel — coordinate on [issues](https://github.com/romwil/curatorx/issues) before large UI refactors.
+Phase 1 ships the `curatorx` package, default `general` lens, persona API, and dual UI (Turnstyle + Immersive). Open [issues](https://github.com/romwil/curatorx/issues) for lens presets, agent blueprints, and connector hardening.
 
 ---
 

@@ -228,7 +228,7 @@ Same as Phase 0: `POST /api/library/sync` → JobManager → Plex/Radarr/Sonarr/
 
 ### Add-to-Radarr confirmation
 
-Two-phase: propose token → user confirm → execute. TTL 600 seconds. Unchanged from MediaCurator Phase 0.
+Two-phase: propose token → user confirm → execute. TTL 600 seconds.
 
 ---
 
@@ -294,7 +294,7 @@ See [DOCKER.md](DOCKER.md) for Mac Colima, Unraid, and Compose details.
 |-----------|--------|
 | Curation lenses | **Implemented** — CRUD, active lens, chat filter |
 | Persona sliders | **Implemented** — DB-backed, hot-reload prompt |
-| Dual UI | **In progress** — Turnstyle + Immersive foundations |
+| Dual UI | **Implemented** — Turnstyle command lane + Immersive viewport |
 | Agent blueprints | Schema present; scheduler wiring **Future** |
 | Interaction telemetry | Schema present; ingestion **Future** |
 | True LLM SSE streaming | **Future** |
