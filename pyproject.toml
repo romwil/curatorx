@@ -32,6 +32,10 @@ web = [
     "sse-starlette>=2.0.0",
 ]
 
+mcp = [
+    "mcp>=1.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/romwil/curatorx"
 Repository = "https://github.com/romwil/curatorx"
@@ -39,6 +43,7 @@ Issues = "https://github.com/romwil/curatorx/issues"
 
 [project.scripts]
 curatorx-web = "curatorx.web.__main__:main"
+curatorx-mcp = "curatorx.mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

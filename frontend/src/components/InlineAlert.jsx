@@ -1,4 +1,4 @@
-export default function InlineAlert({ type, message, testId }) {
+export default function InlineAlert({ type, message, testId, onDismiss }) {
   if (!message || (type !== "success" && type !== "error")) return null;
   return (
     <div
@@ -6,7 +6,18 @@ export default function InlineAlert({ type, message, testId }) {
       role="alert"
       data-testid={testId || `inline-alert-${type}`}
     >
-      {message}
+      <span className="inline-alert-message">{message}</span>
+      {onDismiss ? (
+        <button
+          type="button"
+          className="inline-alert-dismiss ghost"
+          data-testid={testId ? `${testId}-dismiss` : "inline-alert-dismiss"}
+          onClick={onDismiss}
+          aria-label="Dismiss"
+        >
+          ×
+        </button>
+      ) : null}
     </div>
   );
 }

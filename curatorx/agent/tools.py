@@ -3,20 +3,45 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from curatorx.config_store import Settings
+from curatorx.config_store import (
+    Settings,
+    radarr_add_configuration_error,
+    resolve_radarr_root_folder,
+    resolve_sonarr_root_folder,
+    sonarr_add_configuration_error,
+    validate_arr_root_folder,
+)
+from curatorx.connectors.arr_errors import ArrTitleExistsError
 from curatorx.connectors.radarr import RadarrClient
 from curatorx.connectors.sonarr import SonarrClient
 from curatorx.connectors.tmdb import TMDBClient
 from curatorx.library.db import Database
+from curatorx.library.episodes import query_episodes, summarize_tv_progress
+from curatorx.library.facets import library_facet_catalog
+from curatorx.library.query import (
+    LibraryFilters,
+    _build_where,
+    aggregate_library,
+    filters_from_mapping,
+    format_overview_for_prompt,
+    library_overview,
+    maybe_set_audit_context_label,
+    query_library,
+    query_library_async,
+    row_to_query_item,
+)
 from curatorx.library.search import row_to_title_card, search_library
 from curatorx.library.titles import get_title_detail
 from curatorx.models.schemas import TitleCard
 from curatorx.preferences.purge import suggest_purge_candidates
 from curatorx.preferences.store import preference_context, remember_preference
+
+logger = logging.getLogger(__name__)
 
 
 TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
@@ -24,7 +49,10 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_library",
-            "description": "Search the user's Plex library by theme, genre, title, or mood.",
+            "description": (
+                "Search the user's Plex library by theme, genre, title, or mood. "
+                "Uses semantic/fuzzy matching over owned titles — not for exact external TMDB lookups."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -132,6 +160,27 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "search_tmdb",
+            "description": (
+                "Exact title search on TMDB for movies or shows not in the library. "
+                "Use before add_to_radarr/add_to_sonarr to resolve tmdb_id and tvdb_id. "
+                "Returns best match first with honest total_matched."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Title to look up on TMDB"},
+                    "year": {"type": "integer", "description": "Optional release/air year to narrow results"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "limit": {"type": "integer", "description": "Max results to return (default 10)"},
+                },
+                "required": ["title", "media_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_title_detail",
             "description": "Get rich metadata for a specific title by TMDB/TVDB id or Plex rating key.",
             "parameters": {
@@ -150,13 +199,20 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
         "type": "function",
         "function": {
             "name": "explore_genre",
-            "description": "Browse the user's library and TMDB for titles in a genre or theme.",
+            "description": (
+                "Browse a genre: owned titles (include_missing=false) or TMDB gaps to add "
+                "(include_missing=true). Do not use for add recommendations when the user only "
+                "wants missing titles — prefer find_collection_gaps or recommend_hidden_gems."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "genre": {"type": "string"},
                     "media_type": {"type": "string", "enum": ["movie", "show"]},
-                    "include_missing": {"type": "boolean", "description": "Include TMDB titles not in library"},
+                    "include_missing": {
+                        "type": "boolean",
+                        "description": "When true, include TMDB titles not in library (add candidates)",
+                    },
                 },
                 "required": ["genre", "media_type"],
             },
@@ -180,12 +236,246 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "analyze_watch_patterns",
-            "description": "Summarize viewing habits: top genres, stale titles, binge patterns.",
+            "name": "query_library",
+            "description": (
+                "Browse titles the user already owns with rich filters. "
+                "Supports year/decade, genre, director, cast, keywords, runtime, ratings, "
+                "date added (added_from, added_to, recently_added_days, sort=added_at), "
+                "watch history (last_viewed_from/to, stale_days, view_count), file_size for purge, "
+                "Radarr/Sonarr presence (in_radarr, in_sonarr), "
+                "semantic_query, fts_query, and TV progress fields. Returns total_matched and has_more."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "year_from": {"type": "integer"},
+                    "year_to": {"type": "integer"},
+                    "genres": {"type": "string", "description": "Comma-separated genre names"},
+                    "directors": {"type": "string", "description": "Comma-separated director names"},
+                    "cast": {"type": "string", "description": "Comma-separated actor names"},
+                    "keywords": {"type": "string", "description": "Comma-separated theme keywords"},
+                    "countries": {"type": "string", "description": "Comma-separated countries"},
+                    "content_ratings": {"type": "string", "description": "Comma-separated content ratings"},
+                    "original_language": {"type": "string"},
+                    "query": {"type": "string", "description": "Keyword filter on title/summary"},
+                    "fts_query": {"type": "string", "description": "Full-text search across metadata"},
+                    "semantic_query": {"type": "string", "description": "Mood/theme semantic search"},
+                    "unwatched_only": {"type": "boolean"},
+                    "min_view_count": {"type": "integer", "description": "Minimum play count"},
+                    "max_view_count": {"type": "integer", "description": "Maximum play count (0 = never watched)"},
+                    "stale_days": {
+                        "type": "integer",
+                        "description": "Not watched in this many days (includes never watched)",
+                    },
+                    "recently_added_days": {
+                        "type": "integer",
+                        "description": "Added to Plex within the last N days",
+                    },
+                    "added_from": {
+                        "type": "string",
+                        "description": "Added on/after date (YYYY-MM-DD or unix timestamp)",
+                    },
+                    "added_to": {
+                        "type": "string",
+                        "description": "Added on/before date (YYYY-MM-DD or unix timestamp)",
+                    },
+                    "last_viewed_from": {
+                        "type": "string",
+                        "description": "Last watched on/after date (YYYY-MM-DD or unix timestamp)",
+                    },
+                    "last_viewed_to": {
+                        "type": "string",
+                        "description": "Last watched on/before date (YYYY-MM-DD or unix timestamp)",
+                    },
+                    "runtime_min": {"type": "integer"},
+                    "runtime_max": {"type": "integer"},
+                    "vote_min": {"type": "number"},
+                    "vote_max": {"type": "number"},
+                    "file_size_min": {"type": "integer", "description": "Minimum file size in bytes"},
+                    "file_size_max": {"type": "integer", "description": "Maximum file size in bytes"},
+                    "in_radarr": {
+                        "type": "boolean",
+                        "description": "Filter by Radarr presence (false = in Plex but missing from Radarr)",
+                    },
+                    "in_sonarr": {
+                        "type": "boolean",
+                        "description": "Filter by Sonarr presence (false = in Plex but missing from Sonarr)",
+                    },
+                    "missing_tmdb_id": {
+                        "type": "boolean",
+                        "description": "Titles without TMDB id (metadata gaps)",
+                    },
+                    "in_progress_only": {"type": "boolean", "description": "Shows partially watched"},
+                    "sort": {
+                        "type": "string",
+                        "enum": [
+                            "title",
+                            "year",
+                            "view_count",
+                            "file_size",
+                            "vote_average",
+                            "runtime_minutes",
+                            "added_at",
+                            "last_viewed_at",
+                            "unwatched_episode_count",
+                        ],
+                    },
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer", "description": "Max 50 per page"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_library",
+            "description": (
+                "Aggregate owned library counts without listing every title. "
+                "group_by: decade, year, genre, media_type, director, actor, keyword, "
+                "country, language, content_rating, runtime_bucket, decade_genre."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_by": {
+                        "type": "string",
+                        "enum": [
+                            "decade",
+                            "year",
+                            "genre",
+                            "media_type",
+                            "director",
+                            "actor",
+                            "keyword",
+                            "country",
+                            "language",
+                            "content_rating",
+                            "runtime_bucket",
+                            "decade_genre",
+                        ],
+                    },
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "year_from": {"type": "integer"},
+                    "year_to": {"type": "integer"},
+                    "genres": {"type": "string", "description": "Comma-separated genre names"},
+                },
+                "required": ["group_by"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_library_overview",
+            "description": "Get compact library inventory stats: totals, decades, genres, directors, TV progress.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_facet_catalog",
+            "description": "List top directors, actors, keywords, countries, or languages in the owned library.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "facet_type": {
+                        "type": "string",
+                        "enum": ["director", "actor", "keyword", "country", "language"],
+                    },
+                    "limit": {"type": "integer"},
+                },
+                "required": ["facet_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_tv_episodes",
+            "description": "Browse unwatched or all episodes for a TV show the user owns.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "show": {"type": "string", "description": "Show title"},
+                    "show_id": {"type": "integer"},
+                    "season": {"type": "integer"},
+                    "unwatched_only": {"type": "boolean"},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_tv_progress",
+            "description": "Summarize TV completion progress by show or season.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_by": {"type": "string", "enum": ["show", "season"]},
+                    "in_progress_only": {"type": "boolean"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_watch_patterns",
+            "description": "Summarize viewing habits: top genres, stale titles, binge patterns.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "year_from": {"type": "integer"},
+                    "year_to": {"type": "integer"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                },
+            },
+        },
+    },
 ]
+
+
+def _tmdb_result_year(item: Mapping[str, Any]) -> Optional[int]:
+    date = item.get("release_date") or item.get("first_air_date") or ""
+    if not date:
+        return None
+    try:
+        return int(str(date)[:4])
+    except ValueError:
+        return None
+
+
+def _rank_tmdb_search_results(results: List[Mapping[str, Any]], *, year: Optional[int]) -> List[Mapping[str, Any]]:
+    if year is None:
+        return list(results)
+    exact = [item for item in results if _tmdb_result_year(item) == year]
+    rest = [item for item in results if _tmdb_result_year(item) != year]
+    return exact + rest
+
+
+def _tmdb_search_item_to_tool_item(item: Mapping[str, Any], media_type: str) -> Dict[str, Any]:
+    title = str(item.get("title") or item.get("name") or "")
+    overview = str(item.get("overview") or "")
+    payload: Dict[str, Any] = {
+        "title": title,
+        "year": _tmdb_result_year(item),
+        "media_type": media_type,
+        "tmdb_id": int(item.get("id") or 0),
+        "overview": overview[:200] if overview else "",
+        "in_library": False,
+    }
+    if media_type == "show":
+        external = item.get("external_ids") or {}
+        if external.get("tvdb_id"):
+            payload["tvdb_id"] = int(external["tvdb_id"])
+    return payload
 
 
 def _tmdb_card(item: Mapping[str, Any], media_type: str, tmdb: TMDBClient, *, reason: str = "") -> TitleCard:
@@ -216,6 +506,98 @@ def _tmdb_card(item: Mapping[str, Any], media_type: str, tmdb: TMDBClient, *, re
     )
 
 
+def _card_to_tool_item(card: TitleCard) -> Dict[str, Any]:
+    item: Dict[str, Any] = {
+        "title": card.title,
+        "year": card.year,
+        "media_type": card.media_type,
+        "genres": list(card.genres or []),
+        "view_count": getattr(card, "view_count", 0),
+        "in_library": card.in_library,
+    }
+    if card.tmdb_id:
+        item["tmdb_id"] = card.tmdb_id
+    if card.tvdb_id:
+        item["tvdb_id"] = card.tvdb_id
+    if card.rating_key:
+        item["rating_key"] = card.rating_key
+    return item
+
+
+def _query_item_to_tool_item(item: Mapping[str, Any]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "title": item.get("title"),
+        "year": item.get("year"),
+        "media_type": item.get("media_type"),
+        "genres": item.get("genres") or [],
+        "directors": item.get("directors") or [],
+        "cast": item.get("cast") or [],
+        "keywords": item.get("keywords") or [],
+        "view_count": item.get("view_count"),
+        "runtime_minutes": item.get("runtime_minutes"),
+        "vote_average": item.get("vote_average"),
+        "content_rating": item.get("content_rating"),
+        "unwatched_episode_count": item.get("unwatched_episode_count"),
+        "total_episode_count": item.get("total_episode_count"),
+        "in_library": True,
+    }
+    if item.get("tmdb_id"):
+        payload["tmdb_id"] = item["tmdb_id"]
+    if item.get("tvdb_id"):
+        payload["tvdb_id"] = item["tvdb_id"]
+    if item.get("rating_key"):
+        payload["rating_key"] = item["rating_key"]
+    return payload
+
+
+def _enrich_show_external_ids(item: Mapping[str, Any], tmdb: TMDBClient) -> Mapping[str, Any]:
+    if item.get("external_ids"):
+        return item
+    tmdb_id = int(item.get("id") or 0)
+    if not tmdb_id:
+        return item
+    try:
+        details = tmdb.tv_details(tmdb_id)
+    except RuntimeError:
+        return item
+    return {**item, "external_ids": details.get("external_ids") or {}}
+
+
+def _detail_to_tool_payload(detail: Any, settings: Settings) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "title": detail.title,
+        "year": detail.year,
+        "media_type": detail.media_type,
+        "in_library": detail.in_library,
+        "overview": detail.overview[:200] if detail.overview else "",
+    }
+    if detail.tmdb_id:
+        payload["tmdb_id"] = detail.tmdb_id
+    if detail.tvdb_id:
+        payload["tvdb_id"] = detail.tvdb_id
+    if detail.rating_key:
+        payload["rating_key"] = detail.rating_key
+    if not detail.title and not detail.overview:
+        if not settings.tmdb_api_key and not detail.in_library:
+            payload["error"] = "TMDB API key not configured — cannot look up external titles"
+        else:
+            payload["error"] = "No metadata found for the provided id"
+    return payload
+
+
+def _attach_query_cards(registry: "ToolRegistry", db: Database, items: List[Mapping[str, Any]]) -> None:
+    for item in items:
+        row = db.library_item_by_id(int(item["id"])) if item.get("id") else None
+        if row is not None:
+            registry._cards.append(row_to_title_card(row, reason="In your library"))
+
+
+def _append_recommendation_cards(registry: "ToolRegistry", cards: List[TitleCard]) -> None:
+    """Attach title cards for titles the user may want to add (never owned)."""
+    registry._recommendation_context = True
+    registry._cards.extend(card for card in cards if not card.in_library)
+
+
 class ToolRegistry:
     def __init__(self, db: Database, settings: Settings, lens_id: str) -> None:
         self.db = db
@@ -223,10 +605,15 @@ class ToolRegistry:
         self.lens_id = lens_id
         self._cards: List[TitleCard] = []
         self._pending_tokens: List[str] = []
+        self._recommendation_context = False
 
     @property
     def cards(self) -> List[TitleCard]:
         return list(self._cards)
+
+    @property
+    def recommendation_context(self) -> bool:
+        return self._recommendation_context
 
     @property
     def pending_tokens(self) -> List[str]:
@@ -235,8 +622,14 @@ class ToolRegistry:
     async def execute(self, name: str, arguments: Mapping[str, Any]) -> str:
         handler: Optional[Callable] = getattr(self, f"_tool_{name}", None)
         if handler is None:
+            logger.warning("Unknown agent tool requested: %s", name)
             return json.dumps({"error": f"Unknown tool {name}"})
-        return await handler(arguments)
+        logger.debug("Executing tool %s", name)
+        try:
+            return await handler(arguments)
+        except Exception:
+            logger.exception("Tool %s failed", name)
+            raise
 
     async def _tool_search_library(self, args: Mapping[str, Any]) -> str:
         cards = await search_library(
@@ -246,7 +639,69 @@ class ToolRegistry:
             media_type=args.get("media_type"),
         )
         self._cards.extend(cards)
-        return json.dumps({"count": len(cards), "titles": [c.title for c in cards]})
+        items = [_card_to_tool_item(c) for c in cards]
+        return json.dumps(
+            {
+                "total_matched": len(cards),
+                "returned": len(cards),
+                "offset": 0,
+                "has_more": False,
+                "items": items,
+            }
+        )
+
+    async def _tool_query_library(self, args: Mapping[str, Any]) -> str:
+        filters = filters_from_mapping(args)
+        if filters.semantic_query:
+            result = await query_library_async(self.db, filters, self.settings)
+        else:
+            result = query_library(self.db, filters)
+        _attach_query_cards(self, self.db, result["items"])
+        maybe_set_audit_context_label(self.db, filters)
+        payload = {
+            **result,
+            "items": [_query_item_to_tool_item(item) for item in result["items"]],
+        }
+        if result.get("has_more"):
+            payload["hint"] = "More titles match — increase offset or call summarize_library first."
+        return json.dumps(payload)
+
+    async def _tool_get_facet_catalog(self, args: Mapping[str, Any]) -> str:
+        facet_type = str(args.get("facet_type") or "director")
+        limit = int(args.get("limit") or 50)
+        return json.dumps(library_facet_catalog(self.db, facet_type, limit=limit))
+
+    async def _tool_query_tv_episodes(self, args: Mapping[str, Any]) -> str:
+        result = query_episodes(
+            self.db,
+            show=args.get("show"),
+            show_id=args.get("show_id"),
+            season=args.get("season"),
+            unwatched_only=bool(args.get("unwatched_only")),
+            offset=int(args.get("offset") or 0),
+            limit=int(args.get("limit") or 25),
+        )
+        return json.dumps(result)
+
+    async def _tool_summarize_tv_progress(self, args: Mapping[str, Any]) -> str:
+        result = summarize_tv_progress(
+            self.db,
+            group_by=str(args.get("group_by") or "show"),
+            in_progress_only=bool(args.get("in_progress_only")),
+            limit=int(args.get("limit") or 25),
+        )
+        return json.dumps(result)
+
+    async def _tool_summarize_library(self, args: Mapping[str, Any]) -> str:
+        group_by = str(args.get("group_by") or "decade")
+        filters = filters_from_mapping(args)
+        maybe_set_audit_context_label(self.db, filters)
+        summary = aggregate_library(self.db, group_by, filters)  # type: ignore[arg-type]
+        return json.dumps(summary)
+
+    async def _tool_get_library_overview(self, args: Mapping[str, Any]) -> str:
+        del args
+        return json.dumps(library_overview(self.db))
 
     async def _tool_find_collection_gaps(self, args: Mapping[str, Any]) -> str:
         media_type = str(args.get("media_type") or "movie")
@@ -279,14 +734,25 @@ class ToolRegistry:
         cards: List[TitleCard] = []
         for item in results:
             tmdb_id = int(item.get("id") or 0)
-            if tmdb_id in owned:
+            if tmdb_id <= 0 or tmdb_id in owned:
                 continue
+            if media_type == "show":
+                item = _enrich_show_external_ids(item, tmdb)
             card = _tmdb_card(item, media_type, tmdb, reason="Missing from your collection")
             cards.append(card)
             if len(cards) >= 12:
                 break
-        self._cards.extend(cards)
-        return json.dumps({"missing_count": len(cards), "titles": [c.title for c in cards]})
+        _append_recommendation_cards(self, cards)
+        return json.dumps(
+            {
+                "total_matched": len(cards),
+                "returned": len(cards),
+                "offset": 0,
+                "has_more": False,
+                "items": [_card_to_tool_item(c) for c in cards],
+                "note": "These are TMDB titles missing from the library, not owned titles.",
+            }
+        )
 
     async def _tool_recommend_hidden_gems(self, args: Mapping[str, Any]) -> str:
         media_type = str(args.get("media_type") or "movie")
@@ -306,21 +772,40 @@ class ToolRegistry:
         cards = []
         for item in results:
             tmdb_id = int(item.get("id") or 0)
-            if tmdb_id in owned:
+            if tmdb_id <= 0 or tmdb_id in owned:
                 continue
             rating = float(item.get("vote_average") or 0)
             if rating < 7.0:
                 continue
+            if media_type == "show":
+                item = _enrich_show_external_ids(item, tmdb)
             cards.append(_tmdb_card(item, media_type, tmdb, reason=f"Hidden gem ({rating:.1f}/10)"))
             if len(cards) >= 10:
                 break
-        self._cards.extend(cards)
-        return json.dumps({"count": len(cards)})
+        _append_recommendation_cards(self, cards)
+        return json.dumps(
+            {
+                "total_matched": len(cards),
+                "returned": len(cards),
+                "offset": 0,
+                "has_more": False,
+                "items": [_card_to_tool_item(c) for c in cards],
+                "note": "Highly rated TMDB titles not in the library.",
+            }
+        )
 
     async def _tool_suggest_purge_candidates(self, args: Mapping[str, Any]) -> str:
         cards = suggest_purge_candidates(self.db, self.settings, limit=int(args.get("limit") or 12))
         self._cards.extend(cards)
-        return json.dumps({"count": len(cards), "titles": [c.title for c in cards]})
+        return json.dumps(
+            {
+                "total_matched": len(cards),
+                "returned": len(cards),
+                "offset": 0,
+                "has_more": False,
+                "items": [_card_to_tool_item(c) for c in cards],
+            }
+        )
 
     async def _tool_remember_preference(self, args: Mapping[str, Any]) -> str:
         from curatorx.models.schemas import PreferenceSignal
@@ -336,10 +821,30 @@ class ToolRegistry:
         return json.dumps({"saved": True})
 
     async def _tool_add_to_radarr(self, args: Mapping[str, Any]) -> str:
+        config_error = radarr_add_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        client = RadarrClient(self.settings.radarr_url, self.settings.radarr_api_key)
+        root_error = validate_arr_root_folder(
+            "Radarr",
+            resolve_radarr_root_folder(self.settings),
+            client.root_folders(),
+        )
+        if root_error:
+            return json.dumps({"error": root_error})
+        tmdb_id = int(args["tmdb_id"])
+        existing = check_radarr_already_exists(
+            client,
+            tmdb_id,
+            title=str(args.get("title") or ""),
+        )
+        if existing:
+            mark_in_radarr(self.db, tmdb_id)
+            return json.dumps(existing)
         token = uuid.uuid4().hex
         payload = {
             "action": "add_radarr",
-            "tmdb_id": int(args["tmdb_id"]),
+            "tmdb_id": tmdb_id,
             "title": str(args.get("title") or ""),
         }
         self.db.save_pending_action(token, "add_radarr", payload)
@@ -347,10 +852,30 @@ class ToolRegistry:
         return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to add to Radarr"})
 
     async def _tool_add_to_sonarr(self, args: Mapping[str, Any]) -> str:
+        config_error = sonarr_add_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        client = SonarrClient(self.settings.sonarr_url, self.settings.sonarr_api_key)
+        root_error = validate_arr_root_folder(
+            "Sonarr",
+            resolve_sonarr_root_folder(self.settings),
+            client.root_folders(),
+        )
+        if root_error:
+            return json.dumps({"error": root_error})
+        tvdb_id = int(args["tvdb_id"])
+        existing = check_sonarr_already_exists(
+            client,
+            tvdb_id,
+            title=str(args.get("title") or ""),
+        )
+        if existing:
+            mark_in_sonarr(self.db, tvdb_id)
+            return json.dumps(existing)
         token = uuid.uuid4().hex
         payload = {
             "action": "add_sonarr",
-            "tvdb_id": int(args["tvdb_id"]),
+            "tvdb_id": tvdb_id,
             "title": str(args.get("title") or ""),
         }
         self.db.save_pending_action(token, "add_sonarr", payload)
@@ -370,6 +895,63 @@ class ToolRegistry:
         self._pending_tokens.append(token)
         return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to remove"})
 
+    async def _tool_search_tmdb(self, args: Mapping[str, Any]) -> str:
+        if not self.settings.tmdb_api_key:
+            return json.dumps({"error": "TMDB API key not configured"})
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return json.dumps({"error": "title is required"})
+        media_type = str(args.get("media_type") or "movie")
+        year = args.get("year")
+        year_int = int(year) if year is not None else None
+        limit = min(int(args.get("limit") or 10), 20)
+
+        tmdb = TMDBClient(self.settings.tmdb_api_key)
+        if media_type == "movie":
+            page = tmdb.search_movie_page(title, year=year_int)
+        else:
+            page = tmdb.search_tv_page(title)
+        results = page.get("results", [])
+        if not isinstance(results, list):
+            results = []
+        total_matched = int(page.get("total_results") or len(results))
+        results = _rank_tmdb_search_results(results, year=year_int)
+
+        owned = self.db.owned_tmdb_ids(media_type)
+        cards: List[TitleCard] = []
+        items: List[Dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, Mapping):
+                continue
+            tmdb_id = int(item.get("id") or 0)
+            if tmdb_id <= 0:
+                continue
+            if media_type == "show":
+                item = _enrich_show_external_ids(item, tmdb)
+            card = _tmdb_card(item, media_type, tmdb, reason="TMDB title match")
+            card.in_library = tmdb_id in owned
+            cards.append(card)
+            tool_item = _tmdb_search_item_to_tool_item(item, media_type)
+            tool_item["in_library"] = card.in_library
+            items.append(tool_item)
+            if len(items) >= limit:
+                break
+
+        _append_recommendation_cards(self, cards)
+        return json.dumps(
+            {
+                "total_matched": total_matched,
+                "returned": len(items),
+                "offset": 0,
+                "has_more": total_matched > len(items),
+                "items": items,
+                "note": (
+                    "Best match first. Items include in_library flag — only propose adds for "
+                    "in_library=false. Use tmdb_id for add_to_radarr; tvdb_id for add_to_sonarr."
+                ),
+            }
+        )
+
     async def _tool_get_title_detail(self, args: Mapping[str, Any]) -> str:
         media_type = str(args.get("media_type") or "movie")
         kwargs: Dict[str, Any] = {"media_type": media_type}
@@ -384,24 +966,34 @@ class ToolRegistry:
         detail = get_title_detail(self.db, self.settings, **kwargs)
         card = TitleCard.model_validate(detail.model_dump())
         self._cards.append(card)
-        return json.dumps({"title": detail.title, "in_library": detail.in_library, "overview": detail.overview[:200]})
+        return json.dumps(_detail_to_tool_payload(detail, self.settings))
 
     async def _tool_explore_genre(self, args: Mapping[str, Any]) -> str:
-        genre = str(args.get("genre") or "").lower()
+        genre = str(args.get("genre") or "").strip()
         media_type = str(args.get("media_type") or "movie")
         include_missing = bool(args.get("include_missing", True))
-        cards: List[TitleCard] = []
-        for row in self.db.all_library_items():
-            if row["media_type"] != media_type:
-                continue
-            genres = json.loads(row["genres"]) if row["genres"] else []
-            if any(genre in g.lower() for g in genres):
-                cards.append(row_to_title_card(row, reason=f"In library · {genre.title()}"))
+        offset = int(args.get("offset") or 0)
+        page_limit = int(args.get("limit") or 16)
+
+        filters = LibraryFilters(
+            media_type=media_type,
+            genres=[genre] if genre else [],
+            offset=offset,
+            limit=page_limit,
+        )
+        owned_result = query_library(self.db, filters)
+        owned_cards: List[TitleCard] = []
+        for item in owned_result["items"]:
+            row = self.db.library_item_by_id(int(item["id"]))
+            if row is not None:
+                owned_cards.append(row_to_title_card(row, reason=f"In library · {genre.title()}"))
+        missing_cards: List[TitleCard] = []
+
         if include_missing and self.settings.tmdb_api_key:
             tmdb = TMDBClient(self.settings.tmdb_api_key)
             owned = self.db.owned_tmdb_ids(media_type)
             genre_list = tmdb.genre_list_movies() if media_type == "movie" else tmdb.genre_list_tv()
-            genre_ids = [str(g["id"]) for g in genre_list if genre in str(g.get("name", "")).lower()]
+            genre_ids = [str(g["id"]) for g in genre_list if genre.lower() in str(g.get("name", "")).lower()]
             if genre_ids:
                 if media_type == "movie":
                     results = tmdb.discover_movies(with_genres=",".join(genre_ids))
@@ -409,19 +1001,39 @@ class ToolRegistry:
                     results = tmdb.discover_tv(with_genres=",".join(genre_ids))
                 for item in results:
                     tmdb_id = int(item.get("id") or 0)
-                    if tmdb_id in owned:
+                    if tmdb_id <= 0 or tmdb_id in owned:
                         continue
-                    if media_type == "show" and not item.get("external_ids"):
-                        try:
-                            details = tmdb.tv_details(tmdb_id)
-                            item = {**item, "external_ids": details.get("external_ids") or {}}
-                        except RuntimeError:
-                            pass
-                    cards.append(_tmdb_card(item, media_type, tmdb, reason=f"Not in library · {genre.title()}"))
-                    if len(cards) >= 16:
+                    if media_type == "show":
+                        item = _enrich_show_external_ids(item, tmdb)
+                    missing_cards.append(
+                        _tmdb_card(item, media_type, tmdb, reason=f"Not in library · {genre.title()}")
+                    )
+                    if len(missing_cards) >= page_limit:
                         break
-        self._cards.extend(cards[:16])
-        return json.dumps({"count": len(cards[:16]), "genre": genre, "titles": [c.title for c in cards[:16]]})
+
+        if include_missing:
+            _append_recommendation_cards(self, missing_cards)
+        else:
+            self._cards.extend(owned_cards)
+
+        response_items = [_card_to_tool_item(c) for c in owned_cards + missing_cards]
+        return json.dumps(
+            {
+                "genre": genre,
+                "total_in_library": owned_result["total_matched"],
+                "returned_in_library": owned_result["returned"],
+                "library_has_more": owned_result["has_more"],
+                "returned_missing": len(missing_cards),
+                "total_returned": len(response_items),
+                "items": response_items,
+                "note": (
+                    "items mix owned (in_library=true) and TMDB gaps (in_library=false). "
+                    "Only propose adds for in_library=false."
+                    if include_missing
+                    else "Owned library titles only."
+                ),
+            }
+        )
 
     async def _tool_what_to_watch_tonight(self, args: Mapping[str, Any]) -> str:
         media_type = args.get("media_type")
@@ -444,16 +1056,33 @@ class ToolRegistry:
             candidates.sort(key=lambda item: item[0], reverse=True)
             cards = [card for _, card in candidates[:limit]]
         self._cards.extend(cards[:limit])
-        return json.dumps({"count": len(cards[:limit]), "titles": [c.title for c in cards[:limit]]})
+        return json.dumps(
+            {
+                "total_matched": len(cards[:limit]),
+                "returned": len(cards[:limit]),
+                "offset": 0,
+                "has_more": False,
+                "items": [_card_to_tool_item(c) for c in cards[:limit]],
+            }
+        )
 
     async def _tool_analyze_watch_patterns(self, args: Mapping[str, Any]) -> str:
-        del args
+        filters = filters_from_mapping(args)
+        where_sql, params = _build_where_for_patterns(filters)
         genre_counts: Dict[str, int] = {}
         total_views = 0
         unwatched = 0
         stale = 0
+        decade_counts: Dict[int, int] = {}
         now = time.time()
-        for row in self.db.all_library_items():
+        total_items = 0
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM library_items WHERE {where_sql}",
+                params,
+            ).fetchall()
+        for row in rows:
+            total_items += 1
             views = int(row["view_count"] or 0)
             total_views += views
             if views == 0:
@@ -461,17 +1090,83 @@ class ToolRegistry:
             last = row["last_viewed_at"]
             if last and (now - int(last)) > 365 * 24 * 3600:
                 stale += 1
+            if row["year"] is not None:
+                decade = (int(row["year"]) // 10) * 10
+                decade_counts[decade] = decade_counts.get(decade, 0) + 1
             for genre in json.loads(row["genres"]) if row["genres"] else []:
                 genre_counts[genre] = genre_counts.get(genre, 0) + max(views, 1)
         top_genres = sorted(genre_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+        decades = [
+            {"decade": f"{decade}s", "count": count}
+            for decade, count in sorted(decade_counts.items())
+        ]
         summary = {
-            "total_items": len(self.db.all_library_items()),
+            "total_items": total_items,
             "total_plays": total_views,
             "unwatched_count": unwatched,
             "stale_count": stale,
             "top_genres": [{"genre": g, "weight": c} for g, c in top_genres],
+            "decades": decades,
         }
         return json.dumps(summary)
+
+
+def _build_where_for_patterns(filters: LibraryFilters) -> tuple[str, List[Any]]:
+    return _build_where(filters)
+
+
+def mark_in_radarr(db: Database, tmdb_id: int) -> None:
+    db.set_arr_presence(tmdb_id=tmdb_id, in_radarr=True)
+
+
+def mark_in_sonarr(db: Database, tvdb_id: int) -> None:
+    db.set_arr_presence(tvdb_id=tvdb_id, in_sonarr=True)
+
+
+def _already_exists_response(action: str, error: ArrTitleExistsError) -> dict:
+    return {
+        "action": action,
+        "already_exists": True,
+        "message": str(error),
+        "result": {
+            "id": error.arr_id,
+            "title": error.title,
+        },
+    }
+
+
+def check_radarr_already_exists(
+    client: RadarrClient,
+    tmdb_id: int,
+    *,
+    title: str = "",
+) -> Optional[dict]:
+    existing = client.movie_by_tmdb_id(tmdb_id)
+    if not existing:
+        return None
+    label = existing.title or title or str(tmdb_id)
+    return {
+        "already_exists": True,
+        "message": f'"{label}" is already in Radarr',
+        "result": {"id": existing.id, "title": existing.title},
+    }
+
+
+def check_sonarr_already_exists(
+    client: SonarrClient,
+    tvdb_id: int,
+    *,
+    title: str = "",
+) -> Optional[dict]:
+    existing = client.series_by_tvdb_id(tvdb_id)
+    if not existing:
+        return None
+    label = existing.title or title or str(tvdb_id)
+    return {
+        "already_exists": True,
+        "message": f'"{label}" is already in Sonarr',
+        "result": {"id": existing.id, "title": existing.title},
+    }
 
 
 async def execute_confirmed_action(db: Database, settings: Settings, token: str) -> dict:
@@ -479,25 +1174,40 @@ async def execute_confirmed_action(db: Database, settings: Settings, token: str)
     if not payload:
         raise RuntimeError("Invalid or expired confirmation token")
     action = payload.get("action")
+    logger.info("Executing confirmed action=%s", action)
     if action == "add_radarr":
-        if not settings.radarr_url or not settings.radarr_api_key:
-            raise RuntimeError("Radarr is not configured")
+        config_error = radarr_add_configuration_error(settings)
+        if config_error:
+            raise RuntimeError(config_error)
         client = RadarrClient(settings.radarr_url, settings.radarr_api_key)
-        result = client.add_movie(
-            int(payload["tmdb_id"]),
-            root_folder=settings.radarr_root_folder,
-            quality_profile_id=settings.radarr_quality_profile_id,
-        )
+        tmdb_id = int(payload["tmdb_id"])
+        try:
+            result = client.add_movie(
+                tmdb_id,
+                root_folder=resolve_radarr_root_folder(settings),
+                quality_profile_id=settings.radarr_quality_profile_id,
+            )
+        except ArrTitleExistsError as error:
+            mark_in_radarr(db, tmdb_id)
+            return _already_exists_response(action, error)
+        mark_in_radarr(db, tmdb_id)
         return {"action": action, "result": result}
     if action == "add_sonarr":
-        if not settings.sonarr_url or not settings.sonarr_api_key:
-            raise RuntimeError("Sonarr is not configured")
+        config_error = sonarr_add_configuration_error(settings)
+        if config_error:
+            raise RuntimeError(config_error)
         client = SonarrClient(settings.sonarr_url, settings.sonarr_api_key)
-        result = client.add_series(
-            int(payload["tvdb_id"]),
-            root_folder=settings.sonarr_root_folder,
-            quality_profile_id=settings.sonarr_quality_profile_id,
-        )
+        tvdb_id = int(payload["tvdb_id"])
+        try:
+            result = client.add_series(
+                tvdb_id,
+                root_folder=resolve_sonarr_root_folder(settings),
+                quality_profile_id=settings.sonarr_quality_profile_id,
+            )
+        except ArrTitleExistsError as error:
+            mark_in_sonarr(db, tvdb_id)
+            return _already_exists_response(action, error)
+        mark_in_sonarr(db, tvdb_id)
         return {"action": action, "result": result}
     if action == "remove_arr":
         delete_files = bool(payload.get("delete_files"))
@@ -534,11 +1244,19 @@ def build_system_prompt(db: Database, lens_id: Optional[str] = None) -> str:
         lens_block += f" Focus: {lens_desc}"
     persona = db.get_persona()
     curator_name = str(persona["curator_name"]) if persona else "Curator"
+    overview_block = format_overview_for_prompt(library_overview(db))
     return (
         f"You are {curator_name}, an expert movie and TV collection curator for CuratorX. "
         "You know the user's Plex library and help them discover what to add, what to watch tonight, "
         "and what to purge to save drive space. Use tools to ground recommendations in their actual library. "
-        "Explain why each recommendation fits their taste. Never add or remove titles without confirmation tokens.\n"
+        "Explain why each recommendation fits their taste. Never add or remove titles without confirmation tokens. "
+        "When proposing adds, always use the exact tmdb_id or tvdb_id from tool item responses — never guess or invent external IDs. "
+        "For titles to add, use find_collection_gaps, recommend_hidden_gems, search_tmdb, or explore_genre(include_missing=true) — "
+        "never query_library or search_library (those only return owned titles). "
+        "Never present in_library=true titles as recommendations to add; title cards for adds exclude owned titles. "
+        "For exact external title lookup before add_to_radarr or add_to_sonarr, use search_tmdb — not search_library. "
+        "For movies use tmdb_id with add_to_radarr; for shows use tvdb_id with add_to_sonarr.\n"
+        f"{overview_block}\n"
         f"{_persona_prompt_block(db)}"
         f"{lens_block}\n\n"
         + preference_context(db, lens_id=resolved)

@@ -41,6 +41,36 @@ Settings persist to `{DATA_DIR}/settings.json` (default `/config/settings.json` 
 | Quality profile IDs | `RADARR_QUALITY_PROFILE_ID`, `SONARR_QUALITY_PROFILE_ID` | *arr quality profiles |
 | Library sync interval | `library_sync_interval_hours` in settings | Auto-sync cadence (1–168 h, default 24) |
 | TV page size | `tv_page_size` in settings | Plex TV fetch batch size (50–2000, default 500) |
+| Log level | `CURATORX_LOG_LEVEL` or `LOG_LEVEL` | `ERROR`, `WARNING`, `INFO` (default), or `DEBUG` |
+| Log format | `LOG_FORMAT` or `CURATORX_LOG_FORMAT` | `text` (default) or `json` |
+
+---
+
+## Logging
+
+CuratorX logs to **stdout/stderr** for Docker and systemd deployments. Set the level in `.env` or `docker-compose.yml`:
+
+| Level | What you see |
+|-------|----------------|
+| **ERROR** | Failures only (sync crashes, tool errors, HTTP hard failures) |
+| **WARNING** | HTTP errors/timeouts, episode sync skips, LLM chat errors, invalid settings |
+| **INFO** | Startup, sync start/finish, scheduler triggers, action propose/confirm, phase counts |
+| **DEBUG** | Per-job progress, TMDB/Fanart enrichment skips, agent tool calls, env/settings merge |
+
+Examples:
+
+```bash
+# Follow live logs
+docker compose logs -f curatorx
+
+# Verbose troubleshooting
+CURATORX_LOG_LEVEL=DEBUG docker compose up -d
+
+# Errors only
+CURATORX_LOG_LEVEL=ERROR docker compose up -d
+```
+
+API keys and tokens are never written to logs (URLs and error bodies are redacted).
 
 ---
 

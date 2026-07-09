@@ -7,7 +7,16 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
 
 from curatorx.agent.providers import get_chat_provider
-from curatorx.config_store import Settings, resolve_llm_base_url, resolve_llm_model, validate_llm_settings
+from curatorx.config_store import (
+    PATH_FIELDS,
+    Settings,
+    resolve_llm_base_url,
+    resolve_llm_model,
+    root_folder_paths_from_api,
+    configured_arr_root_folder_mismatch,
+    validate_arr_root_folder,
+    validate_llm_settings,
+)
 from curatorx.connectors.fanart import FanartClient
 from curatorx.connectors.plex import PlexClient
 from curatorx.connectors.radarr import RadarrClient
@@ -27,6 +36,12 @@ SECRET_FIELDS = (
     "fanart_api_key",
     "tautulli_api_key",
     "llm_api_key",
+)
+
+# Masked or omitted in partial PUT payloads — preserve existing when incoming is empty.
+PRESERVE_IF_EMPTY_FIELDS = (
+    "plex_movie_section",
+    "plex_tv_section",
 )
 
 CERTIFIED_SERVICES = (
@@ -105,40 +120,88 @@ def test_plex(plex_url: str, plex_token: str) -> CheckResult:
         return {"ok": False, "message": str(error), "sections": []}
 
 
-def test_radarr(radarr_url: str, radarr_api_key: str) -> CheckResult:
+def test_radarr(
+    radarr_url: str,
+    radarr_api_key: str,
+    *,
+    configured_root_folder: str = "",
+) -> CheckResult:
     if not radarr_url or not radarr_api_key:
         return {"ok": False, "message": "Radarr URL and API key are required."}
     try:
         client = RadarrClient(radarr_url.strip().rstrip("/"), radarr_api_key.strip())
         status = client.system_status()
         movies = client.movies()
+        root_folders = root_folder_paths_from_api(client.root_folders())
         version = status.get("version", "unknown")
         count = len(movies)
-        return {
+        message = f"Connected — Radarr v{version} | {count:,} Movies Found"
+        if root_folders:
+            message = f"{message} | Root folders: {', '.join(root_folders)}"
+        result: CheckResult = {
             "ok": True,
-            "message": f"Connected — Radarr v{version} | {count:,} Movies Found",
+            "message": message,
             "version": version,
             "movie_count": count,
+            "root_folders": root_folders,
         }
+        configured = str(configured_root_folder or "").strip()
+        if configured:
+            mismatch = configured_arr_root_folder_mismatch("Radarr", configured, client.root_folders())
+            if mismatch:
+                result["root_folder_warning"] = mismatch
+                if len(root_folders) == 1:
+                    result["suggested_root_folder"] = root_folders[0]
+                    result["message"] = (
+                        f"{message} | Configured root folder mismatch — "
+                        f"set radarr_root_folder to {root_folders[0]}"
+                    )
+                else:
+                    result["message"] = f"{message} | {mismatch}"
+        return result
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "message": str(error)}
 
 
-def test_sonarr(sonarr_url: str, sonarr_api_key: str) -> CheckResult:
+def test_sonarr(
+    sonarr_url: str,
+    sonarr_api_key: str,
+    *,
+    configured_root_folder: str = "",
+) -> CheckResult:
     if not sonarr_url or not sonarr_api_key:
         return {"ok": False, "message": "Sonarr URL and API key are required."}
     try:
         client = SonarrClient(sonarr_url.strip().rstrip("/"), sonarr_api_key.strip())
         status = client.system_status()
         series = client.series_list()
+        root_folders = root_folder_paths_from_api(client.root_folders())
         version = status.get("version", "unknown")
         count = len(series)
-        return {
+        message = f"Connected — Sonarr v{version} | {count:,} Series Found"
+        if root_folders:
+            message = f"{message} | Root folders: {', '.join(root_folders)}"
+        result: CheckResult = {
             "ok": True,
-            "message": f"Connected — Sonarr v{version} | {count:,} Series Found",
+            "message": message,
             "version": version,
             "series_count": count,
+            "root_folders": root_folders,
         }
+        configured = str(configured_root_folder or "").strip()
+        if configured:
+            mismatch = configured_arr_root_folder_mismatch("Sonarr", configured, client.root_folders())
+            if mismatch:
+                result["root_folder_warning"] = mismatch
+                if len(root_folders) == 1:
+                    result["suggested_root_folder"] = root_folders[0]
+                    result["message"] = (
+                        f"{message} | Configured root folder mismatch — "
+                        f"set sonarr_root_folder to {root_folders[0]}"
+                    )
+                else:
+                    result["message"] = f"{message} | {mismatch}"
+        return result
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "message": str(error)}
 
@@ -301,6 +364,14 @@ def invalidate_certifications_on_settings_change(
             db.invalidate_service_certification(service_name)
 
 
+def wizard_functionally_complete(steps: Mapping[str, Any]) -> bool:
+    return bool(
+        steps.get("identity_seed", {}).get("complete")
+        and steps.get("infrastructure", {}).get("complete")
+        and steps.get("dropdown_mapping", {}).get("complete")
+    )
+
+
 def build_wizard_status(settings: Settings, db: Database) -> Dict[str, Any]:
     llm_verified = _integration_certified(db, "llm")
     plex_verified = _integration_certified(db, "plex")
@@ -335,33 +406,39 @@ def build_wizard_status(settings: Settings, db: Database) -> Dict[str, Any]:
     }
 
     if settings.onboarding_complete:
-        current_step = 3
-    elif mapping_complete and infrastructure_complete and identity_complete:
-        current_step = 2
-    elif infrastructure_complete:
-        current_step = 2
-    elif identity_complete:
-        current_step = 1
-    else:
+        current_step = -1
+    elif not identity_complete:
         current_step = 0
+    elif not infrastructure_complete:
+        current_step = 1
+    elif not mapping_complete:
+        current_step = 2
+    else:
+        current_step = 2
 
     return {
         "current_step": current_step,
         "steps": steps,
-        "onboarding_complete": settings.onboarding_complete,
+        "onboarding_complete": settings.onboarding_complete or wizard_functionally_complete(steps),
         "certifications": build_certifications_status(db)["services"],
     }
 
 
-def build_setup_status(settings: Settings) -> Dict[str, Any]:
+def build_setup_status(settings: Settings, db: Database | None = None) -> Dict[str, Any]:
     plex_ok = bool(settings.plex_url and settings.plex_token)
     radarr_ok = bool(settings.radarr_url and settings.radarr_api_key)
     sonarr_ok = bool(settings.sonarr_url and settings.sonarr_api_key)
     tmdb_ok = bool(settings.tmdb_api_key)
     llm_ok = bool(settings.llm_api_key or settings.llm_provider == "ollama")
 
+    onboarding_complete = settings.onboarding_complete
+    if not onboarding_complete and db is not None:
+        onboarding_complete = wizard_functionally_complete(
+            build_wizard_status(settings, db)["steps"]
+        )
+
     return {
-        "onboarding_complete": settings.onboarding_complete,
+        "onboarding_complete": onboarding_complete,
         "ready_to_curate": plex_ok and tmdb_ok,
         "checks": {
             "plex": {"ok": plex_ok, "message": "Configured" if plex_ok else "Plex required."},
@@ -375,9 +452,30 @@ def build_setup_status(settings: Settings) -> Dict[str, Any]:
 
 def merge_secret_fields(incoming: Mapping[str, Any], existing: Settings) -> Dict[str, Any]:
     merged = dict(incoming)
+    defaults = Settings()
     for field in SECRET_FIELDS:
         if not str(merged.get(field) or "").strip():
             merged[field] = getattr(existing, field)
+    for field in PRESERVE_IF_EMPTY_FIELDS:
+        if not str(merged.get(field) or "").strip():
+            merged[field] = getattr(existing, field)
+    if not merged.get("onboarding_complete") and existing.onboarding_complete:
+        merged["onboarding_complete"] = True
+    movies_root = str(merged.get("movies_root") or existing.movies_root or defaults.movies_root).strip()
+    tv_root = str(merged.get("tv_root") or existing.tv_root or defaults.tv_root).strip()
+    for field in PATH_FIELDS:
+        if str(merged.get(field) or "").strip():
+            continue
+        existing_val = getattr(existing, field)
+        if str(existing_val or "").strip():
+            merged[field] = existing_val
+            continue
+        if field == "radarr_root_folder" and movies_root:
+            merged[field] = movies_root
+        elif field == "sonarr_root_folder" and tv_root:
+            merged[field] = tv_root
+        else:
+            merged[field] = getattr(defaults, field)
     return merged
 
 

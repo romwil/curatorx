@@ -31,13 +31,24 @@ class TMDBClient:
             return ""
         return f"{self.IMAGE_BASE}/{size}{path}"
 
-    def search_movie(self, query: str, *, page: int = 1) -> List[Mapping[str, Any]]:
-        payload = request_json(self._url("/search/movie", query=query, page=page), timeout=self.timeout)
-        return payload.get("results", []) if isinstance(payload, dict) else []
+    def _search(self, path: str, query: str, *, page: int = 1, year: Optional[int] = None) -> Mapping[str, Any]:
+        params: dict[str, Any] = {"query": query, "page": page}
+        if year is not None:
+            params["year"] = year
+        payload = request_json(self._url(path, **params), timeout=self.timeout)
+        return payload if isinstance(payload, dict) else {}
+
+    def search_movie(self, query: str, *, page: int = 1, year: Optional[int] = None) -> List[Mapping[str, Any]]:
+        return self._search("/search/movie", query, page=page, year=year).get("results", [])
+
+    def search_movie_page(self, query: str, *, page: int = 1, year: Optional[int] = None) -> Mapping[str, Any]:
+        return self._search("/search/movie", query, page=page, year=year)
 
     def search_tv(self, query: str, *, page: int = 1) -> List[Mapping[str, Any]]:
-        payload = request_json(self._url("/search/tv", query=query, page=page), timeout=self.timeout)
-        return payload.get("results", []) if isinstance(payload, dict) else []
+        return self._search("/search/tv", query, page=page).get("results", [])
+
+    def search_tv_page(self, query: str, *, page: int = 1) -> Mapping[str, Any]:
+        return self._search("/search/tv", query, page=page)
 
     def movie_details(self, tmdb_id: int) -> Mapping[str, Any]:
         payload = request_json(

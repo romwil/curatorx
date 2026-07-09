@@ -10,9 +10,14 @@ from curatorx.config_store import (
     load_dotenv_file,
     load_merged_settings,
     model_looks_openai,
+    normalize_path_settings,
+    radarr_add_configuration_error,
     reconcile_llm_provider,
     resolve_llm_base_url,
     resolve_llm_model,
+    resolve_radarr_root_folder,
+    pick_arr_root_folder,
+    validate_arr_root_folder,
     save_settings,
     secret_field_sources,
     validate_llm_settings,
@@ -244,6 +249,66 @@ class ConfigStoreTests(unittest.TestCase):
                     os.environ.pop("LLM_API_KEY", None)
                 else:
                     os.environ["LLM_API_KEY"] = original
+
+    def test_resolve_radarr_root_folder_prefers_radarr_then_movies(self) -> None:
+        settings = Settings(radarr_root_folder="/radarr/movies", movies_root="/plex/movies")
+        self.assertEqual(resolve_radarr_root_folder(settings), "/radarr/movies")
+        settings = Settings(radarr_root_folder="", movies_root="/plex/movies")
+        self.assertEqual(resolve_radarr_root_folder(settings), "/plex/movies")
+
+    def test_normalize_path_settings_restores_defaults(self) -> None:
+        settings = Settings(
+            movies_root="",
+            tv_root="",
+            radarr_root_folder="",
+            sonarr_root_folder="",
+        )
+        normalized = normalize_path_settings(settings)
+        self.assertEqual(normalized.radarr_root_folder, "/media/movies")
+        self.assertEqual(normalized.movies_root, "/media/movies")
+
+    def test_normalize_path_settings_uses_movies_root_for_radarr(self) -> None:
+        settings = Settings(movies_root="/plex/movies", radarr_root_folder="")
+        normalized = normalize_path_settings(settings)
+        self.assertEqual(normalized.radarr_root_folder, "/plex/movies")
+
+    def test_radarr_add_configuration_error_when_root_missing(self) -> None:
+        settings = Settings(
+            radarr_url="http://radarr",
+            radarr_api_key="secret",
+            radarr_root_folder="",
+            movies_root="",
+        )
+        error = radarr_add_configuration_error(settings)
+        self.assertIn("root folder", error or "")
+
+    def test_pick_arr_root_folder_exact_match(self) -> None:
+        resolved = pick_arr_root_folder("/movies", ["/movies"], service="Radarr")
+        self.assertEqual(resolved, "/movies")
+
+    def test_validate_arr_root_folder_returns_none_for_match(self) -> None:
+        error = validate_arr_root_folder("Radarr", "/movies", [{"path": "/movies"}])
+        self.assertIsNone(error)
+
+    def test_validate_arr_root_folder_returns_error_for_mismatch(self) -> None:
+        error = validate_arr_root_folder(
+            "Radarr",
+            "/mnt/user/data/media/movies",
+            [{"path": "/movies"}, {"path": "/media/movies"}],
+        )
+        self.assertIn("Available root folders", error or "")
+
+    def test_load_merged_settings_normalizes_empty_path_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            save_settings(
+                data_dir,
+                Settings(radarr_root_folder="", movies_root="", radarr_url="http://radarr"),
+            )
+            loaded = load_merged_settings(data_dir)
+            self.assertEqual(loaded.radarr_root_folder, "/media/movies")
+            self.assertEqual(loaded.movies_root, "/media/movies")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -81,10 +81,16 @@ def semantic_search(
     *,
     limit: int = 20,
     media_type: Optional[str] = None,
+    candidate_ids: Optional[set[int]] = None,
 ) -> List[Tuple[int, float]]:
     scores: List[Tuple[int, float]] = []
-    items = {int(row["id"]): row for row in db.all_library_items()}
+    items: Dict[int, Any] = {}
+    if media_type:
+        for row in db.all_library_items():
+            items[int(row["id"])] = row
     for item_id, vector in db.get_embeddings():
+        if candidate_ids is not None and item_id not in candidate_ids:
+            continue
         if media_type:
             row = items.get(item_id)
             if row is None or row["media_type"] != media_type:

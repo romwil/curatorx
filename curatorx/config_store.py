@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping
 
 ENV_TO_FIELD = {
     "PLEX_URL": "plex_url",
@@ -101,6 +102,15 @@ LLM_MODEL_DEFAULTS: Dict[str, str] = {
 _OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "text-embedding", "chatgpt-")
 _OPENAI_COMPAT_PROVIDERS = frozenset({"openai", "openai_compatible", "custom_openai_compatible"})
 
+PATH_FIELDS = (
+    "movies_root",
+    "tv_root",
+    "radarr_root_folder",
+    "sonarr_root_folder",
+)
+
+logger = logging.getLogger(__name__)
+
 
 def model_looks_openai(model: str) -> bool:
     cleaned = str(model or "").lower().strip()
@@ -170,6 +180,165 @@ def reconcile_llm_provider(settings: Settings) -> Settings:
     if implied == "anthropic" and provider in _OPENAI_COMPAT_PROVIDERS:
         return Settings.from_mapping({**asdict(settings), "llm_provider": "anthropic"})
     return settings
+
+
+def resolve_radarr_root_folder(settings: Settings) -> str:
+    for value in (settings.radarr_root_folder, settings.movies_root):
+        cleaned = str(value or "").strip()
+        if cleaned:
+            return cleaned
+    return "/media/movies"
+
+
+def resolve_sonarr_root_folder(settings: Settings) -> str:
+    for value in (settings.sonarr_root_folder, settings.tv_root):
+        cleaned = str(value or "").strip()
+        if cleaned:
+            return cleaned
+    return "/media/tv"
+
+
+def normalize_root_path(path: str) -> str:
+    return str(path or "").strip().rstrip("/")
+
+
+def root_folder_paths_from_api(entries: List[Mapping[str, Any]]) -> List[str]:
+    paths: List[str] = []
+    for entry in entries:
+        path = str(entry.get("path") or "").strip()
+        if path:
+            paths.append(path)
+    return paths
+
+
+def format_arr_root_folder_mismatch_error(
+    service: str,
+    configured: str,
+    available: List[str],
+) -> str:
+    service_label = service.strip() or "Arr"
+    setting_key = "radarr_root_folder" if service_label.lower() == "radarr" else "sonarr_root_folder"
+    if not available:
+        return (
+            f"{service_label} has no root folders configured. "
+            f"Add one in {service_label} Settings → Media Management → Root Folders, "
+            f"then set {setting_key} in Configuration → Advanced settings."
+        )
+    listed = ", ".join(available)
+    return (
+        f"Configured {service_label.lower()} root folder '{configured}' is not registered in {service_label}. "
+        f"Available root folders: {listed}. "
+        f"Set {setting_key} in Configuration → Advanced settings to one of these paths."
+    )
+
+
+def pick_arr_root_folder(configured: str, available: List[str], *, service: str = "Arr") -> str:
+    configured_clean = normalize_root_path(configured)
+    if not configured_clean:
+        raise RuntimeError(
+            f"{service} root folder path is not configured. "
+            f"Set radarr_root_folder or sonarr_root_folder in Configuration → Advanced settings."
+        )
+    if not available:
+        raise RuntimeError(format_arr_root_folder_mismatch_error(service, configured_clean, available))
+
+    for path in available:
+        if normalize_root_path(path) == configured_clean:
+            return path
+
+    if len(available) == 1:
+        return available[0]
+
+    raise RuntimeError(format_arr_root_folder_mismatch_error(service, configured_clean, available))
+
+
+def configured_arr_root_folder_mismatch(
+    service: str,
+    configured: str,
+    root_folders: List[Mapping[str, Any]],
+) -> str | None:
+    configured_clean = normalize_root_path(configured)
+    if not configured_clean:
+        return None
+    available = root_folder_paths_from_api(root_folders)
+    if any(normalize_root_path(path) == configured_clean for path in available):
+        return None
+    return format_arr_root_folder_mismatch_error(service, configured_clean, available)
+
+
+def validate_arr_root_folder(
+    service: str,
+    configured: str,
+    root_folders: List[Mapping[str, Any]],
+) -> str | None:
+    try:
+        pick_arr_root_folder(
+            configured,
+            root_folder_paths_from_api(root_folders),
+            service=service,
+        )
+    except RuntimeError as error:
+        return str(error)
+    return None
+
+
+def radarr_root_folder_configured(settings: Settings) -> bool:
+    return bool(
+        str(settings.radarr_root_folder or "").strip()
+        or str(settings.movies_root or "").strip()
+    )
+
+
+def sonarr_root_folder_configured(settings: Settings) -> bool:
+    return bool(
+        str(settings.sonarr_root_folder or "").strip()
+        or str(settings.tv_root or "").strip()
+    )
+
+
+def radarr_add_configuration_error(settings: Settings) -> str | None:
+    if not str(settings.radarr_url or "").strip() or not str(settings.radarr_api_key or "").strip():
+        return "Radarr is not configured. Add Radarr URL and API key in Configuration."
+    if not radarr_root_folder_configured(settings):
+        return (
+            "Radarr root folder path is not configured. "
+            "Open Configuration → Advanced settings and set radarr_root_folder or movies_root."
+        )
+    return None
+
+
+def sonarr_add_configuration_error(settings: Settings) -> str | None:
+    if not str(settings.sonarr_url or "").strip() or not str(settings.sonarr_api_key or "").strip():
+        return "Sonarr is not configured. Add Sonarr URL and API key in Configuration."
+    if not sonarr_root_folder_configured(settings):
+        return (
+            "Sonarr root folder path is not configured. "
+            "Open Configuration → Advanced settings and set sonarr_root_folder or tv_root."
+        )
+    return None
+
+
+def normalize_path_settings(settings: Settings) -> Settings:
+    fresh = Settings()
+    merged = asdict(settings)
+    updates: Dict[str, Any] = {}
+
+    if not str(merged.get("movies_root") or "").strip():
+        updates["movies_root"] = fresh.movies_root
+    if not str(merged.get("tv_root") or "").strip():
+        updates["tv_root"] = fresh.tv_root
+
+    movies_root = str(updates.get("movies_root") or merged.get("movies_root") or "").strip()
+    tv_root = str(updates.get("tv_root") or merged.get("tv_root") or "").strip()
+
+    if not str(merged.get("radarr_root_folder") or "").strip():
+        updates["radarr_root_folder"] = movies_root or fresh.radarr_root_folder
+    if not str(merged.get("sonarr_root_folder") or "").strip():
+        updates["sonarr_root_folder"] = tv_root or fresh.sonarr_root_folder
+
+    if not updates:
+        return settings
+    return Settings.from_mapping({**merged, **updates})
 
 
 def validate_llm_settings(settings: Settings) -> str | None:
@@ -243,6 +412,7 @@ def load_dotenv_file(path: Path | None = None) -> None:
                 os.environ[key] = value
                 loaded_any = True
         if loaded_any:
+            logger.debug("Loaded environment from %s", candidate)
             return
 
 
@@ -354,8 +524,13 @@ class Settings:
 def _load_settings_file_data(data_dir: Path) -> Dict[str, Any]:
     settings_path = data_dir / "settings.json"
     if not settings_path.exists():
+        logger.debug("No settings.json at %s; using defaults and env", data_dir)
         return {}
-    return json.loads(settings_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(settings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        logger.warning("Invalid settings.json at %s: %s", settings_path, error)
+        return {}
 
 
 def _file_field_explicitly_set(file_data: Mapping[str, Any], field_name: str) -> bool:
@@ -387,6 +562,7 @@ def load_merged_settings(data_dir: Path) -> Settings:
         if _file_field_explicitly_set(file_data, field_name):
             continue
         merged[field_name] = env_value
+        logger.debug("Settings field %s filled from env %s", field_name, env_name)
     for int_field in (
         "radarr_quality_profile_id",
         "sonarr_quality_profile_id",
@@ -399,7 +575,7 @@ def load_merged_settings(data_dir: Path) -> Settings:
         if _file_field_explicitly_set(file_data, int_field):
             continue
         merged[int_field] = int(os.environ[env_key])
-    return normalize_settings_llm(Settings.from_mapping(merged))
+    return normalize_path_settings(normalize_settings_llm(Settings.from_mapping(merged)))
 
 
 def secret_field_sources(data_dir: Path) -> Dict[str, str]:

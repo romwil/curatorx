@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -430,6 +431,322 @@ class ApiContractTests(unittest.TestCase):
 
         missing = self.client.get(f"/api/chat/threads/{session_id}/messages")
         self.assertEqual(missing.status_code, 404)
+
+    def test_library_query_and_aggregate_endpoints(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        db.upsert_library_item(
+            {
+                "rating_key": "audit-1",
+                "media_type": "movie",
+                "title": "French Connection",
+                "year": 1971,
+                "genres": ["Crime"],
+            }
+        )
+        db.upsert_library_item(
+            {
+                "rating_key": "audit-2",
+                "media_type": "movie",
+                "title": "Blade Runner",
+                "year": 1982,
+                "genres": ["Sci-Fi"],
+            }
+        )
+
+        query = self.client.get(
+            "/api/library/query",
+            params={"year_from": 1970, "year_to": 1979, "media_type": "movie"},
+        )
+        self.assertEqual(query.status_code, 200)
+        body = query.json()
+        self.assertEqual(body["total_matched"], 1)
+        self.assertEqual(body["items"][0]["title"], "French Connection")
+
+        aggregate = self.client.get(
+            "/api/library/aggregate",
+            params={"group_by": "decade"},
+        )
+        self.assertEqual(aggregate.status_code, 200)
+        agg = aggregate.json()
+        self.assertEqual(agg["group_by"], "decade")
+
+        overview = self.client.get("/api/library/overview")
+        self.assertEqual(overview.status_code, 200)
+        self.assertIn("total", overview.json())
+
+        facets = self.client.get("/api/library/facets", params={"facet_type": "director", "limit": 5})
+        self.assertEqual(facets.status_code, 200)
+        self.assertEqual(facets.json()["facet_type"], "director")
+
+        show_id = db.upsert_library_item(
+            {
+                "rating_key": "tv-show-1",
+                "media_type": "show",
+                "title": "Test Show",
+            }
+        )
+        db.upsert_library_episode(
+            {
+                "show_item_id": show_id,
+                "rating_key": "tv-ep-1",
+                "season_number": 1,
+                "episode_number": 1,
+                "title": "Episode One",
+                "view_count": 0,
+            }
+        )
+        db.update_show_episode_rollups(show_id)
+
+        episodes = self.client.get(
+            "/api/library/tv/episodes",
+            params={"show": "Test Show", "unwatched_only": True},
+        )
+        self.assertEqual(episodes.status_code, 200)
+        self.assertEqual(episodes.json()["total_matched"], 1)
+
+        progress = self.client.get("/api/library/tv/progress", params={"group_by": "show"})
+        self.assertEqual(progress.status_code, 200)
+        self.assertEqual(progress.json()["group_by"], "show")
+
+    def test_settings_put_restores_empty_root_folders(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_root_folder": "",
+                "movies_root": "",
+                "sonarr_root_folder": "",
+                "tv_root": "",
+            },
+        )
+        resp = self.client.get("/api/settings")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["radarr_root_folder"], "/media/movies")
+        self.assertEqual(body["movies_root"], "/media/movies")
+        self.assertEqual(body["sonarr_root_folder"], "/media/tv")
+        self.assertEqual(body["tv_root"], "/media/tv")
+
+    def test_settings_put_preserves_plex_library_sections(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "plex_movie_section": "42",
+                "plex_tv_section": "99",
+            },
+        )
+        self.client.put(
+            "/api/settings",
+            json={
+                "plex_movie_section": "",
+                "plex_tv_section": "",
+            },
+        )
+        resp = self.client.get("/api/settings")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["plex_movie_section"], "42")
+        self.assertEqual(body["plex_tv_section"], "99")
+
+    def test_settings_put_sets_onboarding_complete(self) -> None:
+        resp = self.client.put(
+            "/api/settings",
+            json={"onboarding_complete": True},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["onboarding_complete"])
+        status = self.client.get("/api/setup/status")
+        self.assertTrue(status.json()["onboarding_complete"])
+
+    def test_propose_and_confirm_add_radarr(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/media/movies",
+            },
+        )
+        with patch(
+            "curatorx.web.app.RadarrClient.root_folders",
+            return_value=[{"path": "/media/movies"}],
+        ), patch(
+            "curatorx.web.app.RadarrClient.movie_by_tmdb_id",
+            return_value=None,
+        ):
+            propose = self.client.post(
+                "/api/actions/propose",
+                json={"action": "add_radarr", "tmdb_id": 603, "title": "The Matrix"},
+            )
+        self.assertEqual(propose.status_code, 200)
+        token = propose.json()["confirmation_token"]
+        self.assertTrue(token)
+
+        with patch("curatorx.agent.tools.RadarrClient.add_movie", return_value={"id": 42}) as add_movie:
+            confirm = self.client.post(
+                "/api/actions/confirm",
+                json={"token": token, "confirmed": True},
+            )
+        self.assertEqual(confirm.status_code, 200)
+        body = confirm.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["action"], "add_radarr")
+        add_movie.assert_called_once_with(
+            603,
+            root_folder="/media/movies",
+            quality_profile_id=1,
+        )
+
+    def test_propose_add_radarr_already_exists(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/media/movies",
+            },
+        )
+        existing = type(
+            "Movie",
+            (),
+            {"id": 9, "title": "The Matrix", "tmdb_id": 603},
+        )()
+        with patch(
+            "curatorx.web.app.RadarrClient.root_folders",
+            return_value=[{"path": "/media/movies"}],
+        ), patch(
+            "curatorx.web.app.RadarrClient.movie_by_tmdb_id",
+            return_value=existing,
+        ):
+            propose = self.client.post(
+                "/api/actions/propose",
+                json={"action": "add_radarr", "tmdb_id": 603, "title": "The Matrix"},
+            )
+        self.assertEqual(propose.status_code, 200)
+        body = propose.json()
+        self.assertTrue(body["already_exists"])
+        self.assertIn("already in Radarr", body["message"])
+        self.assertNotIn("confirmation_token", body)
+
+    def test_confirm_add_radarr_already_exists(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/media/movies",
+            },
+        )
+        with patch(
+            "curatorx.web.app.RadarrClient.root_folders",
+            return_value=[{"path": "/media/movies"}],
+        ), patch(
+            "curatorx.web.app.RadarrClient.movie_by_tmdb_id",
+            return_value=None,
+        ):
+            propose = self.client.post(
+                "/api/actions/propose",
+                json={"action": "add_radarr", "tmdb_id": 603, "title": "The Matrix"},
+            )
+        token = propose.json()["confirmation_token"]
+
+        from curatorx.connectors.arr_errors import ArrTitleExistsError
+
+        with patch(
+            "curatorx.agent.tools.RadarrClient.add_movie",
+            side_effect=ArrTitleExistsError(
+                "Radarr",
+                title="The Matrix",
+                external_id=603,
+                arr_id=9,
+            ),
+        ):
+            confirm = self.client.post(
+                "/api/actions/confirm",
+                json={"token": token, "confirmed": True},
+            )
+        self.assertEqual(confirm.status_code, 200)
+        body = confirm.json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["already_exists"])
+        self.assertIn("already in Radarr", body["message"])
+
+    def test_propose_add_radarr_rejects_unregistered_root_folder(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/mnt/user/data/media/movies",
+            },
+        )
+        with patch(
+            "curatorx.web.app.RadarrClient.root_folders",
+            return_value=[{"path": "/movies"}, {"path": "/media/movies"}],
+        ):
+            propose = self.client.post(
+                "/api/actions/propose",
+                json={"action": "add_radarr", "tmdb_id": 603, "title": "The Matrix"},
+            )
+        self.assertEqual(propose.status_code, 400)
+        self.assertIn("Available root folders", propose.json()["detail"])
+
+    def test_setup_test_radarr_returns_registered_root_folders(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/mnt/user/data/media/movies",
+            },
+        )
+        with patch("curatorx.web.setup.RadarrClient.system_status", return_value={"version": "5.0"}), patch(
+            "curatorx.web.setup.RadarrClient.movies", return_value=[]
+        ), patch(
+            "curatorx.web.setup.RadarrClient.root_folders",
+            return_value=[{"path": "/movies"}],
+        ):
+            resp = self.client.post("/api/setup/test/radarr", json={})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["root_folders"], ["/movies"])
+        self.assertEqual(body["suggested_root_folder"], "/movies")
+        self.assertIn("radarr_root_folder", body["message"])
+
+    def test_confirm_action_cancels_pending_token(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+                "radarr_root_folder": "/media/movies",
+            },
+        )
+        with patch(
+            "curatorx.web.app.RadarrClient.root_folders",
+            return_value=[{"path": "/media/movies"}],
+        ), patch(
+            "curatorx.web.app.RadarrClient.movie_by_tmdb_id",
+            return_value=None,
+        ):
+            propose = self.client.post(
+                "/api/actions/propose",
+                json={
+                    "action": "add_radarr",
+                    "tmdb_id": 1,
+                    "title": "Test",
+                },
+            )
+        self.assertEqual(propose.status_code, 200)
+        token = propose.json()["confirmation_token"]
+        cancel = self.client.post(
+            "/api/actions/confirm",
+            json={"token": token, "confirmed": False},
+        )
+        self.assertEqual(cancel.status_code, 200)
+        self.assertTrue(cancel.json()["cancelled"])
 
 
 if __name__ == "__main__":

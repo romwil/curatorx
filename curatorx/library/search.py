@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from curatorx.config_store import Settings
 from curatorx.library.db import Database
-from curatorx.library.embeddings import embed_text, semantic_search
+from curatorx.library.query import filters_from_mapping, query_library_async
 from curatorx.models.schemas import TitleCard
 
 
@@ -28,6 +28,7 @@ def row_to_title_card(row, *, reason: str = "") -> TitleCard:
         in_radarr=bool(row["in_radarr"]),
         in_sonarr=bool(row["in_sonarr"]),
         recommendation_reason=reason,
+        runtime_minutes=int(row["runtime_minutes"]) if "runtime_minutes" in row.keys() and row["runtime_minutes"] else None,
     )
 
 
@@ -39,18 +40,19 @@ async def search_library(
     media_type: Optional[str] = None,
     limit: int = 12,
 ) -> List[TitleCard]:
-    vector = await embed_text(query, settings)
-    hits = semantic_search(db, vector, limit=limit, media_type=media_type)
-    items = {int(row["id"]): row for row in db.all_library_items()}
+    filters = filters_from_mapping(
+        {
+            "semantic_query": query,
+            "media_type": media_type,
+            "limit": limit,
+        }
+    )
+    result = await query_library_async(db, filters, settings)
     cards: List[TitleCard] = []
-    for item_id, score in hits:
-        row = items.get(item_id)
+    for item in result.get("items", []):
+        row = db.library_item_by_id(int(item["id"])) if item.get("id") else None
         if row is None:
             continue
-        cards.append(row_to_title_card(row, reason=f"Library match ({score:.0%})"))
-    if not cards:
-        for row in db.search_keyword(query, limit=limit):
-            if media_type and row["media_type"] != media_type:
-                continue
-            cards.append(row_to_title_card(row, reason="Keyword match"))
+        mode = result.get("search_mode", "semantic")
+        cards.append(row_to_title_card(row, reason=f"Library match ({mode})"))
     return cards[:limit]

@@ -83,6 +83,16 @@ Open **http://localhost:8788**.
 
 Environment variables in `.env` seed first-run settings (Plex, *arr, TMDB, LLM). See [CONFIGURATION.md](CONFIGURATION.md).
 
+### Logs
+
+All application output goes to stdout/stderr. Tail logs with:
+
+```bash
+docker compose logs -f curatorx
+```
+
+Set `CURATORX_LOG_LEVEL=DEBUG` in `.env` for verbose sync and agent tool tracing. See [CONFIGURATION.md](CONFIGURATION.md#logging).
+
 ---
 
 ## Unraid

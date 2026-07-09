@@ -200,6 +200,14 @@ function onboardingReady(verification) {
   );
 }
 
+function firstIncompleteWizardStep(wizardData) {
+  const steps = wizardData?.steps;
+  if (!steps) return 0;
+  if (!steps.identity_seed?.complete) return 0;
+  if (!steps.infrastructure?.complete) return 1;
+  return 2;
+}
+
 export default function ConfigPage() {
   const navigate = useNavigate();
   const [settings, setSettings] = useState(null);
@@ -272,8 +280,8 @@ export default function ConfigPage() {
       radarr: wizardData.steps.infrastructure.radarr_verified || prev.radarr,
       sonarr: wizardData.steps.infrastructure.sonarr_verified || prev.sonarr,
     }));
-    if (!wizardData.onboarding_complete && wizardData.current_step >= 0) {
-      setStepIndex(Math.min(wizardData.current_step, WIZARD_STEPS.length - 1));
+    if (!wizardData.onboarding_complete) {
+      setStepIndex(firstIncompleteWizardStep(wizardData));
     }
   }
 
@@ -307,7 +315,7 @@ export default function ConfigPage() {
           setPlexCollapsed(true);
         }
         if (!wizardData.onboarding_complete) {
-          setStepIndex(Math.min(wizardData.current_step, WIZARD_STEPS.length - 1));
+          setStepIndex(firstIncompleteWizardStep(wizardData));
         }
       },
     );
@@ -361,20 +369,12 @@ export default function ConfigPage() {
   }, [persona?.curator_name]);
 
   useEffect(() => {
-    if (showWizard || WIZARD_STEPS[stepIndex] !== "dropdown_mapping") return;
-    if (!verification.plex || sections.length) return;
+    if (!settings || sections.length) return;
+    if (!serviceCredentialsPresent("plex", settings) && !verification.plex) return;
     getPlexSections()
       .then((loaded) => setSections(loaded))
       .catch(() => {});
-  }, [showWizard, stepIndex, verification.plex, sections.length]);
-
-  useEffect(() => {
-    if (showWizard || !settings?.plex_movie_section) return;
-    if (sections.length) return;
-    getPlexSections()
-      .then((loaded) => setSections(loaded))
-      .catch(() => {});
-  }, [showWizard, settings?.plex_movie_section, sections.length]);
+  }, [settings, verification.plex, sections.length]);
 
   function updateSettings(patch) {
     setSettings((prev) => ({ ...prev, ...patch }));
@@ -584,7 +584,7 @@ export default function ConfigPage() {
     }
   }
 
-  async function handleFinish() {
+  async function handleFinishOnboarding() {
     setFooterAlert(null);
     if (!onboardingReady(verification)) {
       setFooterAlert({
@@ -606,7 +606,7 @@ export default function ConfigPage() {
     }
   }
 
-  async function handleFinish() {
+  async function handleSaveSettings() {
     clearActionFeedback("save");
     try {
       await persistSettings();
@@ -1204,7 +1204,7 @@ export default function ConfigPage() {
                   Next
                 </button>
               ) : (
-                <button type="button" data-testid="wizard-finish" onClick={handleFinish} disabled={!onboardingReady(verification)}>
+                <button type="button" data-testid="wizard-finish" onClick={handleFinishOnboarding} disabled={!onboardingReady(verification)}>
                   Finish onboarding
                 </button>
               )}

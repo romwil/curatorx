@@ -10,12 +10,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 from curatorx.agent.curator import (
     CuratorAgent,
+    _cards_for_response,
+    _displayable_cards,
     _extract_text,
     _extract_tool_calls,
 )
+from curatorx.agent.tools import ToolRegistry
 from curatorx.agent.providers import _normalize_anthropic_response
 from curatorx.config_store import Settings
-from curatorx.library.db import Database
+from curatorx.library.db import DEFAULT_LENS_ID, Database
+from curatorx.models.schemas import TitleCard
 
 
 class CuratorResponseParsingTests(unittest.TestCase):
@@ -147,6 +151,31 @@ class CuratorAgentToolLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(call_count["n"], 3)
             self.assertEqual(text_blocks[0]["content"], "Done after two tool rounds.")
+
+
+class DisplayableCardsTests(unittest.TestCase):
+    def test_filters_empty_placeholder_cards(self) -> None:
+        cards = [
+            TitleCard(media_type="movie", title="Blade Runner", tmdb_id=78),
+            TitleCard(media_type="movie", title=""),
+            TitleCard(media_type="movie", title="", tmdb_id=829),
+        ]
+        filtered = _displayable_cards(cards)
+        self.assertEqual([card.title for card in filtered], ["Blade Runner", ""])
+        self.assertEqual(filtered[1].tmdb_id, 829)
+
+    def test_cards_for_response_drops_owned_in_recommendation_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
+            registry._recommendation_context = True
+            registry._cards = [
+                TitleCard(media_type="movie", title="Owned", tmdb_id=1, in_library=True),
+                TitleCard(media_type="movie", title="Missing", tmdb_id=2, in_library=False),
+            ]
+            filtered = _cards_for_response(registry)
+            self.assertEqual(len(filtered), 1)
+            self.assertEqual(filtered[0].title, "Missing")
 
 
 if __name__ == "__main__":

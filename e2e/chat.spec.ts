@@ -118,4 +118,23 @@ test.describe("Chat UI modes", () => {
     await expect(page.getByTestId("chat-message-user")).toContainText("Thread one message");
     await expect(page.getByTestId("chat-message-user")).not.toContainText("Thread two message");
   });
+
+  test("library query API returns honest decade slice metadata", async ({ page }) => {
+    const data = await page.evaluate(async () => {
+      const res = await fetch("/api/library/query?year_from=1970&year_to=1979&media_type=movie");
+      return res.json();
+    });
+    expect(data.total_matched).toBe(142);
+    expect(data.has_more).toBe(true);
+    expect(data.items[0].year).toBe(1979);
+  });
+
+  test("TV progress API returns show completion metadata", async ({ page }) => {
+    const data = await page.evaluate(async () => {
+      const res = await fetch("/api/library/tv/progress?group_by=show&in_progress_only=true");
+      return res.json();
+    });
+    expect(data.buckets[0].completion_percent).toBe(50);
+    expect(data.buckets[0].show_title).toBe("The Wire");
+  });
 });

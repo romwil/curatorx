@@ -2,28 +2,34 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
+  confirmAction,
   createThread,
   formatApiError,
   getActiveContext,
   getThreadMessages,
   listJobs,
   listThreads,
+  proposeAction,
   resolveAgentPulse,
   sendChat,
   sessionId,
   setActiveSession,
 } from "./api/client";
+import { alreadyInArrMessage, isAlreadyInArr } from "./lib/addActions.js";
+import AddActionBanner from "./components/AddActionBanner";
 import ChatThread from "./components/ChatThread";
 import InlineAlert from "./components/InlineAlert";
 import IntegrationStatus from "./components/IntegrationStatus";
 import SidebarSection from "./components/SidebarSection";
 import Thoughtstream from "./components/Thoughtstream";
 import ThreadList from "./components/ThreadList";
+import TurnstyleResultsOverlay from "./components/TurnstyleResultsOverlay";
 import TurnstyleViewport from "./components/TurnstyleViewport";
-import VisualFingerprint, { extractLatestCards } from "./components/VisualFingerprint";
+import VisualFingerprint from "./components/VisualFingerprint";
 
 const SIDEBAR_RAIL_KEY = "curatorx.sidebar.rail";
 const MEDIUM_BREAKPOINT = "(max-width: 1100px)";
+const ADD_FEEDBACK_DISMISS_MS = 5000;
 
 export default function App() {
   const [viewMode, setViewMode] = useState("compact");
@@ -32,6 +38,13 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState(() => sessionId());
   const [threadsReady, setThreadsReady] = useState(false);
   const [showCompactThreads, setShowCompactThreads] = useState(false);
+  const [turnstyleResults, setTurnstyleResults] = useState(null);
+  const [pendingAdd, setPendingAdd] = useState(null);
+  const [pendingBulk, setPendingBulk] = useState(null);
+  const [pendingTokens, setPendingTokens] = useState([]);
+  const [addInProgress, setAddInProgress] = useState(false);
+  const [addProgress, setAddProgress] = useState(null);
+  const [addFeedback, setAddFeedback] = useState(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [chatError, setChatError] = useState("");
@@ -88,6 +101,10 @@ export default function App() {
       setActiveSession(session);
       setActiveSessionId(session);
       setChatError("");
+      setPendingAdd(null);
+      setPendingBulk(null);
+      setPendingTokens([]);
+      setAddFeedback(null);
       await loadThreadMessages(session);
     },
     [activeSessionId, loadThreadMessages]
@@ -173,6 +190,16 @@ export default function App() {
     return () => clearInterval(interval);
   }, [refreshJobs]);
 
+  useEffect(() => {
+    if (!addFeedback) return undefined;
+    const timer = setTimeout(() => setAddFeedback(null), ADD_FEEDBACK_DISMISS_MS);
+    return () => clearTimeout(timer);
+  }, [addFeedback]);
+
+  function dismissAddFeedback() {
+    setAddFeedback(null);
+  }
+
   function appendChatError(reason) {
     const message = `Curator couldn't respond: ${reason}`;
     setChatError(message);
@@ -206,14 +233,16 @@ export default function App() {
         return;
       }
       setMessages((prev) => [...prev, result.message]);
+      setPendingTokens(Array.isArray(result.pending_tokens) ? result.pending_tokens : []);
+      if (Array.isArray(result.pending_tokens) && result.pending_tokens.length >= 2) {
+        setPendingBulk(null);
+        setPendingAdd(null);
+      }
       refreshJobs();
       refreshThreads();
       getActiveContext()
         .then(setActiveContext)
         .catch(() => {});
-      if (extractLatestCards([result.message]).length > 0) {
-        setViewMode("immersive");
-      }
     } catch (error) {
       appendChatError(formatApiError(error));
     } finally {
@@ -221,23 +250,214 @@ export default function App() {
     }
   }
 
-  async function handleAdd(item, target) {
-    const confirmText =
-      target === "sonarr"
-        ? `Add "${item.title}" to Sonarr?`
-        : `Add "${item.title}" to Radarr?`;
-    if (!window.confirm(confirmText)) return;
+  function handleAdd(item, target) {
+    setAddFeedback(null);
+    setPendingBulk(null);
+    setPendingTokens([]);
+    setPendingAdd({ item, target });
+  }
+
+  function handleConfirmAllItems(items, target) {
+    if (!items?.length || addInProgress) return;
+    setAddFeedback(null);
+    setPendingAdd(null);
+    setPendingTokens([]);
+    setPendingBulk({ items, target });
+  }
+
+  function handleConfirmAllTokens() {
+    if (pendingTokens.length < 2 || addInProgress) return;
+    setAddFeedback(null);
+    setPendingAdd(null);
+    setPendingBulk(null);
+    executeConfirmAllTokens();
+  }
+
+  function cancelPendingBulk() {
+    if (addInProgress) return;
+    setPendingBulk(null);
+  }
+
+  function cancelPendingTokens() {
+    if (addInProgress) return;
+    setPendingTokens([]);
+  }
+
+  function cancelPendingAdd() {
+    if (addInProgress) return;
+    setPendingAdd(null);
+  }
+
+  async function executeBulkAdd(items, target) {
+    const service = target === "sonarr" ? "Sonarr" : "Radarr";
+    const action = target === "sonarr" ? "add_sonarr" : "add_radarr";
+    let successCount = 0;
+    const failures = [];
+
+    setAddInProgress(true);
+    setAddProgress({ current: 0, total: items.length });
+
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index];
+      setAddProgress({ current: index + 1, total: items.length, title: item.title });
+      const body =
+        target === "sonarr"
+          ? { action, tvdb_id: item.tvdb_id, title: item.title }
+          : { action, tmdb_id: item.tmdb_id, title: item.title };
+      try {
+        const proposal = await proposeAction(body);
+        if (isAlreadyInArr(proposal)) {
+          successCount += 1;
+          continue;
+        }
+        const confirm = await confirmAction(proposal.confirmation_token);
+        if (isAlreadyInArr(confirm)) {
+          successCount += 1;
+          continue;
+        }
+        successCount += 1;
+      } catch (error) {
+        failures.push({ title: item.title || "Unknown title", message: formatApiError(error) });
+      }
+    }
+
+    setAddInProgress(false);
+    setAddProgress(null);
+    setPendingBulk(null);
+
+    if (successCount === items.length) {
+      setAddFeedback({
+        type: "success",
+        message: `Added ${successCount} title${successCount === 1 ? "" : "s"} to ${service}.`,
+      });
+      return;
+    }
+
+    if (successCount > 0) {
+      setAddFeedback({
+        type: "error",
+        message: `Added ${successCount} of ${items.length} to ${service}. ${failures.length} failed.`,
+      });
+      return;
+    }
+
+    setAddFeedback({
+      type: "error",
+      message: failures[0]?.message || `Could not add titles to ${service}.`,
+    });
+  }
+
+  async function executeConfirmAllTokens() {
+    const tokens = [...pendingTokens];
+    let successCount = 0;
+    const failures = [];
+
+    setAddInProgress(true);
+    setAddProgress({ current: 0, total: tokens.length });
+
+    for (let index = 0; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      setAddProgress({ current: index + 1, total: tokens.length });
+      try {
+        const confirm = await confirmAction(token);
+        if (isAlreadyInArr(confirm)) {
+          successCount += 1;
+          continue;
+        }
+        successCount += 1;
+      } catch (error) {
+        failures.push(formatApiError(error));
+      }
+    }
+
+    setAddInProgress(false);
+    setAddProgress(null);
+    setPendingTokens([]);
+
+    if (successCount === tokens.length) {
+      setAddFeedback({
+        type: "success",
+        message: `Confirmed ${successCount} add${successCount === 1 ? "" : "s"}.`,
+      });
+      return;
+    }
+
+    if (successCount > 0) {
+      setAddFeedback({
+        type: "error",
+        message: `Confirmed ${successCount} of ${tokens.length}. ${failures.length} failed.`,
+      });
+      return;
+    }
+
+    setAddFeedback({
+      type: "error",
+      message: failures[0] || "Could not confirm proposed adds.",
+    });
+  }
+
+  async function confirmActiveAction() {
+    if (pendingBulk) {
+      await executeBulkAdd(pendingBulk.items, pendingBulk.target);
+      return;
+    }
+    if (pendingTokens.length >= 2) {
+      await executeConfirmAllTokens();
+      return;
+    }
+    await confirmPendingAdd();
+  }
+
+  function cancelActiveAction() {
+    if (pendingBulk) {
+      cancelPendingBulk();
+      return;
+    }
+    if (pendingTokens.length >= 2) {
+      cancelPendingTokens();
+      return;
+    }
+    cancelPendingAdd();
+  }
+
+  async function confirmPendingAdd() {
+    if (!pendingAdd || addInProgress) return;
+
+    const { item, target } = pendingAdd;
+    const label = item.title || "this title";
+    const service = target === "sonarr" ? "Sonarr" : "Radarr";
     const action = target === "sonarr" ? "add_sonarr" : "add_radarr";
     const body =
       target === "sonarr"
         ? { action, tvdb_id: item.tvdb_id, title: item.title }
         : { action, tmdb_id: item.tmdb_id, title: item.title };
-    const proposal = await api("/actions/propose", { method: "POST", body: JSON.stringify(body) });
-    await api("/actions/confirm", {
-      method: "POST",
-      body: JSON.stringify({ token: proposal.confirmation_token, confirmed: true }),
-    });
-    alert(`Added ${item.title}`);
+
+    setAddInProgress(true);
+    try {
+      const proposal = await proposeAction(body);
+      if (isAlreadyInArr(proposal)) {
+        setAddFeedback({
+          type: "success",
+          message: alreadyInArrMessage(proposal, { label, service }),
+        });
+        setPendingAdd(null);
+        return;
+      }
+      const confirm = await confirmAction(proposal.confirmation_token);
+      if (isAlreadyInArr(confirm)) {
+        setAddFeedback({
+          type: "success",
+          message: alreadyInArrMessage(confirm, { label, service }),
+        });
+      } else {
+        setAddFeedback({ type: "success", message: `Added "${label}" to ${service}.` });
+      }
+      setPendingAdd(null);
+    } catch (error) {
+      setAddFeedback({ type: "error", message: formatApiError(error) });
+    } finally {
+      setAddInProgress(false);
+    }
   }
 
   async function handleDismiss(item) {
@@ -330,7 +550,11 @@ export default function App() {
             messages={messages}
             onAdd={handleAdd}
             onDismiss={handleDismiss}
-            onOpenViewport={() => setViewMode("immersive")}
+            onOpenViewport={setTurnstyleResults}
+            onConfirmAllItems={handleConfirmAllItems}
+            onConfirmAllTokens={handleConfirmAllTokens}
+            pendingTokenCount={pendingTokens.length}
+            actionsDisabled={addInProgress}
           />
         </div>
       ) : (
@@ -409,37 +633,43 @@ export default function App() {
             </div>
 
             <div className="sidebar-footer">
-              <div className="sidebar-actions">
-                <button
-                  type="button"
-                  className="ghost sidebar-action-btn"
-                  data-testid="collapse-viewport"
-                  onClick={() => setViewMode("compact")}
-                >
-                  <span className="sidebar-action-icon" aria-hidden="true">
-                    ⊟
-                  </span>
-                  <span className="sidebar-action-label">Collapse</span>
-                </button>
-                <button type="button" className="sidebar-action-btn" onClick={syncLibrary}>
-                  <span className="sidebar-action-icon" aria-hidden="true">
-                    ↻
-                  </span>
-                  <span className="sidebar-action-label">Sync library</span>
-                </button>
-                <Link to="/config" className="btn-link ghost sidebar-action-btn">
-                  <span className="sidebar-action-icon" aria-hidden="true">
-                    ⚙
-                  </span>
-                  <span className="sidebar-action-label">Configuration</span>
-                </Link>
-              </div>
+              <div className="sidebar-footer-callout">
+                <div className="sidebar-actions">
+                  <button
+                    type="button"
+                    className="sidebar-action-btn sidebar-action-btn--ghost"
+                    data-testid="collapse-viewport"
+                    onClick={() => setViewMode("compact")}
+                  >
+                    <span className="sidebar-action-icon" aria-hidden="true">
+                      ⊟
+                    </span>
+                    <span className="sidebar-action-label">Collapse</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="sidebar-action-btn sidebar-action-btn--primary"
+                    onClick={syncLibrary}
+                  >
+                    <span className="sidebar-action-icon" aria-hidden="true">
+                      ↻
+                    </span>
+                    <span className="sidebar-action-label">Sync library</span>
+                  </button>
+                  <Link to="/config" className="sidebar-action-btn sidebar-action-btn--ghost">
+                    <span className="sidebar-action-icon" aria-hidden="true">
+                      ⚙
+                    </span>
+                    <span className="sidebar-action-label">Configuration</span>
+                  </Link>
+                </div>
 
-              {stats ? (
-                <p className="sidebar-stats">
-                  {stats.total} titles · {stats.movies} movies · {stats.shows} shows
-                </p>
-              ) : null}
+                {stats ? (
+                  <p className="sidebar-stats">
+                    {stats.total} titles · {stats.movies} movies · {stats.shows} shows
+                  </p>
+                ) : null}
+              </div>
             </div>
           </aside>
 
@@ -454,7 +684,11 @@ export default function App() {
                 chatError={chatError}
                 onAdd={handleAdd}
                 onDismiss={handleDismiss}
-                onOpenViewport={() => setViewMode("immersive")}
+                onOpenViewport={setTurnstyleResults}
+                onConfirmAllItems={handleConfirmAllItems}
+                onConfirmAllTokens={handleConfirmAllTokens}
+                pendingTokenCount={pendingTokens.length}
+                actionsDisabled={addInProgress}
               />
               <form
                 className="composer immersive-composer"
@@ -481,12 +715,43 @@ export default function App() {
               </form>
             </div>
 
-            <div className="immersive-fingerprint">
-              <VisualFingerprint messages={messages} onAdd={handleAdd} onDismiss={handleDismiss} />
-            </div>
+            {!isMediumViewport ? (
+              <div className="immersive-fingerprint" data-testid="immersive-fingerprint">
+                <VisualFingerprint messages={messages} onAdd={handleAdd} onDismiss={handleDismiss} />
+              </div>
+            ) : null}
           </main>
         </div>
       )}
+
+      {turnstyleResults ? (
+        <TurnstyleResultsOverlay
+          payload={turnstyleResults}
+          onClose={() => setTurnstyleResults(null)}
+          onAdd={handleAdd}
+          onDismiss={handleDismiss}
+          onConfirmAllItems={handleConfirmAllItems}
+          actionsDisabled={addInProgress}
+        />
+      ) : null}
+
+      <div className="add-action-layer">
+        <AddActionBanner
+          pendingAdd={pendingAdd}
+          pendingBulk={pendingBulk}
+          pendingTokens={pendingTokens.length >= 2 ? pendingTokens : null}
+          inProgress={addInProgress}
+          progress={addProgress}
+          onConfirm={confirmActiveAction}
+          onCancel={cancelActiveAction}
+        />
+        <InlineAlert
+          type={addFeedback?.type}
+          message={addFeedback?.message}
+          testId="add-action-feedback"
+          onDismiss={dismissAddFeedback}
+        />
+      </div>
     </div>
   );
 }

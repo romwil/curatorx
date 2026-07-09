@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -15,7 +16,12 @@ from typing import Dict, List, Literal, Optional
 
 from curatorx.config_store import Settings, load_merged_settings
 from curatorx.library.db import Database
+from curatorx.library.facets import ensure_library_facet_index
+from curatorx.library.query import refresh_library_overview_cache
 from curatorx.library.sync import sync_library
+from curatorx.logging_config import configure_logging
+
+logger = logging.getLogger(__name__)
 
 JobStatus = Literal["queued", "running", "completed", "failed"]
 
@@ -70,10 +76,13 @@ def _resolve_db_path(data_dir: Path) -> Path:
 
 class JobManager:
     def __init__(self, data_dir: Path) -> None:
+        configure_logging()
         self.data_dir = data_dir
         self.db = Database(_resolve_db_path(data_dir))
+        ensure_library_facet_index(self.db)
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
+        logger.info("JobManager initialized data_dir=%s", data_dir)
 
     def list_jobs(self) -> List[Job]:
         with self._lock:
@@ -88,6 +97,7 @@ class JobManager:
         job = Job(id=job_id, job_type="library_sync", status="queued", created_at=time.time())
         with self._lock:
             self._jobs[job_id] = job
+        logger.info("Library sync job queued job_id=%s", job_id)
         thread = threading.Thread(target=self._run_sync, args=(job_id, settings), daemon=True)
         thread.start()
         return job
@@ -97,6 +107,14 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job:
                 job.progress = JobProgress(phase=phase, current=current, total=total, message=message)
+        logger.debug(
+            "Sync progress job_id=%s phase=%s %s/%s %s",
+            job_id,
+            phase,
+            current,
+            total,
+            message,
+        )
 
     def _run_sync(self, job_id: str, settings: Settings) -> None:
         with self._lock:
@@ -104,17 +122,29 @@ class JobManager:
             job.status = "running"
             job.started_at = time.time()
 
+        logger.info("Library sync started job_id=%s", job_id)
+
         def progress(phase: str, current: int, total: int, message: str) -> None:
             self._update_progress(job_id, phase, current, total, message)
 
         try:
             result = asyncio.run(sync_library(self.db, settings, progress=progress))
+            refresh_library_overview_cache(self.db)
+            elapsed = time.time() - (job.started_at or time.time())
             with self._lock:
                 job.status = "completed"
                 job.finished_at = time.time()
                 job.summary = result
                 job.progress = JobProgress(phase="completed", current=1, total=1, message="Done")
+            logger.info(
+                "Library sync completed job_id=%s elapsed=%.1fs items=%s embeddings=%s",
+                job_id,
+                elapsed,
+                result.get("items_synced"),
+                result.get("embeddings"),
+            )
         except Exception as error:  # noqa: BLE001
+            logger.exception("Library sync failed job_id=%s: %s", job_id, error)
             with self._lock:
                 job.status = "failed"
                 job.finished_at = time.time()
@@ -135,6 +165,7 @@ class SyncScheduler:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True, name="library-sync-scheduler")
         self._thread.start()
+        logger.info("Library sync scheduler started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -156,9 +187,13 @@ class SyncScheduler:
                             should_run = True
                     running = any(j.status in ("queued", "running") for j in get_job_manager().list_jobs())
                     if should_run and not running:
+                        logger.info(
+                            "Scheduler triggering library sync interval_hours=%s",
+                            interval_hours,
+                        )
                         get_job_manager().start_sync(settings)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as error:  # noqa: BLE001
+                logger.exception("Sync scheduler loop error: %s", error)
             self._stop.wait(timeout=3600)
 
 

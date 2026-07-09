@@ -15,7 +15,8 @@ export function extractLatestCards(messages) {
     if (message.role !== "assistant") continue;
     const cards = message.blocks
       .filter((block) => block.type === "title_cards")
-      .flatMap((block) => block.items || []);
+      .flatMap((block) => block.items || [])
+      .filter((item) => item?.title || item?.tmdb_id || item?.tvdb_id || item?.rating_key);
     if (cards.length) return cards;
   }
   return [];

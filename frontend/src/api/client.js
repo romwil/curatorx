@@ -368,3 +368,17 @@ export async function testService(service, settings) {
     body: JSON.stringify(settings),
   });
 }
+
+export async function proposeAction(body) {
+  return api("/actions/propose", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function confirmAction(token, confirmed = true) {
+  return api("/actions/confirm", {
+    method: "POST",
+    body: JSON.stringify({ token, confirmed }),
+  });
+}

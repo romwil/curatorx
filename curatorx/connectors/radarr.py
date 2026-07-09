@@ -6,6 +6,8 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional
 
+from curatorx.config_store import pick_arr_root_folder, root_folder_paths_from_api
+from curatorx.connectors.arr_errors import ArrTitleExistsError, arr_exists_error_code
 from curatorx.connectors.http import request_json
 
 
@@ -37,6 +39,19 @@ class RadarrClient:
             timeout=self.timeout,
         )
 
+    def _movie_from_api(self, item: Mapping[str, Any]) -> RadarrMovie:
+        movie_file = item.get("movieFile") or {}
+        return RadarrMovie(
+            id=int(item["id"]),
+            title=str(item.get("title") or ""),
+            year=item.get("year"),
+            tmdb_id=int(item.get("tmdbId") or 0),
+            monitored=bool(item.get("monitored")),
+            has_file=bool(movie_file),
+            file_path=str(movie_file.get("path") or item.get("path") or ""),
+            file_size=int(movie_file.get("size") or 0),
+        )
+
     def movies(self) -> List[RadarrMovie]:
         payload = request_json(
             f"{self.base_url}/api/v3/movie",
@@ -47,20 +62,23 @@ class RadarrClient:
         if not isinstance(payload, list):
             return movies
         for item in payload:
-            movie_file = item.get("movieFile") or {}
-            movies.append(
-                RadarrMovie(
-                    id=int(item["id"]),
-                    title=str(item.get("title") or ""),
-                    year=item.get("year"),
-                    tmdb_id=int(item.get("tmdbId") or 0),
-                    monitored=bool(item.get("monitored")),
-                    has_file=bool(movie_file),
-                    file_path=str(movie_file.get("path") or item.get("path") or ""),
-                    file_size=int(movie_file.get("size") or 0),
-                )
-            )
+            movies.append(self._movie_from_api(item))
         return movies
+
+    def movie_by_tmdb_id(self, tmdb_id: int) -> Optional[RadarrMovie]:
+        payload = request_json(
+            f"{self.base_url}/api/v3/movie?tmdbId={tmdb_id}",
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        if isinstance(payload, list):
+            for item in payload:
+                if int(item.get("tmdbId") or 0) == tmdb_id:
+                    return self._movie_from_api(item)
+            return None
+        if isinstance(payload, dict) and int(payload.get("tmdbId") or 0) == tmdb_id:
+            return self._movie_from_api(payload)
+        return None
 
     def lookup(self, term: str) -> List[Mapping[str, Any]]:
         encoded = urllib.parse.quote(term)
@@ -88,20 +106,55 @@ class RadarrClient:
         monitored: bool = True,
         search_for_movie: bool = True,
     ) -> Mapping[str, Any]:
+        cleaned_root = str(root_folder or "").strip()
+        if not cleaned_root:
+            raise RuntimeError(
+                "Radarr root folder path is not configured. "
+                "Set radarr_root_folder in Configuration → Advanced settings."
+            )
+        existing = self.movie_by_tmdb_id(tmdb_id)
+        if existing:
+            raise ArrTitleExistsError(
+                "Radarr",
+                title=existing.title,
+                external_id=tmdb_id,
+                arr_id=existing.id,
+            )
+        resolved_root = pick_arr_root_folder(
+            cleaned_root,
+            root_folder_paths_from_api(self.root_folders()),
+            service="Radarr",
+        )
         lookup = self.lookup_tmdb(tmdb_id)
         if not lookup:
             raise RuntimeError(f"Radarr could not lookup TMDB id {tmdb_id}")
-        lookup["rootFolderPath"] = root_folder
-        lookup["qualityProfileId"] = quality_profile_id
-        lookup["monitored"] = monitored
-        lookup["addOptions"] = {"searchForMovie": search_for_movie}
-        result = request_json(
-            f"{self.base_url}/api/v3/movie",
-            method="POST",
-            headers=self._headers(),
-            body=lookup,
-            timeout=self.timeout,
-        )
+        body = dict(lookup)
+        body["rootFolderPath"] = resolved_root
+        body["qualityProfileId"] = quality_profile_id
+        body["monitored"] = monitored
+        body["addOptions"] = {"searchForMovie": search_for_movie}
+        if not str(body.get("path") or "").strip():
+            body.pop("path", None)
+        try:
+            result = request_json(
+                f"{self.base_url}/api/v3/movie",
+                method="POST",
+                headers=self._headers(),
+                body=body,
+                timeout=self.timeout,
+            )
+        except RuntimeError as error:
+            detail = str(error)
+            body_text = detail.split(": ", 1)[-1] if ": " in detail else detail
+            if arr_exists_error_code(body_text, movie=True):
+                found = self.movie_by_tmdb_id(tmdb_id)
+                raise ArrTitleExistsError(
+                    "Radarr",
+                    title=found.title if found else str(body.get("title") or ""),
+                    external_id=tmdb_id,
+                    arr_id=found.id if found else None,
+                ) from error
+            raise
         return result if isinstance(result, dict) else {}
 
     def delete_movie(self, movie_id: int, *, delete_files: bool = False) -> None:

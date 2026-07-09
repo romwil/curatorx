@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
@@ -10,6 +11,26 @@ from curatorx.agent.providers import get_chat_provider
 from curatorx.agent.tools import TOOL_DEFINITIONS, ToolRegistry, build_system_prompt
 from curatorx.config_store import Settings
 from curatorx.library.db import DEFAULT_LENS_ID, Database
+from curatorx.models.schemas import TitleCard
+
+logger = logging.getLogger(__name__)
+
+
+def _displayable_cards(cards: List[TitleCard]) -> List[TitleCard]:
+    """Skip empty placeholder cards that have no title or external ids."""
+    displayable: List[TitleCard] = []
+    for card in cards:
+        if card.title or card.tmdb_id or card.tvdb_id or card.rating_key:
+            displayable.append(card)
+    return displayable
+
+
+def _cards_for_response(registry: ToolRegistry) -> List[TitleCard]:
+    """Cards shown in title_cards blocks — drop owned titles during add/recommend flows."""
+    cards = registry.cards
+    if registry.recommendation_context:
+        cards = [card for card in cards if not card.in_library]
+    return _displayable_cards(cards)
 
 
 def _extract_tool_calls(response: Mapping[str, Any]) -> List[Mapping[str, Any]]:
@@ -96,14 +117,16 @@ class CuratorAgent:
             text = await self._fallback_run(registry, user_message)
             blocks: List[Dict[str, Any]] = [{"type": "text", "content": text}]
             if registry.cards:
-                blocks.append({"type": "title_cards", "items": [card.model_dump() for card in registry.cards]})
-                blocks.append(
-                    {
-                        "type": "action_prompt",
-                        "action": "open_viewport",
-                        "payload": {"title": "Results", "items": [c.model_dump() for c in registry.cards]},
-                    }
-                )
+                cards = _cards_for_response(registry)
+                if cards:
+                    blocks.append({"type": "title_cards", "items": [card.model_dump() for card in cards]})
+                    blocks.append(
+                        {
+                            "type": "action_prompt",
+                            "action": "open_viewport",
+                            "payload": {"title": "Results", "items": [c.model_dump() for c in cards]},
+                        }
+                    )
             user_id = uuid.uuid4().hex
             assistant_id = uuid.uuid4().hex
             self.db.save_chat_message(
@@ -144,6 +167,7 @@ class CuratorAgent:
                 fn = call.get("function") or {}
                 name = fn.get("name")
                 args = json.loads(fn.get("arguments") or "{}")
+                logger.debug("Agent tool call name=%s args=%s", name, args)
                 result = await registry.execute(str(name), args)
                 messages.append(
                     {
@@ -181,14 +205,17 @@ class CuratorAgent:
                 }
             )
         if registry.cards:
-            blocks.append({"type": "title_cards", "items": [card.model_dump() for card in registry.cards]})
-            blocks.append(
-                {
-                    "type": "action_prompt",
-                    "action": "open_viewport",
-                    "payload": {"title": "Recommendations", "items": [c.model_dump() for c in registry.cards]},
-                }
-            )
+            cards = _cards_for_response(registry)
+            if cards:
+                viewport_title = "Recommendations" if registry.recommendation_context else "Results"
+                blocks.append({"type": "title_cards", "items": [card.model_dump() for card in cards]})
+                blocks.append(
+                    {
+                        "type": "action_prompt",
+                        "action": "open_viewport",
+                        "payload": {"title": viewport_title, "items": [c.model_dump() for c in cards]},
+                    }
+                )
 
         user_id = uuid.uuid4().hex
         assistant_id = uuid.uuid4().hex

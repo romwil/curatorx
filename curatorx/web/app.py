@@ -9,6 +9,7 @@ import re
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -20,7 +21,13 @@ from sse_starlette.sse import EventSourceResponse
 from curatorx import __version__
 from curatorx.agent.curator import CuratorAgent, stream_agent
 from curatorx.agent.providers import LLMProviderError
-from curatorx.agent.tools import execute_confirmed_action
+from curatorx.agent.tools import (
+    check_radarr_already_exists,
+    check_sonarr_already_exists,
+    execute_confirmed_action,
+    mark_in_radarr,
+    mark_in_sonarr,
+)
 from curatorx.config_store import (
     ANTHROPIC_MODEL_OPTIONS,
     LLM_MODEL_DEFAULTS,
@@ -28,14 +35,32 @@ from curatorx.config_store import (
     Settings,
     load_dotenv_file,
     load_merged_settings,
+    normalize_path_settings,
     normalize_settings_llm,
+    radarr_add_configuration_error,
     resolve_llm_model,
+    resolve_radarr_root_folder,
+    resolve_sonarr_root_folder,
     save_settings,
     secret_field_sources,
+    sonarr_add_configuration_error,
+    validate_arr_root_folder,
     validate_llm_settings,
 )
 from curatorx.connectors.plex import PlexClient
+from curatorx.connectors.radarr import RadarrClient
+from curatorx.connectors.sonarr import SonarrClient
 from curatorx.library.db import DEFAULT_LENS_ID
+from curatorx.library.facets import ensure_library_facet_index
+from curatorx.library.episodes import query_episodes, summarize_tv_progress
+from curatorx.library.facets import library_facet_catalog
+from curatorx.library.query import (
+    aggregate_library,
+    filters_from_mapping,
+    library_overview,
+    query_library,
+    query_library_async,
+)
 from curatorx.library.titles import get_title_detail
 from curatorx.models.schemas import (
     ActionConfirmRequest,
@@ -87,6 +112,10 @@ FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 if os.environ.get("CURATORX_SKIP_DOTENV") != "1":
     load_dotenv_file()
+
+from curatorx.logging_config import configure_logging
+
+configure_logging()
 
 app = FastAPI(title="CuratorX", version=__version__)
 logger = logging.getLogger(__name__)
@@ -145,9 +174,12 @@ def _resolve_lens_id(lens_id: Optional[str]) -> str:
 
 @app.on_event("startup")
 def _startup() -> None:
-    get_job_manager()
-    get_job_manager().db.ensure_seed_data()
+    logger.info("CuratorX startup (version %s, data_dir=%s)", __version__, DATA_DIR)
+    manager = get_job_manager()
+    manager.db.ensure_seed_data()
+    ensure_library_facet_index(manager.db)
     get_sync_scheduler().start()
+    logger.info("Job manager and sync scheduler ready")
 
 
 if FRONTEND_DIST.exists():
@@ -264,7 +296,7 @@ def health() -> Dict[str, str]:
 
 @app.get("/api/setup/status")
 def setup_status() -> Dict[str, Any]:
-    return build_setup_status(_settings())
+    return build_setup_status(_settings(), _db())
 
 
 @app.get("/api/setup/wizard")
@@ -297,7 +329,10 @@ def put_settings(payload: SettingsPayload) -> Dict[str, Any]:
     before = Settings.load(settings_path)
     existing = _settings()
     merged = merge_secret_fields(payload.model_dump(), existing)
-    settings = normalize_settings_llm(Settings.from_mapping(merged))
+    settings = normalize_path_settings(normalize_settings_llm(Settings.from_mapping(merged)))
+    wizard_status = build_wizard_status(settings, _db())
+    if not settings.onboarding_complete and wizard_status["onboarding_complete"]:
+        settings = Settings.from_mapping({**asdict(settings), "onboarding_complete": True})
     invalidate_certifications_on_settings_change(_db(), before, settings, payload.model_dump())
     save_settings(DATA_DIR, settings)
     sync_settings_to_db(_db(), settings)
@@ -320,8 +355,13 @@ def api_test_plex(payload: TestPayload) -> Dict[str, Any]:
 
 @app.post("/api/setup/test/radarr")
 def api_test_radarr(payload: TestPayload) -> Dict[str, Any]:
-    resolved = resolve_test_payload(payload.model_dump(), _settings())
-    result = test_radarr(resolved["radarr_url"], resolved["radarr_api_key"])
+    settings = _settings()
+    resolved = resolve_test_payload(payload.model_dump(), settings)
+    result = test_radarr(
+        resolved["radarr_url"],
+        resolved["radarr_api_key"],
+        configured_root_folder=resolve_radarr_root_folder(settings),
+    )
     record_service_integration(
         _db(),
         "radarr",
@@ -334,8 +374,13 @@ def api_test_radarr(payload: TestPayload) -> Dict[str, Any]:
 
 @app.post("/api/setup/test/sonarr")
 def api_test_sonarr(payload: TestPayload) -> Dict[str, Any]:
-    resolved = resolve_test_payload(payload.model_dump(), _settings())
-    result = test_sonarr(resolved["sonarr_url"], resolved["sonarr_api_key"])
+    settings = _settings()
+    resolved = resolve_test_payload(payload.model_dump(), settings)
+    result = test_sonarr(
+        resolved["sonarr_url"],
+        resolved["sonarr_api_key"],
+        configured_root_folder=resolve_sonarr_root_folder(settings),
+    )
     record_service_integration(
         _db(),
         "sonarr",
@@ -446,6 +491,7 @@ def get_job(job_id: str) -> Dict[str, Any]:
 @app.post("/api/library/sync")
 def start_library_sync() -> Dict[str, Any]:
     job = get_job_manager().start_sync(_settings())
+    logger.info("Library sync queued job_id=%s", job.id)
     return job.to_dict()
 
 
@@ -461,6 +507,182 @@ def library_stats() -> Dict[str, Any]:
         "shows": shows,
         "last_sync": db.get_sync_state("last_sync"),
     }
+
+
+@app.get("/api/library/overview")
+def library_overview_endpoint() -> Dict[str, Any]:
+    return library_overview(_db())
+
+
+@app.get("/api/library/query")
+async def library_query_endpoint(
+    media_type: Optional[str] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    genres: Optional[str] = None,
+    directors: Optional[str] = None,
+    cast: Optional[str] = None,
+    keywords: Optional[str] = None,
+    countries: Optional[str] = None,
+    content_ratings: Optional[str] = None,
+    original_language: Optional[str] = None,
+    query: Optional[str] = None,
+    fts_query: Optional[str] = None,
+    semantic_query: Optional[str] = None,
+    unwatched_only: bool = False,
+    min_view_count: Optional[int] = None,
+    max_view_count: Optional[int] = None,
+    stale_days: Optional[int] = None,
+    recently_added_days: Optional[int] = None,
+    added_from: Optional[str] = None,
+    added_to: Optional[str] = None,
+    last_viewed_from: Optional[str] = None,
+    last_viewed_to: Optional[str] = None,
+    runtime_min: Optional[int] = None,
+    runtime_max: Optional[int] = None,
+    vote_min: Optional[float] = None,
+    vote_max: Optional[float] = None,
+    file_size_min: Optional[int] = None,
+    file_size_max: Optional[int] = None,
+    in_radarr: Optional[bool] = None,
+    in_sonarr: Optional[bool] = None,
+    missing_tmdb_id: bool = False,
+    in_progress_only: bool = False,
+    sort: str = "title",
+    offset: int = 0,
+    limit: int = 25,
+) -> Dict[str, Any]:
+    filters = filters_from_mapping(
+        {
+            "media_type": media_type,
+            "year_from": year_from,
+            "year_to": year_to,
+            "genres": genres,
+            "directors": directors,
+            "cast": cast,
+            "keywords": keywords,
+            "countries": countries,
+            "content_ratings": content_ratings,
+            "original_language": original_language,
+            "query": query,
+            "fts_query": fts_query,
+            "semantic_query": semantic_query,
+            "unwatched_only": unwatched_only,
+            "min_view_count": min_view_count,
+            "max_view_count": max_view_count,
+            "stale_days": stale_days,
+            "recently_added_days": recently_added_days,
+            "added_from": added_from,
+            "added_to": added_to,
+            "last_viewed_from": last_viewed_from,
+            "last_viewed_to": last_viewed_to,
+            "runtime_min": runtime_min,
+            "runtime_max": runtime_max,
+            "vote_min": vote_min,
+            "vote_max": vote_max,
+            "file_size_min": file_size_min,
+            "file_size_max": file_size_max,
+            "in_radarr": in_radarr,
+            "in_sonarr": in_sonarr,
+            "missing_tmdb_id": missing_tmdb_id,
+            "in_progress_only": in_progress_only,
+            "sort": sort,
+            "offset": offset,
+            "limit": limit,
+        }
+    )
+    if filters.semantic_query:
+        return await query_library_async(_db(), filters, _settings())
+    return query_library(_db(), filters)
+
+
+@app.get("/api/library/aggregate")
+def library_aggregate_endpoint(
+    group_by: str,
+    media_type: Optional[str] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    genres: Optional[str] = None,
+    directors: Optional[str] = None,
+    keywords: Optional[str] = None,
+) -> Dict[str, Any]:
+    normalized = group_by.strip().lower()
+    allowed = {
+        "decade",
+        "year",
+        "genre",
+        "media_type",
+        "director",
+        "actor",
+        "keyword",
+        "country",
+        "language",
+        "content_rating",
+        "runtime_bucket",
+        "decade_genre",
+    }
+    if normalized not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="group_by must be decade, year, genre, media_type, director, actor, keyword, "
+            "country, language, content_rating, runtime_bucket, or decade_genre",
+        )
+    filters = filters_from_mapping(
+        {
+            "media_type": media_type,
+            "year_from": year_from,
+            "year_to": year_to,
+            "genres": genres,
+            "directors": directors,
+            "keywords": keywords,
+        }
+    )
+    return aggregate_library(_db(), normalized, filters)  # type: ignore[arg-type]
+
+
+@app.get("/api/library/facets")
+def library_facets_endpoint(facet_type: str, limit: int = 50) -> Dict[str, Any]:
+    try:
+        return library_facet_catalog(_db(), facet_type, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/library/tv/episodes")
+def library_tv_episodes_endpoint(
+    show: Optional[str] = None,
+    show_id: Optional[int] = None,
+    season: Optional[int] = None,
+    unwatched_only: bool = False,
+    offset: int = 0,
+    limit: int = 25,
+) -> Dict[str, Any]:
+    return query_episodes(
+        _db(),
+        show=show,
+        show_id=show_id,
+        season=season,
+        unwatched_only=unwatched_only,
+        offset=offset,
+        limit=limit,
+    )
+
+
+@app.get("/api/library/tv/progress")
+def library_tv_progress_endpoint(
+    group_by: str = "show",
+    in_progress_only: bool = False,
+    limit: int = 25,
+) -> Dict[str, Any]:
+    try:
+        return summarize_tv_progress(
+            _db(),
+            group_by=group_by,
+            in_progress_only=in_progress_only,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/lenses", response_model=List[Lens])
@@ -760,19 +982,83 @@ def propose_action(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     action = payload.get("action")
     if action == "add_radarr":
+        settings = _settings()
+        config_error = radarr_add_configuration_error(settings)
+        if config_error:
+            raise HTTPException(status_code=400, detail=config_error)
+        client = RadarrClient(settings.radarr_url, settings.radarr_api_key)
+        root_error = validate_arr_root_folder(
+            "Radarr",
+            resolve_radarr_root_folder(settings),
+            client.root_folders(),
+        )
+        if root_error:
+            raise HTTPException(status_code=400, detail=root_error)
+        tmdb_id = int(payload["tmdb_id"])
+        existing = check_radarr_already_exists(
+            client,
+            tmdb_id,
+            title=str(payload.get("title") or ""),
+        )
+        if existing:
+            mark_in_radarr(_db(), tmdb_id)
+            logger.info(
+                "Skipped add_radarr tmdb_id=%s title=%r — already in Radarr",
+                tmdb_id,
+                payload.get("title", ""),
+            )
+            return existing
         token = uuid_mod.uuid4().hex
         _db().save_pending_action(
             token,
             "add_radarr",
-            {"action": "add_radarr", "tmdb_id": int(payload["tmdb_id"]), "title": payload.get("title", "")},
+            {"action": "add_radarr", "tmdb_id": tmdb_id, "title": payload.get("title", "")},
+        )
+        logger.info(
+            "Proposed add_radarr tmdb_id=%s title=%r token=%s",
+            payload["tmdb_id"],
+            payload.get("title", ""),
+            token[:8],
         )
         return {"confirmation_token": token}
     if action == "add_sonarr":
+        settings = _settings()
+        config_error = sonarr_add_configuration_error(settings)
+        if config_error:
+            raise HTTPException(status_code=400, detail=config_error)
+        client = SonarrClient(settings.sonarr_url, settings.sonarr_api_key)
+        root_error = validate_arr_root_folder(
+            "Sonarr",
+            resolve_sonarr_root_folder(settings),
+            client.root_folders(),
+        )
+        if root_error:
+            raise HTTPException(status_code=400, detail=root_error)
+        tvdb_id = int(payload["tvdb_id"])
+        existing = check_sonarr_already_exists(
+            client,
+            tvdb_id,
+            title=str(payload.get("title") or ""),
+        )
+        if existing:
+            mark_in_sonarr(_db(), tvdb_id)
+            logger.info(
+                "Skipped add_sonarr tvdb_id=%s title=%r — already in Sonarr",
+                tvdb_id,
+                payload.get("title", ""),
+            )
+            return existing
         token = uuid_mod.uuid4().hex
         _db().save_pending_action(
             token,
             "add_sonarr",
-            {"action": "add_sonarr", "tvdb_id": int(payload["tvdb_id"]), "title": payload.get("title", "")},
+            {"action": "add_sonarr", "tvdb_id": tvdb_id, "title": payload.get("title", "")},
+        )
+        logger.info(
+            "Proposed add_sonarr tvdb_id=%s title=%r token=%s",
+            payload["tvdb_id"],
+            payload.get("title", ""),
+            token[:8],
         )
         return {"confirmation_token": token}
     raise HTTPException(status_code=400, detail="Unknown action")
@@ -782,11 +1068,14 @@ def propose_action(payload: Dict[str, Any]) -> Dict[str, Any]:
 async def confirm_action(payload: ActionConfirmRequest) -> Dict[str, Any]:
     if not payload.confirmed:
         _db().pop_pending_action(payload.token)
+        logger.info("Action cancelled token=%s", payload.token[:8])
         return {"cancelled": True}
     try:
         result = await execute_confirmed_action(_db(), _settings(), payload.token)
+        logger.info("Action confirmed token=%s action=%s", payload.token[:8], result.get("action"))
         return {"ok": True, **result}
     except Exception as error:  # noqa: BLE001
+        logger.exception("Action confirm failed token=%s", payload.token[:8])
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 

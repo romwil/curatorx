@@ -241,6 +241,75 @@ export async function mockCuratorApis(page: Page) {
     });
   });
 
+  await page.route("**/api/library/query**", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        total_matched: 142,
+        returned: 25,
+        offset: 0,
+        has_more: true,
+        items: [
+          {
+            title: "Alien",
+            year: 1979,
+            media_type: "movie",
+            genres: ["Horror", "Sci-Fi"],
+            view_count: 2,
+            tmdb_id: 348,
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.route("**/api/library/aggregate**", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        group_by: "decade",
+        total_matched: 142,
+        buckets: [{ decade: "1970s", decade_start: 1970, decade_end: 1979, count: 142 }],
+      }),
+    });
+  });
+
+  await page.route("**/api/library/overview", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        total: 5276,
+        movies: 4474,
+        shows: 802,
+        decades: [{ decade: "1970s", decade_start: 1970, count: 142 }],
+        top_genres: [{ genre: "Drama", count: 1868 }],
+      }),
+    });
+  });
+
+  await page.route("**/api/library/tv/progress**", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        group_by: "show",
+        returned: 1,
+        buckets: [
+          {
+            show_title: "The Wire",
+            total_episodes: 60,
+            watched_episodes: 30,
+            unwatched_episodes: 30,
+            completion_percent: 50.0,
+          },
+        ],
+      }),
+    });
+  });
+
   await page.route("**/api/settings", async (route: Route) => {
     if (route.request().method() !== "PUT") {
       await route.continue();

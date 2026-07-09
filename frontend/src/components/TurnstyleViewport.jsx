@@ -17,6 +17,10 @@ export default function TurnstyleViewport({
   onAdd,
   onDismiss,
   onOpenViewport,
+  onConfirmAllItems,
+  onConfirmAllTokens,
+  pendingTokenCount = 0,
+  actionsDisabled = false,
 }) {
   const inputRef = useRef(null);
 
@@ -91,6 +95,10 @@ export default function TurnstyleViewport({
             onAdd={onAdd}
             onDismiss={onDismiss}
             onOpenViewport={onOpenViewport}
+            onConfirmAllItems={onConfirmAllItems}
+            onConfirmAllTokens={onConfirmAllTokens}
+            pendingTokenCount={pendingTokenCount}
+            actionsDisabled={actionsDisabled}
           />
         </div>
       ) : null}

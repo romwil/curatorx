@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS library_items (
     poster_url TEXT DEFAULT '',
     backdrop_url TEXT DEFAULT '',
     view_count INTEGER DEFAULT 0,
+    added_at INTEGER,
     last_viewed_at INTEGER,
     file_size INTEGER DEFAULT 0,
     in_radarr INTEGER DEFAULT 0,
@@ -44,6 +45,8 @@ CREATE TABLE IF NOT EXISTS library_items (
 CREATE INDEX IF NOT EXISTS idx_library_tmdb ON library_items(tmdb_id);
 CREATE INDEX IF NOT EXISTS idx_library_tvdb ON library_items(tvdb_id);
 CREATE INDEX IF NOT EXISTS idx_library_type ON library_items(media_type);
+CREATE INDEX IF NOT EXISTS idx_library_year ON library_items(year);
+CREATE INDEX IF NOT EXISTS idx_library_media_year ON library_items(media_type, year);
 
 CREATE TABLE IF NOT EXISTS embeddings (
     item_id INTEGER PRIMARY KEY,
@@ -207,6 +210,8 @@ class Database:
             self._migrate_service_integrations_certified(conn)
             self._migrate_phase3_tables(conn)
             self._migrate_persona_columns(conn)
+            self._migrate_library_intelligence(conn)
+            self._migrate_library_indexes(conn)
             self._seed_defaults(conn)
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -264,6 +269,74 @@ class Database:
                 WHERE connection_status = 'verified'
                 """
             )
+
+    def _migrate_library_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_year ON library_items(year)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_library_media_year ON library_items(media_type, year)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_added_at ON library_items(added_at)")
+
+    def _migrate_library_intelligence(self, conn: sqlite3.Connection) -> None:
+        cols = self._table_columns(conn, "library_items")
+        new_columns = {
+            "runtime_minutes": "INTEGER",
+            "content_rating": "TEXT DEFAULT ''",
+            "vote_average": "REAL",
+            "original_language": "TEXT DEFAULT ''",
+            "countries": "TEXT DEFAULT '[]'",
+            "season_count": "INTEGER",
+            "leaf_count": "INTEGER",
+            "viewed_leaf_count": "INTEGER",
+            "unwatched_episode_count": "INTEGER DEFAULT 0",
+            "total_episode_count": "INTEGER DEFAULT 0",
+            "last_episode_watched_at": "INTEGER",
+            "last_episode_sync_at": "REAL",
+            "added_at": "INTEGER",
+        }
+        for name, typedef in new_columns.items():
+            if name not in cols:
+                conn.execute(f"ALTER TABLE library_items ADD COLUMN {name} {typedef}")
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS library_facets (
+                item_id INTEGER NOT NULL,
+                facet_type TEXT NOT NULL,
+                facet_value TEXT NOT NULL,
+                FOREIGN KEY(item_id) REFERENCES library_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_facets_lookup ON library_facets(facet_type, facet_value);
+            CREATE INDEX IF NOT EXISTS idx_facets_item ON library_facets(item_id);
+
+            CREATE TABLE IF NOT EXISTS library_episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                show_item_id INTEGER NOT NULL,
+                rating_key TEXT UNIQUE,
+                season_number INTEGER,
+                episode_number INTEGER,
+                title TEXT,
+                runtime_minutes INTEGER,
+                view_count INTEGER DEFAULT 0,
+                last_viewed_at INTEGER,
+                file_size INTEGER DEFAULT 0,
+                aired_at TEXT,
+                FOREIGN KEY(show_item_id) REFERENCES library_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_show ON library_episodes(show_item_id);
+            CREATE INDEX IF NOT EXISTS idx_episodes_unwatched ON library_episodes(show_item_id, view_count);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS library_fts USING fts5(
+                item_id UNINDEXED,
+                title,
+                summary,
+                cast_text,
+                directors_text,
+                keywords_text,
+                tokenize='porter'
+            );
+            """
+        )
 
     def _migrate_persona_columns(self, conn: sqlite3.Connection) -> None:
         cols = self._table_columns(conn, "curator_persona_metrics")
@@ -381,8 +454,12 @@ class Database:
                 INSERT INTO library_items (
                     rating_key, media_type, title, year, summary, genres, cast, directors,
                     keywords, tmdb_id, tvdb_id, imdb_id, poster_url, backdrop_url,
-                    view_count, last_viewed_at, file_size, in_radarr, in_sonarr, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    view_count, added_at, last_viewed_at, file_size, in_radarr, in_sonarr,
+                    runtime_minutes, content_rating, vote_average, original_language, countries,
+                    season_count, leaf_count, viewed_leaf_count,
+                    unwatched_episode_count, total_episode_count,
+                    last_episode_watched_at, last_episode_sync_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rating_key) DO UPDATE SET
                     media_type=excluded.media_type,
                     title=excluded.title,
@@ -398,10 +475,29 @@ class Database:
                     poster_url=excluded.poster_url,
                     backdrop_url=excluded.backdrop_url,
                     view_count=excluded.view_count,
+                    added_at=COALESCE(excluded.added_at, library_items.added_at),
                     last_viewed_at=excluded.last_viewed_at,
                     file_size=excluded.file_size,
                     in_radarr=excluded.in_radarr,
                     in_sonarr=excluded.in_sonarr,
+                    runtime_minutes=excluded.runtime_minutes,
+                    content_rating=excluded.content_rating,
+                    vote_average=COALESCE(excluded.vote_average, library_items.vote_average),
+                    original_language=CASE
+                        WHEN excluded.original_language != '' THEN excluded.original_language
+                        ELSE library_items.original_language
+                    END,
+                    countries=CASE
+                        WHEN excluded.countries != '[]' THEN excluded.countries
+                        ELSE library_items.countries
+                    END,
+                    season_count=excluded.season_count,
+                    leaf_count=excluded.leaf_count,
+                    viewed_leaf_count=excluded.viewed_leaf_count,
+                    unwatched_episode_count=excluded.unwatched_episode_count,
+                    total_episode_count=excluded.total_episode_count,
+                    last_episode_watched_at=excluded.last_episode_watched_at,
+                    last_episode_sync_at=excluded.last_episode_sync_at,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -420,10 +516,23 @@ class Database:
                     item.get("poster_url", ""),
                     item.get("backdrop_url", ""),
                     item.get("view_count", 0),
+                    item.get("added_at"),
                     item.get("last_viewed_at"),
                     item.get("file_size", 0),
                     int(bool(item.get("in_radarr"))),
                     int(bool(item.get("in_sonarr"))),
+                    item.get("runtime_minutes"),
+                    item.get("content_rating", ""),
+                    item.get("vote_average"),
+                    item.get("original_language", ""),
+                    json.dumps(item.get("countries", [])),
+                    item.get("season_count"),
+                    item.get("leaf_count"),
+                    item.get("viewed_leaf_count"),
+                    item.get("unwatched_episode_count", 0),
+                    item.get("total_episode_count", 0),
+                    item.get("last_episode_watched_at"),
+                    item.get("last_episode_sync_at"),
                     now,
                 ),
             )
@@ -452,12 +561,220 @@ class Database:
                 (tmdb_id, media_type),
             ).fetchone()
 
+    def library_item_by_id(self, item_id: int) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM library_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()
+
     def library_item_by_tvdb(self, tvdb_id: int) -> Optional[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
                 "SELECT * FROM library_items WHERE tvdb_id = ? AND media_type = 'show'",
                 (tvdb_id,),
             ).fetchone()
+
+    def library_item_by_title(self, title: str, *, media_type: Optional[str] = None) -> Optional[sqlite3.Row]:
+        pattern = f"%{title.strip().lower()}%"
+        with self.connect() as conn:
+            if media_type:
+                return conn.execute(
+                    """
+                    SELECT * FROM library_items
+                    WHERE lower(title) LIKE ? AND media_type = ?
+                    ORDER BY length(title) ASC
+                    LIMIT 1
+                    """,
+                    (pattern, media_type),
+                ).fetchone()
+            return conn.execute(
+                """
+                SELECT * FROM library_items
+                WHERE lower(title) LIKE ?
+                ORDER BY length(title) ASC
+                LIMIT 1
+                """,
+                (pattern,),
+            ).fetchone()
+
+    def library_shows(self) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM library_items WHERE media_type = 'show' ORDER BY title"
+                ).fetchall()
+            )
+
+    def update_library_item_rating_key(self, show_id: int, rating_key: str) -> bool:
+        key = str(rating_key or "").strip()
+        if not key:
+            return False
+        now = time.time()
+        with self.connect() as conn:
+            conflict = conn.execute(
+                """
+                SELECT id FROM library_items
+                WHERE rating_key = ? AND id != ?
+                """,
+                (key, show_id),
+            ).fetchone()
+            if conflict:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE library_items
+                SET rating_key = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (key, now, show_id),
+            )
+            return cursor.rowcount > 0
+
+    def set_arr_presence(
+        self,
+        *,
+        tmdb_id: Optional[int] = None,
+        tvdb_id: Optional[int] = None,
+        in_radarr: Optional[bool] = None,
+        in_sonarr: Optional[bool] = None,
+    ) -> int:
+        now = time.time()
+        with self.connect() as conn:
+            if tmdb_id is not None and in_radarr is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE library_items
+                    SET in_radarr = ?, updated_at = ?
+                    WHERE tmdb_id = ? AND media_type = 'movie'
+                    """,
+                    (int(bool(in_radarr)), now, tmdb_id),
+                )
+                return int(cursor.rowcount)
+            if tvdb_id is not None and in_sonarr is not None:
+                cursor = conn.execute(
+                    """
+                    UPDATE library_items
+                    SET in_sonarr = ?, updated_at = ?
+                    WHERE tvdb_id = ? AND media_type = 'show'
+                    """,
+                    (int(bool(in_sonarr)), now, tvdb_id),
+                )
+                return int(cursor.rowcount)
+        return 0
+
+    def clear_library_facets(self) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM library_facets")
+
+    def add_library_facet(self, item_id: int, facet_type: str, facet_value: str) -> None:
+        cleaned = str(facet_value or "").strip()
+        if not cleaned:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO library_facets (item_id, facet_type, facet_value)
+                VALUES (?, ?, ?)
+                """,
+                (item_id, facet_type, cleaned),
+            )
+
+    def clear_library_fts(self) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM library_fts")
+
+    def upsert_library_fts_row(
+        self,
+        item_id: int,
+        title: str,
+        summary: str,
+        cast_text: str,
+        directors_text: str,
+        keywords_text: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO library_fts (
+                    item_id, title, summary, cast_text, directors_text, keywords_text
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (item_id, title, summary, cast_text, directors_text, keywords_text),
+            )
+
+    def delete_episodes_for_show(self, show_item_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM library_episodes WHERE show_item_id = ?", (show_item_id,))
+
+    def upsert_library_episode(self, episode: Mapping[str, Any]) -> int:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO library_episodes (
+                    show_item_id, rating_key, season_number, episode_number, title,
+                    runtime_minutes, view_count, last_viewed_at, file_size, aired_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(rating_key) DO UPDATE SET
+                    show_item_id=excluded.show_item_id,
+                    season_number=excluded.season_number,
+                    episode_number=excluded.episode_number,
+                    title=excluded.title,
+                    runtime_minutes=excluded.runtime_minutes,
+                    view_count=excluded.view_count,
+                    last_viewed_at=excluded.last_viewed_at,
+                    file_size=excluded.file_size,
+                    aired_at=excluded.aired_at
+                """,
+                (
+                    episode["show_item_id"],
+                    episode.get("rating_key"),
+                    episode.get("season_number"),
+                    episode.get("episode_number"),
+                    episode.get("title", ""),
+                    episode.get("runtime_minutes"),
+                    episode.get("view_count", 0),
+                    episode.get("last_viewed_at"),
+                    episode.get("file_size", 0),
+                    episode.get("aired_at"),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM library_episodes WHERE rating_key = ?",
+                (episode.get("rating_key"),),
+            ).fetchone()
+            return int(row["id"]) if row else 0
+
+    def update_show_episode_rollups(self, show_item_id: int) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN view_count IS NULL OR view_count = 0 THEN 1 ELSE 0 END) AS unwatched,
+                    MAX(last_viewed_at) AS last_watched
+                FROM library_episodes
+                WHERE show_item_id = ?
+                """,
+                (show_item_id,),
+            ).fetchone()
+            conn.execute(
+                """
+                UPDATE library_items
+                SET total_episode_count = ?,
+                    unwatched_episode_count = ?,
+                    last_episode_watched_at = ?,
+                    last_episode_sync_at = ?
+                WHERE id = ?
+                """,
+                (
+                    int(row["total"] or 0),
+                    int(row["unwatched"] or 0),
+                    row["last_watched"],
+                    time.time(),
+                    show_item_id,
+                ),
+            )
 
     def owned_tmdb_ids(self, media_type: str) -> set[int]:
         with self.connect() as conn:
@@ -696,6 +1013,20 @@ class Database:
         row = self.get_derived_context(DEFAULT_CONTEXT_HASH)
         assert row is not None
         return row
+
+    def update_derived_context_label(self, context_hash: str, label: str) -> None:
+        cleaned = str(label or "").strip()
+        if not cleaned:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE derived_contexts
+                SET inferred_label = ?, last_active_at = CURRENT_TIMESTAMP
+                WHERE context_hash = ?
+                """,
+                (cleaned, context_hash),
+            )
 
     # --- Persona ---
 

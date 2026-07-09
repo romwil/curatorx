@@ -37,14 +37,17 @@ def get_title_detail(
         media_type=media_type,  # type: ignore[arg-type]
         title="",
         in_library=row is not None,
+        tmdb_id=tmdb_id,
+        tvdb_id=tvdb_id,
+        rating_key=rating_key,
     )
 
     if row:
         detail.title = row["title"]
         detail.year = row["year"]
-        detail.tmdb_id = row["tmdb_id"]
-        detail.tvdb_id = row["tvdb_id"]
-        detail.rating_key = row["rating_key"]
+        detail.tmdb_id = row["tmdb_id"] or tmdb_id
+        detail.tvdb_id = row["tvdb_id"] or tvdb_id
+        detail.rating_key = row["rating_key"] or rating_key
         detail.poster_url = row["poster_url"] or ""
         detail.backdrop_url = row["backdrop_url"] or ""
         detail.overview = row["summary"] or ""
@@ -60,32 +63,40 @@ def get_title_detail(
 
     if settings.tmdb_api_key and tmdb_id:
         tmdb = TMDBClient(settings.tmdb_api_key)
-        if media_type == "movie":
-            meta = tmdb.movie_details(tmdb_id)
-            detail.title = detail.title or str(meta.get("title") or "")
-            detail.overview = detail.overview or str(meta.get("overview") or "")
-            detail.rating = float(meta.get("vote_average") or 0) or None
-            if not detail.poster_url:
-                detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
-            if not detail.backdrop_url:
-                detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
-            detail.runtime_minutes = int((meta.get("runtime") or 0) or 0) or None
-            credits = meta.get("credits") or {}
-            if not detail.cast:
-                detail.cast = [c.get("name", "") for c in credits.get("cast", [])[:8]]
-            if not detail.directors:
-                detail.directors = [c.get("name", "") for c in credits.get("crew", []) if c.get("job") == "Director"]
-            keywords = (meta.get("keywords") or {}).get("keywords") or []
-            detail.keywords = detail.keywords or [k.get("name", "") for k in keywords if k.get("name")]
-        else:
-            meta = tmdb.tv_details(tmdb_id)
-            detail.title = detail.title or str(meta.get("name") or "")
-            detail.overview = detail.overview or str(meta.get("overview") or "")
-            detail.rating = float(meta.get("vote_average") or 0) or None
-            if not detail.poster_url:
-                detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
-            if not detail.backdrop_url:
-                detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
+        try:
+            if media_type == "movie":
+                meta = tmdb.movie_details(tmdb_id)
+                detail.title = detail.title or str(meta.get("title") or "")
+                detail.overview = detail.overview or str(meta.get("overview") or "")
+                detail.rating = float(meta.get("vote_average") or 0) or None
+                if not detail.poster_url:
+                    detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
+                if not detail.backdrop_url:
+                    detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
+                detail.runtime_minutes = int((meta.get("runtime") or 0) or 0) or None
+                credits = meta.get("credits") or {}
+                if not detail.cast:
+                    detail.cast = [c.get("name", "") for c in credits.get("cast", [])[:8]]
+                if not detail.directors:
+                    detail.directors = [
+                        c.get("name", "") for c in credits.get("crew", []) if c.get("job") == "Director"
+                    ]
+                keywords = (meta.get("keywords") or {}).get("keywords") or []
+                detail.keywords = detail.keywords or [k.get("name", "") for k in keywords if k.get("name")]
+            else:
+                meta = tmdb.tv_details(tmdb_id)
+                detail.title = detail.title or str(meta.get("name") or "")
+                detail.overview = detail.overview or str(meta.get("overview") or "")
+                detail.rating = float(meta.get("vote_average") or 0) or None
+                if not detail.poster_url:
+                    detail.poster_url = tmdb.poster_url(meta.get("poster_path"))
+                if not detail.backdrop_url:
+                    detail.backdrop_url = tmdb.backdrop_url(meta.get("backdrop_path"))
+                external = meta.get("external_ids") or {}
+                if external.get("tvdb_id"):
+                    detail.tvdb_id = int(external["tvdb_id"])
+        except RuntimeError:
+            pass
 
     if settings.fanart_api_key and tmdb_id and media_type == "movie":
         art = FanartClient(settings.fanart_api_key).movie(tmdb_id)
