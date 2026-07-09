@@ -12,11 +12,15 @@ from fastapi.testclient import TestClient
 
 from curatorx.library.db import Database
 from curatorx.persona import (
+    CURATOR_NAME_PLACEHOLDER,
     build_assembled_persona_prompt,
     build_behavioral_prompt_from_sliders,
     build_persona_prompt,
+    build_rendered_behavioral_prompt,
     derive_persona_mode,
     get_preset,
+    slider_band,
+    substitute_curator_name,
 )
 from curatorx.persona.presets import PERSONA_PRESETS
 
@@ -26,6 +30,15 @@ class PersonaPromptTests(unittest.TestCase):
         self.assertEqual(derive_persona_mode({"persona_prompt_override": "Custom tone"}), "custom")
         self.assertEqual(derive_persona_mode({"persona_prompt_override": ""}), "sliders")
         self.assertEqual(derive_persona_mode({}), "sliders")
+
+    def test_slider_band_thresholds(self) -> None:
+        self.assertEqual(slider_band(0.0), "low")
+        self.assertEqual(slider_band(0.34), "low")
+        self.assertEqual(slider_band(0.35), "mid")
+        self.assertEqual(slider_band(0.5), "mid")
+        self.assertEqual(slider_band(0.65), "mid")
+        self.assertEqual(slider_band(0.66), "high")
+        self.assertEqual(slider_band(1.0), "high")
 
     def test_build_persona_prompt_concatenates_identity_and_behavior(self) -> None:
         persona = {
@@ -38,7 +51,73 @@ class PersonaPromptTests(unittest.TestCase):
         prompt = build_persona_prompt(persona)
         self.assertIn("I am a noir obsessive.", prompt)
         self.assertIn("Atlas", prompt)
-        self.assertIn("Vocabulary density", prompt)
+        self.assertIn("Vocabulary", prompt)
+        self.assertIn("Library curation:", prompt)
+
+    def test_slider_template_uses_name_placeholder(self) -> None:
+        template = build_behavioral_prompt_from_sliders(
+            {"val_bro_prof": 0.5, "val_dipl_snark": 0.5, "val_pass_auto": 0.5}
+        )
+        self.assertIn(CURATOR_NAME_PLACEHOLDER, template)
+        self.assertNotIn("Curator", template)
+
+    def test_low_vocabulary_band_uses_casual_guidance(self) -> None:
+        prompt = build_behavioral_prompt_from_sliders(
+            {"val_bro_prof": 0.1, "val_dipl_snark": 0.5, "val_pass_auto": 0.5}
+        )
+        self.assertIn("casual film-fan", prompt)
+        self.assertIn("bro", prompt.lower())
+
+    def test_high_directness_band_uses_snark_guidance(self) -> None:
+        prompt = build_behavioral_prompt_from_sliders(
+            {"val_bro_prof": 0.5, "val_dipl_snark": 0.9, "val_pass_auto": 0.5}
+        )
+        self.assertIn("lead with conclusions", prompt.lower())
+        self.assertIn("headline first", prompt.lower())
+
+    def test_high_initiative_band_uses_autonomous_guidance(self) -> None:
+        prompt = build_behavioral_prompt_from_sliders(
+            {"val_bro_prof": 0.5, "val_dipl_snark": 0.5, "val_pass_auto": 0.95}
+        )
+        self.assertIn("autonomous", prompt.lower())
+        self.assertIn("concrete next steps", prompt.lower())
+
+    def test_preset_includes_archetype_anchor_and_behavioral_anchor(self) -> None:
+        preset = get_preset("classic-curator")
+        assert preset is not None
+        prompt = build_behavioral_prompt_from_sliders(
+            {
+                "persona_preset_id": preset.id,
+                "val_bro_prof": preset.val_bro_prof,
+                "val_dipl_snark": preset.val_dipl_snark,
+                "val_pass_auto": preset.val_pass_auto,
+            }
+        )
+        self.assertIn("Classic Curator", prompt)
+        self.assertIn(preset.behavioral_anchor, prompt)
+
+    def test_substitute_curator_name_renders_placeholder(self) -> None:
+        rendered = substitute_curator_name(f"You are {CURATOR_NAME_PLACEHOLDER}.", "Marcus")
+        self.assertEqual(rendered, "You are Marcus.")
+
+    def test_name_change_preserves_slider_template(self) -> None:
+        base = {"val_bro_prof": 0.5, "val_dipl_snark": 0.5, "val_pass_auto": 0.5}
+        template = build_behavioral_prompt_from_sliders(base)
+        rendered_a = build_rendered_behavioral_prompt({**base, "curator_name": "Curator"})
+        rendered_b = build_rendered_behavioral_prompt({**base, "curator_name": "Marcus"})
+        self.assertEqual(template, build_behavioral_prompt_from_sliders({**base, "curator_name": "Marcus"}))
+        self.assertIn("Curator", rendered_a)
+        self.assertIn("Marcus", rendered_b)
+        self.assertNotIn("Curator", rendered_b)
+
+    def test_custom_override_with_placeholder_updates_name(self) -> None:
+        persona = {
+            "curator_name": "Marcus",
+            "persona_prompt_override": f"Always greet as {CURATOR_NAME_PLACEHOLDER}.",
+        }
+        rendered = build_rendered_behavioral_prompt(persona)
+        self.assertIn("Marcus", rendered)
+        self.assertNotIn(CURATOR_NAME_PLACEHOLDER, rendered)
 
     def test_override_replaces_slider_behavioral_text(self) -> None:
         persona = {
@@ -52,18 +131,27 @@ class PersonaPromptTests(unittest.TestCase):
         prompt = build_persona_prompt(persona)
         self.assertIn("Core identity stays.", prompt)
         self.assertIn("Always speak in haiku.", prompt)
-        self.assertNotIn("Vocabulary density", prompt)
+        self.assertNotIn("Vocabulary", prompt)
 
-    def test_preset_values_exist(self) -> None:
-        self.assertGreaterEqual(len(PERSONA_PRESETS), 8)
-        scholar = get_preset("film-scholar")
-        assert scholar is not None
-        self.assertGreater(scholar.val_bro_prof, 0.7)
+    def test_archetype_presets_exist(self) -> None:
+        self.assertEqual(len(PERSONA_PRESETS), 5)
+        for preset_id in (
+            "classic-curator",
+            "blunt-archivist",
+            "enthusiastic-scout",
+            "academic-critic",
+            "night-owl-host",
+        ):
+            preset = get_preset(preset_id)
+            assert preset is not None
+            self.assertTrue(preset.identity_blurb)
+            self.assertTrue(preset.behavioral_anchor)
+            self.assertTrue(preset.tagline)
 
     def test_apply_preset_via_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "test.db")
-            preset = get_preset("enthusiastic-friend")
+            preset = get_preset("enthusiastic-scout")
             assert preset is not None
             row = db.upsert_persona(
                 persona_preset_id=preset.id,
@@ -85,8 +173,8 @@ class PersonaPromptTests(unittest.TestCase):
         }
         cleared = {**persona, "persona_prompt_override": None}
         behavioral = build_behavioral_prompt_from_sliders(cleared)
-        self.assertIn("casual", behavioral)
-        self.assertIn("snarky", behavioral.lower())
+        self.assertIn("casual film-fan", behavioral)
+        self.assertIn("lead with conclusions", behavioral.lower())
 
     def test_assembled_prompt_matches_identity_plus_behavior(self) -> None:
         persona = {
@@ -137,15 +225,28 @@ class PersonaApiTests(unittest.TestCase):
         ):
             self.assertIn(key, body)
         self.assertEqual(body["persona_mode"], "sliders")
+        self.assertIn("Library curation:", body["behavioral_prompt"])
 
     def test_persona_presets_list(self) -> None:
         resp = self.client.get("/api/persona/presets")
         self.assertEqual(resp.status_code, 200)
         presets = resp.json()
-        self.assertGreaterEqual(len(presets), 8)
+        self.assertEqual(len(presets), 5)
         ids = {item["id"] for item in presets}
-        self.assertIn("film-scholar", ids)
-        self.assertIn("enthusiastic-friend", ids)
+        self.assertEqual(
+            ids,
+            {
+                "classic-curator",
+                "blunt-archivist",
+                "enthusiastic-scout",
+                "academic-critic",
+                "night-owl-host",
+            },
+        )
+        classic = next(item for item in presets if item["id"] == "classic-curator")
+        self.assertIn("tagline", classic)
+        self.assertIn("behavioral_anchor", classic)
+        self.assertTrue(classic["behavioral_anchor"])
 
     def test_custom_override_blocks_slider_change_until_confirmed(self) -> None:
         put = self.client.put(
@@ -164,20 +265,62 @@ class PersonaApiTests(unittest.TestCase):
         )
         self.assertEqual(cleared.status_code, 200)
         self.assertEqual(cleared.json()["persona_mode"], "sliders")
-        self.assertIn("professorial", cleared.json()["behavioral_prompt"])
+        self.assertIn("professorial", cleared.json()["behavioral_prompt"].lower())
 
     def test_apply_preset_endpoint(self) -> None:
-        resp = self.client.put("/api/persona", json={"apply_preset": "film-scholar"})
+        resp = self.client.put("/api/persona", json={"apply_preset": "academic-critic"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body["persona_preset_id"], "film-scholar")
-        self.assertGreater(body["val_bro_prof"], 0.7)
+        self.assertEqual(body["persona_preset_id"], "academic-critic")
+        self.assertGreater(body["val_bro_prof"], 0.85)
+        self.assertIn("Academic Critic", body["behavioral_prompt"])
+
+    def test_apply_preset_preserves_existing_identity(self) -> None:
+        custom_identity = "My custom identity stays."
+        seeded = self.client.put("/api/persona", json={"persona_identity": custom_identity})
+        self.assertEqual(seeded.status_code, 200)
+
+        applied = self.client.put("/api/persona", json={"apply_preset": "night-owl-host"})
+        self.assertEqual(applied.status_code, 200)
+        self.assertEqual(applied.json()["persona_identity"], custom_identity)
 
     def test_persona_preview_endpoint(self) -> None:
         resp = self.client.get("/api/persona/preview", params={"persona_identity": "Preview identity"})
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
         self.assertIn("Preview identity", body["assembled_prompt"])
+
+    def test_curator_name_only_update_preserves_slider_prompt(self) -> None:
+        baseline = self.client.get("/api/persona").json()
+        self.assertEqual(baseline["persona_mode"], "sliders")
+        slider_template = build_behavioral_prompt_from_sliders(baseline)
+
+        renamed = self.client.put("/api/persona", json={"curator_name": "Marcus"})
+        self.assertEqual(renamed.status_code, 200)
+        body = renamed.json()
+        self.assertEqual(body["curator_name"], "Marcus")
+        self.assertEqual(body["persona_mode"], "sliders")
+        self.assertIn("Marcus", body["behavioral_prompt"])
+        self.assertIn("Marcus", body["assembled_prompt"])
+        self.assertEqual(
+            build_behavioral_prompt_from_sliders({**baseline, "curator_name": "Marcus"}),
+            slider_template,
+        )
+
+    def test_curator_name_only_update_preserves_custom_override(self) -> None:
+        custom = self.client.put(
+            "/api/persona",
+            json={"persona_prompt_override": f"Speak as {CURATOR_NAME_PLACEHOLDER}, always."},
+        )
+        self.assertEqual(custom.status_code, 200)
+        self.assertEqual(custom.json()["persona_mode"], "custom")
+
+        renamed = self.client.put("/api/persona", json={"curator_name": "The Curator"})
+        self.assertEqual(renamed.status_code, 200)
+        body = renamed.json()
+        self.assertEqual(body["persona_mode"], "custom")
+        self.assertIn("The Curator", body["behavioral_prompt"])
+        self.assertNotIn(CURATOR_NAME_PLACEHOLDER, body["behavioral_prompt"])
 
 
 if __name__ == "__main__":

@@ -879,6 +879,14 @@ export default function ConfigPage() {
           setSavingPersona={setSavingPersona}
           actionAlert={actionAlert}
           setActionFeedback={setActionFeedback}
+          showCuratorName
+          onCuratorNameBlur={async (name) => {
+            await putSystemConfig({ curator_name: String(name) });
+            setVerification((prev) => ({
+              ...prev,
+              identity: Boolean(String(name || "").trim()),
+            }));
+          }}
         />
 
         <section className="config-section">

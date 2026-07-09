@@ -111,10 +111,12 @@ class PersonaPresetSummary(BaseModel):
     id: str
     name: str
     description: str
+    tagline: str = ""
     val_bro_prof: float
     val_dipl_snark: float
     val_pass_auto: float
     identity_blurb: str = ""
+    behavioral_anchor: str = ""
 
 
 class PersonaMetrics(BaseModel):

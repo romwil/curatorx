@@ -3,9 +3,30 @@ import { getPersonaPresets, putPersona } from "../api/client";
 import InlineAlert from "./InlineAlert";
 
 const PERSONA_FIELDS = [
-  { key: "val_bro_prof", label: "Vocabulary", low: "Bro", high: "Professorial" },
-  { key: "val_dipl_snark", label: "Interaction", low: "Diplomatic", high: "Snarky" },
-  { key: "val_pass_auto", label: "Automation", low: "Passive", high: "Autonomous" },
+  {
+    key: "val_bro_prof",
+    label: "Vocabulary",
+    low: "Bro",
+    high: "Professorial",
+    help:
+      "Controls word choice and film-literacy depth in the LLM prompt. Low = casual fan talk; high = movement, craft, and auteur vocabulary.",
+  },
+  {
+    key: "val_dipl_snark",
+    label: "Directness",
+    low: "Diplomatic",
+    high: "Snarky",
+    help:
+      "Controls how blunt recommendations and critiques are. Low = context-first, softened critiques; high = lead with verdicts and call out weak picks plainly.",
+  },
+  {
+    key: "val_pass_auto",
+    label: "Initiative",
+    low: "Passive",
+    high: "Autonomous",
+    help:
+      "Controls how proactively the curator proposes next steps. Low = suggest and wait; high = concrete queue/purge plans and pattern callouts.",
+  },
 ];
 
 function isCustomMode(persona) {
@@ -140,7 +161,8 @@ export default function PersonaSection({
     <section className="config-section persona-section" data-testid="persona-section">
       <h2>Curator persona</h2>
       <p className="wizard-note">
-        Draft your curator&apos;s core identity, pick a preset, tune behavior, and preview the prompt sent to the LLM.
+        Draft your curator&apos;s core identity, pick an archetype preset, tune behavior sliders, and preview the
+        prompt sent to the LLM. Identity text is never overwritten by sliders — only presets fill it when empty.
       </p>
 
       {showCuratorName ? (
@@ -173,7 +195,8 @@ export default function PersonaSection({
       ) : null}
 
       <div className="persona-presets">
-        <h3>Persona presets</h3>
+        <h3>Persona archetypes</h3>
+        <p className="wizard-note">Each preset sets slider positions and adds a rich behavioral anchor to the LLM prompt.</p>
         <div className="preset-grid" data-testid="persona-preset-grid">
           {presets.map((preset) => (
             <button
@@ -185,7 +208,11 @@ export default function PersonaSection({
               onClick={() => handlePresetSelect(preset.id)}
             >
               <strong>{preset.name}</strong>
+              {preset.tagline ? <em className="preset-tagline">{preset.tagline}</em> : null}
               <span>{preset.description}</span>
+              {preset.behavioral_anchor ? (
+                <span className="preset-anchor-preview">{preset.behavioral_anchor}</span>
+              ) : null}
             </button>
           ))}
         </div>
@@ -200,13 +227,28 @@ export default function PersonaSection({
             </span>
           ) : null}
         </div>
+        <p className="wizard-note">
+          Each slider maps to multi-sentence behavioral guidance in the generated prompt (low / mid / high bands).
+        </p>
         <div className="slider-grid">
-          {PERSONA_FIELDS.map(({ key, label, low, high }) => (
+          {PERSONA_FIELDS.map(({ key, label, low, high, help }) => (
             <label key={key} className="slider-field">
               <div className="slider-labels">
-                <span>{label}</span>
+                <span className="slider-label-with-help">
+                  {label}
+                  <button
+                    type="button"
+                    className="slider-help"
+                    title={help}
+                    aria-label={`${label} slider effect`}
+                    data-testid={`persona-slider-help-${key}`}
+                  >
+                    ?
+                  </button>
+                </span>
                 <span className="slider-value">{persona[key].toFixed(2)}</span>
               </div>
+              <p className="slider-help-text">{help}</p>
               <input
                 type="range"
                 min="0"
@@ -250,7 +292,7 @@ export default function PersonaSection({
           <>
             <textarea
               data-testid="persona-behavioral-edit"
-              rows={5}
+              rows={8}
               value={draftBehavioral}
               disabled={savingPersona}
               onChange={(event) => setDraftBehavioral(event.target.value)}
@@ -285,7 +327,7 @@ export default function PersonaSection({
         <div className="persona-confirm-banner" data-testid="persona-confirm-banner" role="alertdialog">
           <p>
             {confirmAction.type === "preset"
-              ? "Applying a preset will replace your custom behavioral prompt and update sliders. Continue?"
+              ? "Applying a preset will replace your custom behavioral prompt and update sliders. Your identity text is kept unless empty. Continue?"
               : "Adjusting sliders will replace your custom behavioral prompt with the slider-generated default. Continue?"}
           </p>
           <div className="persona-confirm-actions">

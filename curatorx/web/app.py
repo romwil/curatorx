@@ -78,7 +78,7 @@ from curatorx.models.schemas import (
 )
 from curatorx.persona import (
     build_assembled_persona_prompt,
-    build_behavioral_prompt_from_sliders,
+    build_rendered_behavioral_prompt,
     derive_persona_mode,
     get_preset,
     list_presets,
@@ -133,8 +133,7 @@ def _row_to_lens(row: Any) -> Lens:
 def _persona_dict(row: Any) -> dict[str, Any]:
     data = persona_row_to_dict(row)
     mode = derive_persona_mode(data)
-    override = str(data.get("persona_prompt_override") or "").strip()
-    behavioral = override if override else build_behavioral_prompt_from_sliders(data)
+    behavioral = build_rendered_behavioral_prompt(data)
     assembled = build_assembled_persona_prompt(data)
     return {
         **data,
@@ -742,10 +741,12 @@ def get_persona_presets() -> List[PersonaPresetSummary]:
             id=preset.id,
             name=preset.name,
             description=preset.description,
+            tagline=preset.tagline,
             val_bro_prof=preset.val_bro_prof,
             val_dipl_snark=preset.val_dipl_snark,
             val_pass_auto=preset.val_pass_auto,
             identity_blurb=preset.identity_blurb,
+            behavioral_anchor=preset.behavioral_anchor,
         )
         for preset in list_presets()
     ]
@@ -781,8 +782,7 @@ def get_persona_preview(
         ),
     }
     mode = derive_persona_mode(draft)
-    override = str(draft.get("persona_prompt_override") or "").strip()
-    behavioral = override if override else build_behavioral_prompt_from_sliders(draft)
+    behavioral = build_rendered_behavioral_prompt(draft)
     assembled = build_assembled_persona_prompt(draft)
     return PersonaPreviewResponse(
         persona_mode=mode,
@@ -805,17 +805,19 @@ def get_persona() -> PersonaMetrics:
 @app.put("/api/persona", response_model=PersonaMetrics)
 def put_persona(payload: PersonaMetricsUpdate) -> PersonaMetrics:
     db = _db()
-    preset_id = payload.persona_preset_id
-    identity = payload.persona_identity
-    bro = payload.val_bro_prof
-    snark = payload.val_dipl_snark
-    auto = payload.val_pass_auto
+    provided = payload.model_fields_set
     clear_override = payload.clear_persona_override
     override = payload.persona_prompt_override
 
     if override is not None and not str(override).strip():
         clear_override = True
         override = None
+
+    identity = payload.persona_identity if "persona_identity" in provided else None
+    bro = payload.val_bro_prof if "val_bro_prof" in provided else None
+    snark = payload.val_dipl_snark if "val_dipl_snark" in provided else None
+    auto = payload.val_pass_auto if "val_pass_auto" in provided else None
+    preset_id = payload.persona_preset_id if "persona_preset_id" in provided else None
 
     if payload.apply_preset:
         preset = get_preset(payload.apply_preset)
@@ -839,16 +841,25 @@ def put_persona(payload: PersonaMetricsUpdate) -> PersonaMetrics:
                 detail="Custom behavioral prompt is active. Confirm slider change with clear_persona_override=true.",
             )
 
-    row = db.upsert_persona(
-        curator_name=payload.curator_name,
-        persona_identity=identity,
-        val_bro_prof=bro,
-        val_dipl_snark=snark,
-        val_pass_auto=auto,
-        persona_preset_id=preset_id,
-        persona_prompt_override=override,
-        clear_persona_override=clear_override,
-    )
+    upsert_kwargs: dict[str, Any] = {}
+    if payload.curator_name is not None:
+        upsert_kwargs["curator_name"] = payload.curator_name
+    if identity is not None:
+        upsert_kwargs["persona_identity"] = identity
+    if bro is not None:
+        upsert_kwargs["val_bro_prof"] = bro
+    if snark is not None:
+        upsert_kwargs["val_dipl_snark"] = snark
+    if auto is not None:
+        upsert_kwargs["val_pass_auto"] = auto
+    if preset_id is not None or "persona_preset_id" in provided or payload.apply_preset:
+        upsert_kwargs["persona_preset_id"] = preset_id
+    if clear_override:
+        upsert_kwargs["clear_persona_override"] = True
+    elif "persona_prompt_override" in provided:
+        upsert_kwargs["persona_prompt_override"] = override
+
+    row = db.upsert_persona(**upsert_kwargs)
     return _row_to_persona(row)
 
 
