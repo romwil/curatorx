@@ -679,6 +679,60 @@ class ApiContractTests(unittest.TestCase):
         self.assertTrue(body["already_exists"])
         self.assertIn("already in Radarr", body["message"])
 
+    def test_confirm_remove_arr_returns_friendly_not_found_error(self) -> None:
+        self.client.put(
+            "/api/settings",
+            json={
+                "radarr_url": "http://radarr",
+                "radarr_api_key": "secret",
+            },
+        )
+        import curatorx.web.jobs as jobs
+        from curatorx.connectors.radarr import RadarrMovie
+
+        token = "purge-token"
+        db = jobs.get_job_manager().db
+        db.save_pending_action(
+            token,
+            "remove_arr",
+            {
+                "action": "remove_arr",
+                "media_type": "movie",
+                "arr_id": 76478,
+                "tmdb_id": 5156,
+                "title": "Rust",
+                "delete_files": True,
+            },
+        )
+        movie = RadarrMovie(
+            id=99,
+            title="Rust",
+            year=2024,
+            tmdb_id=5156,
+            monitored=True,
+            has_file=True,
+        )
+        with patch(
+            "curatorx.agent.tools.RadarrClient.movie_by_tmdb_id",
+            return_value=movie,
+        ), patch(
+            "curatorx.agent.tools.RadarrClient.delete_movie",
+            side_effect=RuntimeError(
+                'HTTP 404 from http://radarr/api/v3/movie/99: '
+                '{"message":"Movie with ID 99 does not exist"}'
+            ),
+        ):
+            confirm = self.client.post(
+                "/api/actions/confirm",
+                json={"token": token, "confirmed": True},
+            )
+        self.assertEqual(confirm.status_code, 400)
+        detail = confirm.json()["detail"]
+        self.assertIn("Rust", detail)
+        self.assertIn("not in Radarr", detail)
+        self.assertNotIn("NzbDrone", detail)
+        self.assertNotIn("HTTP 404", detail)
+
     def test_propose_add_radarr_rejects_unregistered_root_folder(self) -> None:
         self.client.put(
             "/api/settings",

@@ -17,6 +17,8 @@ from curatorx.agent.tools import (
     build_tool_definitions,
 )
 from curatorx.config_store import FeatureFlags, Settings
+from curatorx.connectors.arr_errors import ArrTitleNotFoundError
+from curatorx.connectors.radarr import RadarrMovie
 from curatorx.library.db import DEFAULT_LENS_ID, Database
 from curatorx.models.schemas import TitleCard
 
@@ -703,6 +705,104 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("error", payload)
             self.assertIn("root folder", payload["error"])
             self.assertEqual(registry.pending_tokens, [])
+
+    async def test_remove_from_arr_resolves_tmdb_id_and_registers_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(
+                db,
+                Settings(radarr_url="http://radarr", radarr_api_key="secret"),
+                DEFAULT_LENS_ID,
+            )
+            movie = RadarrMovie(
+                id=42,
+                title="The Producers",
+                year=1968,
+                tmdb_id=5156,
+                monitored=True,
+                has_file=True,
+            )
+            with patch(
+                "curatorx.agent.tools.RadarrClient.movie_by_tmdb_id",
+                return_value=movie,
+            ):
+                result = await registry.execute(
+                    "remove_from_arr",
+                    {
+                        "media_type": "movie",
+                        "tmdb_id": 5156,
+                        "title": "The Producers",
+                        "delete_files": True,
+                    },
+                )
+            payload = json.loads(result)
+            self.assertIn("confirmation_token", payload)
+            self.assertEqual(payload["arr_id"], 42)
+            self.assertEqual(
+                registry.pending_tokens,
+                [{"token": payload["confirmation_token"], "action": "remove_arr"}],
+            )
+
+    async def test_remove_from_arr_returns_error_when_not_in_radarr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(
+                db,
+                Settings(radarr_url="http://radarr", radarr_api_key="secret"),
+                DEFAULT_LENS_ID,
+            )
+            with patch(
+                "curatorx.agent.tools.RadarrClient.movie_by_tmdb_id",
+                return_value=None,
+            ):
+                result = await registry.execute(
+                    "remove_from_arr",
+                    {"media_type": "movie", "tmdb_id": 999, "title": "Missing Movie"},
+                )
+            payload = json.loads(result)
+            self.assertIn("error", payload)
+            self.assertIn("not in Radarr", payload["error"])
+            self.assertEqual(registry.pending_tokens, [])
+
+    async def test_execute_confirmed_remove_arr_uses_friendly_not_found_error(self) -> None:
+        from curatorx.agent.tools import execute_confirmed_action
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            settings = Settings(radarr_url="http://radarr", radarr_api_key="secret")
+            token = "remove-token"
+            db.save_pending_action(
+                token,
+                "remove_arr",
+                {
+                    "action": "remove_arr",
+                    "media_type": "movie",
+                    "arr_id": 76478,
+                    "tmdb_id": 5156,
+                    "title": "Rust",
+                    "delete_files": True,
+                },
+            )
+            movie = RadarrMovie(
+                id=99,
+                title="Rust",
+                year=2024,
+                tmdb_id=5156,
+                monitored=True,
+                has_file=True,
+            )
+            with patch(
+                "curatorx.agent.tools.RadarrClient.movie_by_tmdb_id",
+                return_value=movie,
+            ), patch(
+                "curatorx.agent.tools.RadarrClient.delete_movie",
+                side_effect=RuntimeError(
+                    'HTTP 404 from http://radarr/api/v3/movie/99: '
+                    '{"message":"Movie with ID 99 does not exist"}'
+                ),
+            ):
+                with self.assertRaises(ArrTitleNotFoundError):
+                    await execute_confirmed_action(db, settings, token)
 
 
 if __name__ == "__main__":

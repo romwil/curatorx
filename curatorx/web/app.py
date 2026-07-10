@@ -1465,7 +1465,9 @@ async def confirm_action(payload: ActionConfirmRequest) -> Dict[str, Any]:
         return {"ok": True, **result}
     except Exception as error:  # noqa: BLE001
         logger.exception("Action confirm failed token=%s", payload.token[:8])
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        from curatorx.connectors.arr_errors import format_arr_http_error
+
+        raise HTTPException(status_code=400, detail=format_arr_http_error(error)) from error
 
 
 @app.get("/api/persona/typing-phrases")

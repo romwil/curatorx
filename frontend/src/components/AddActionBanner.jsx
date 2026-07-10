@@ -1,4 +1,4 @@
-import { serviceLabelForTarget } from "../lib/addActions";
+import { serviceLabelForTarget, tokenConfirmButtonLabel, tokenConfirmPrompt } from "../lib/addActions";
 
 export default function AddActionBanner({
   pendingAdd,
@@ -56,12 +56,21 @@ export default function AddActionBanner({
     return (
       <div className="add-action-banner" data-testid="token-confirm-banner" role="alertdialog" aria-modal="true">
         <p data-testid="token-confirm-prompt">
-          Confirm all <strong>{count}</strong> proposed adds?
+          {(() => {
+            const text = tokenConfirmPrompt(count, pendingTokens);
+            const match = text.match(/^Confirm all (\d+) (.+)$/);
+            if (!match) return text;
+            return (
+              <>
+                Confirm all <strong>{match[1]}</strong> {match[2]}
+              </>
+            );
+          })()}
         </p>
         {progressLabel ? <p className="bulk-add-progress">{progressLabel}</p> : null}
         <div className="add-action-buttons">
           <button type="button" data-testid="token-confirm-all" onClick={onConfirm} disabled={inProgress}>
-            {inProgress ? "Confirming…" : `Confirm all ${count}`}
+            {inProgress ? "Confirming…" : tokenConfirmButtonLabel(count, pendingTokens)}
           </button>
           <button type="button" className="ghost" data-testid="token-confirm-cancel" onClick={onCancel} disabled={inProgress}>
             Cancel

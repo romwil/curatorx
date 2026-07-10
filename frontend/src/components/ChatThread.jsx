@@ -23,6 +23,7 @@ function renderBulkConfirmActions(message, handlers, showTokenConfirm) {
         key="tokens"
         count={handlers.pendingTokenCount}
         variant="tokens"
+        tokenActions={handlers.pendingTokenActions}
         onClick={() => handlers.onConfirmAllTokens?.()}
         disabled={handlers.actionsDisabled}
       />
@@ -162,6 +163,7 @@ export default function ChatThread({
   onConfirmAllItems,
   onConfirmAllTokens,
   pendingTokenCount = 0,
+  pendingTokenActions = [],
   actionsDisabled = false,
   onTogglePin,
   watchlistLookup,
@@ -194,6 +196,7 @@ export default function ChatThread({
                     onConfirmAllItems,
                     onConfirmAllTokens,
                     pendingTokenCount: message.id === lastAssistantId ? pendingTokenCount : 0,
+                    pendingTokenActions: message.id === lastAssistantId ? pendingTokenActions : [],
                     actionsDisabled,
                     onTogglePin,
                     watchlistLookup,

@@ -122,6 +122,7 @@ Presets hot-reload: change persona in Config and return to chat — no server re
 - **Confirm all** — bulk Radarr/Sonarr adds via in-chat buttons (not a center modal)
 - **Turnstyle overlay** — horizontal scroll overlay for expanded result sets (`Expand N titles…`); title cards support the same drag-to-dock behavior as inline chat cards
 - **Add to Radarr/Sonarr** — confirm in the status dock; server confirmation token required. Drag a movie or show card onto the dock to start the same confirm flow without clicking **Add to Radarr/Sonarr**
+- **Remove from Radarr/Sonarr** — purge/removal proposals use the same status-dock confirm flow with removal-specific copy (not “proposed adds”). Confirm executes the matching pending action type.
 - **Not interested** — `POST /api/preferences` with `dismiss` signal
 - **Ambient context** — inferred from conversation; shown as a tag under the thread title
 - **Message reactions** — thumbs up / thumbs down under each curator reply; your choice helps train future recommendations (stored per conversation)

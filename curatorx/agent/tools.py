@@ -18,7 +18,7 @@ from curatorx.config_store import (
     sonarr_add_configuration_error,
     validate_arr_root_folder,
 )
-from curatorx.connectors.arr_errors import ArrTitleExistsError
+from curatorx.connectors.arr_errors import ArrTitleExistsError, ArrTitleNotFoundError
 from curatorx.connectors.radarr import RadarrClient
 from curatorx.connectors.seerr import SeerrClient
 from curatorx.connectors.sonarr import SonarrClient
@@ -216,16 +216,21 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
         "type": "function",
         "function": {
             "name": "remove_from_arr",
-            "description": "Propose removing a title from Radarr/Sonarr. Returns a confirmation token.",
+            "description": (
+                "Propose removing a title from Radarr/Sonarr. Returns a confirmation token. "
+                "Prefer tmdb_id for movies and tvdb_id for shows so the correct Radarr/Sonarr id is resolved."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "media_type": {"type": "string", "enum": ["movie", "show"]},
-                    "arr_id": {"type": "integer"},
+                    "arr_id": {"type": "integer", "description": "Radarr/Sonarr internal id (optional if tmdb_id/tvdb_id provided)"},
+                    "tmdb_id": {"type": "integer", "description": "TMDB id for movies"},
+                    "tvdb_id": {"type": "integer", "description": "TVDB id for shows"},
                     "title": {"type": "string"},
                     "delete_files": {"type": "boolean"},
                 },
-                "required": ["media_type", "arr_id"],
+                "required": ["media_type"],
             },
         },
     },
@@ -839,6 +844,10 @@ def _card_to_tool_item(card: TitleCard) -> Dict[str, Any]:
         item["tvdb_id"] = card.tvdb_id
     if card.rating_key:
         item["rating_key"] = card.rating_key
+    if card.in_radarr:
+        item["in_radarr"] = True
+    if card.in_sonarr:
+        item["in_sonarr"] = True
     return item
 
 
@@ -941,9 +950,12 @@ class ToolRegistry:
         self.lens_id = lens_id
         self.user_id = user_id
         self._cards: List[TitleCard] = []
-        self._pending_tokens: List[str] = []
+        self._pending_token_entries: List[Dict[str, str]] = []
         self._recommendation_context = False
         self._review_conflicts: List[Dict[str, Any]] = []
+
+    def _register_pending_token(self, token: str, action: str) -> None:
+        self._pending_token_entries.append({"token": token, "action": action})
 
     @property
     def cards(self) -> List[TitleCard]:
@@ -954,8 +966,8 @@ class ToolRegistry:
         return self._recommendation_context
 
     @property
-    def pending_tokens(self) -> List[str]:
-        return list(self._pending_tokens)
+    def pending_tokens(self) -> List[Dict[str, str]]:
+        return list(self._pending_token_entries)
 
     @property
     def review_conflicts(self) -> List[Dict[str, Any]]:
@@ -1190,7 +1202,7 @@ class ToolRegistry:
             "title": str(args.get("title") or ""),
         }
         self.db.save_pending_action(token, "add_radarr", payload)
-        self._pending_tokens.append(token)
+        self._register_pending_token(token, "add_radarr")
         return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to add to Radarr"})
 
     async def _tool_add_to_sonarr(self, args: Mapping[str, Any]) -> str:
@@ -1221,7 +1233,7 @@ class ToolRegistry:
             "title": str(args.get("title") or ""),
         }
         self.db.save_pending_action(token, "add_sonarr", payload)
-        self._pending_tokens.append(token)
+        self._register_pending_token(token, "add_sonarr")
         return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to add to Sonarr"})
 
     async def _tool_request_via_seerr(self, args: Mapping[str, Any]) -> str:
@@ -1258,7 +1270,7 @@ class ToolRegistry:
             )
         token = uuid.uuid4().hex
         self.db.save_pending_action(token, "request_seerr", pending_payload)
-        self._pending_tokens.append(token)
+        self._register_pending_token(token, "request_seerr")
         return json.dumps(
             {
                 "confirmation_token": token,
@@ -1322,17 +1334,44 @@ class ToolRegistry:
         return json.dumps({"total_matched": len(results), "returned": len(items), "items": items})
 
     async def _tool_remove_from_arr(self, args: Mapping[str, Any]) -> str:
+        media_type = str(args.get("media_type") or "movie")
+        title = str(args.get("title") or "")
+        delete_files = bool(args.get("delete_files"))
+        tmdb_id = args.get("tmdb_id")
+        tvdb_id = args.get("tvdb_id")
+        arr_id = args.get("arr_id")
+        try:
+            resolved = resolve_arr_removal_target(
+                self.settings,
+                media_type=media_type,
+                arr_id=int(arr_id) if arr_id is not None else None,
+                tmdb_id=int(tmdb_id) if tmdb_id is not None else None,
+                tvdb_id=int(tvdb_id) if tvdb_id is not None else None,
+                title=title,
+            )
+        except ArrTitleNotFoundError as error:
+            return json.dumps({"error": str(error)})
         token = uuid.uuid4().hex
         payload = {
             "action": "remove_arr",
-            "media_type": str(args.get("media_type") or "movie"),
-            "arr_id": int(args["arr_id"]),
-            "title": str(args.get("title") or ""),
-            "delete_files": bool(args.get("delete_files")),
+            "media_type": media_type,
+            "arr_id": resolved["arr_id"],
+            "title": resolved.get("title") or title,
+            "delete_files": delete_files,
         }
+        if resolved.get("tmdb_id") is not None:
+            payload["tmdb_id"] = resolved["tmdb_id"]
+        if resolved.get("tvdb_id") is not None:
+            payload["tvdb_id"] = resolved["tvdb_id"]
         self.db.save_pending_action(token, "remove_arr", payload)
-        self._pending_tokens.append(token)
-        return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to remove"})
+        self._register_pending_token(token, "remove_arr")
+        return json.dumps(
+            {
+                "confirmation_token": token,
+                "message": "Awaiting user confirmation to remove",
+                "arr_id": resolved["arr_id"],
+            }
+        )
 
     async def _tool_search_tmdb(self, args: Mapping[str, Any]) -> str:
         if not self.settings.tmdb_api_key:
@@ -1683,7 +1722,7 @@ class ToolRegistry:
             "rating_keys": rating_keys,
         }
         self.db.save_pending_action(token, "create_plex_collection", payload)
-        self._pending_tokens.append(token)
+        self._register_pending_token(token, "create_plex_collection")
         return json.dumps(
             {
                 "confirmation_token": token,
@@ -1723,7 +1762,7 @@ class ToolRegistry:
             "collection_title": collection_title,
         }
         self.db.save_pending_action(token, "add_to_plex_collection", payload)
-        self._pending_tokens.append(token)
+        self._register_pending_token(token, "add_to_plex_collection")
         label = collection_title or collection_rating_key
         return json.dumps(
             {
@@ -1944,6 +1983,61 @@ def check_sonarr_already_exists(
     }
 
 
+def resolve_arr_removal_target(
+    settings: Settings,
+    *,
+    media_type: str,
+    arr_id: Optional[int] = None,
+    tmdb_id: Optional[int] = None,
+    tvdb_id: Optional[int] = None,
+    title: str = "",
+) -> Dict[str, Any]:
+    if media_type == "movie":
+        if not settings.radarr_url or not settings.radarr_api_key:
+            raise RuntimeError("Radarr is not configured")
+        client = RadarrClient(settings.radarr_url, settings.radarr_api_key)
+        found = None
+        if tmdb_id is not None:
+            found = client.movie_by_tmdb_id(tmdb_id)
+        elif arr_id is not None:
+            movies = client.movies()
+            found = next((movie for movie in movies if movie.id == arr_id), None)
+        if found is None:
+            raise ArrTitleNotFoundError(
+                "Radarr",
+                title=title,
+                external_id=tmdb_id or 0,
+                arr_id=arr_id,
+            )
+        return {
+            "arr_id": found.id,
+            "title": found.title or title,
+            "tmdb_id": found.tmdb_id or tmdb_id,
+        }
+
+    if not settings.sonarr_url or not settings.sonarr_api_key:
+        raise RuntimeError("Sonarr is not configured")
+    client = SonarrClient(settings.sonarr_url, settings.sonarr_api_key)
+    found = None
+    if tvdb_id is not None:
+        found = client.series_by_tvdb_id(tvdb_id)
+    elif arr_id is not None:
+        series_items = client.series_list()
+        found = next((series for series in series_items if series.id == arr_id), None)
+    if found is None:
+        raise ArrTitleNotFoundError(
+            "Sonarr",
+            title=title,
+            external_id=tvdb_id or 0,
+            arr_id=arr_id,
+        )
+    return {
+        "arr_id": found.id,
+        "title": found.title or title,
+        "tvdb_id": found.tvdb_id or tvdb_id,
+    }
+
+
 async def execute_confirmed_action(db: Database, settings: Settings, token: str) -> dict:
     payload = db.pop_pending_action(token)
     if not payload:
@@ -2007,15 +2101,46 @@ async def execute_confirmed_action(db: Database, settings: Settings, token: str)
         }
     if action == "remove_arr":
         delete_files = bool(payload.get("delete_files"))
-        if payload.get("media_type") == "movie":
-            RadarrClient(settings.radarr_url, settings.radarr_api_key).delete_movie(
-                int(payload["arr_id"]), delete_files=delete_files
-            )
-        else:
-            SonarrClient(settings.sonarr_url, settings.sonarr_api_key).delete_series(
-                int(payload["arr_id"]), delete_files=delete_files
-            )
-        return {"action": action, "removed": True}
+        media_type = str(payload.get("media_type") or "movie")
+        title = str(payload.get("title") or "")
+        resolved = resolve_arr_removal_target(
+            settings,
+            media_type=media_type,
+            arr_id=int(payload["arr_id"]) if payload.get("arr_id") is not None else None,
+            tmdb_id=int(payload["tmdb_id"]) if payload.get("tmdb_id") is not None else None,
+            tvdb_id=int(payload["tvdb_id"]) if payload.get("tvdb_id") is not None else None,
+            title=title,
+        )
+        arr_id = int(resolved["arr_id"])
+        removed_title = str(resolved.get("title") or title)
+        try:
+            if media_type == "movie":
+                RadarrClient(settings.radarr_url, settings.radarr_api_key).delete_movie(
+                    arr_id, delete_files=delete_files
+                )
+                if resolved.get("tmdb_id"):
+                    db.set_arr_presence(tmdb_id=int(resolved["tmdb_id"]), in_radarr=False)
+            else:
+                SonarrClient(settings.sonarr_url, settings.sonarr_api_key).delete_series(
+                    arr_id, delete_files=delete_files
+                )
+                if resolved.get("tvdb_id"):
+                    db.set_arr_presence(tvdb_id=int(resolved["tvdb_id"]), in_sonarr=False)
+        except RuntimeError as error:
+            from curatorx.connectors.arr_errors import format_arr_http_error, is_arr_not_found_error
+
+            if is_arr_not_found_error(error):
+                raise ArrTitleNotFoundError(
+                    "Radarr" if media_type == "movie" else "Sonarr",
+                    title=removed_title,
+                    arr_id=arr_id,
+                ) from error
+            raise RuntimeError(format_arr_http_error(error)) from error
+        return {
+            "action": action,
+            "removed": True,
+            "result": {"title": removed_title, "arr_id": arr_id},
+        }
     if action == "create_plex_collection":
         from curatorx.connectors.plex import PlexClient
         from curatorx.connectors.plex_collections import create_collection

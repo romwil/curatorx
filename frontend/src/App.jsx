@@ -27,7 +27,16 @@ import {
   setActiveSession,
   submitMessageFeedback,
 } from "./api/client";
-import { alreadyInArrMessage, buildProposeActionBody, isAlreadyInArr, requestPathFromFeatures, serviceLabelForTarget } from "./lib/addActions.js";
+import {
+  alreadyInArrMessage,
+  buildProposeActionBody,
+  isAlreadyInArr,
+  normalizePendingTokens,
+  requestPathFromFeatures,
+  serviceLabelForTarget,
+  tokenConfirmFailureMessage,
+  tokenConfirmSuccessMessage,
+} from "./lib/addActions.js";
 import { blendAmbientAccent } from "./lib/ambientAccent.js";
 import { executeSlashCommand, parseSlashCommand } from "./lib/slashCommands.js";
 import {
@@ -502,7 +511,7 @@ export default function App() {
         helpfulCountRef.current = 0;
       }
       setMessages((prev) => [...prev, assistantMessage]);
-      setPendingTokens(Array.isArray(result.pending_tokens) ? result.pending_tokens : []);
+      setPendingTokens(normalizePendingTokens(result.pending_tokens));
       if (Array.isArray(result.pending_tokens) && result.pending_tokens.length >= 2) {
         setPendingBulk(null);
         setPendingAdd(null);
@@ -627,10 +636,10 @@ export default function App() {
     setAddProgress({ current: 0, total: tokens.length });
 
     for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
+      const entry = tokens[index];
       setAddProgress({ current: index + 1, total: tokens.length });
       try {
-        const confirm = await confirmAction(token);
+        const confirm = await confirmAction(entry.token);
         if (isAlreadyInArr(confirm)) {
           successCount += 1;
           continue;
@@ -648,7 +657,7 @@ export default function App() {
     if (successCount === tokens.length) {
       setAddFeedback({
         type: "success",
-        message: `Confirmed ${successCount} add${successCount === 1 ? "" : "s"}.`,
+        message: tokenConfirmSuccessMessage(successCount, tokens),
       });
       return;
     }
@@ -663,7 +672,7 @@ export default function App() {
 
     setAddFeedback({
       type: "error",
-      message: failures[0] || "Could not confirm proposed adds.",
+      message: failures[0] || tokenConfirmFailureMessage(tokens),
     });
   }
 
@@ -940,6 +949,7 @@ export default function App() {
               onConfirmAllItems={handleConfirmAllItems}
               onConfirmAllTokens={handleConfirmAllTokens}
               pendingTokenCount={pendingTokens.length}
+              pendingTokenActions={pendingTokens}
               actionsDisabled={addInProgress}
               onTogglePin={handleToggleWatchlistPin}
               watchlistLookup={watchlistLookup}

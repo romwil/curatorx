@@ -1,10 +1,12 @@
-export default function ConfirmAllButton({ count, target, onClick, disabled = false, variant }) {
+import { tokenConfirmButtonLabel } from "../lib/addActions";
+
+export default function ConfirmAllButton({ count, target, onClick, disabled = false, variant, tokenActions = [] }) {
   if (count < 2) return null;
 
   const resolvedVariant = variant || (target ? target : "tokens");
   const label =
     resolvedVariant === "tokens"
-      ? `Confirm all ${count} adds`
+      ? tokenConfirmButtonLabel(count, tokenActions)
       : resolvedVariant === "seerr"
         ? `Confirm all ${count} in Seerr`
         : resolvedVariant === "sonarr"
