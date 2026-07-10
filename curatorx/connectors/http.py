@@ -53,25 +53,59 @@ def request_json(
         raise RuntimeError(f"Timeout requesting {safe_url}") from error
 
 
-def request_xml(url: str, *, headers: Optional[Mapping[str, str]] = None, timeout: int = 30) -> ET.Element:
-    request = urllib.request.Request(url, headers=dict(headers or {}))
+def request_empty(
+    url: str,
+    *,
+    method: str = "PUT",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: int = 30,
+) -> None:
+    request = urllib.request.Request(url, method=method, headers=dict(headers or {}))
+    safe_url = sanitize_url(url)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        detail = sanitize_log_message(error.read().decode("utf-8", errors="replace"))
+        logger.warning("HTTP %s %s from %s: %s", method, error.code, safe_url, detail[:500])
+        raise RuntimeError(f"HTTP {error.code} from {safe_url}: {detail}") from error
+    except urllib.error.URLError as error:
+        reason = error.reason
+        if isinstance(reason, socket.timeout):
+            logger.warning("Timeout %s %s (timeout=%ss)", method, safe_url, timeout)
+        else:
+            logger.warning("Request failed %s %s: %s", method, safe_url, reason)
+        raise RuntimeError(f"Request failed for {safe_url}: {reason}") from error
+    except TimeoutError as error:
+        logger.warning("Timeout %s %s (timeout=%ss)", method, safe_url, timeout)
+        raise RuntimeError(f"Timeout requesting {safe_url}") from error
+
+
+def request_xml(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: int = 30,
+) -> ET.Element:
+    request = urllib.request.Request(url, method=method, headers=dict(headers or {}))
     safe_url = sanitize_url(url)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return ET.fromstring(response.read())
     except urllib.error.HTTPError as error:
         detail = sanitize_log_message(error.read().decode("utf-8", errors="replace"))
-        logger.warning("HTTP GET %s from %s: %s", error.code, safe_url, detail[:500])
+        logger.warning("HTTP %s %s from %s: %s", method, error.code, safe_url, detail[:500])
         raise RuntimeError(f"HTTP {error.code} from {safe_url}: {detail}") from error
     except urllib.error.URLError as error:
         reason = error.reason
         if isinstance(reason, socket.timeout):
-            logger.warning("Timeout GET %s (timeout=%ss)", safe_url, timeout)
+            logger.warning("Timeout %s %s (timeout=%ss)", method, safe_url, timeout)
         else:
-            logger.warning("Request failed GET %s: %s", safe_url, reason)
+            logger.warning("Request failed %s %s: %s", method, safe_url, reason)
         raise RuntimeError(f"Request failed for {safe_url}: {reason}") from error
     except TimeoutError as error:
-        logger.warning("Timeout GET %s (timeout=%ss)", safe_url, timeout)
+        logger.warning("Timeout %s %s (timeout=%ss)", method, safe_url, timeout)
         raise RuntimeError(f"Timeout requesting {safe_url}") from error
 
 

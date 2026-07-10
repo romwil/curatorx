@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   AUTO_CERTIFY_SERVICES,
@@ -8,15 +8,20 @@ import {
   LLM_PROVIDER_OPTIONS,
   WIZARD_STEPS,
   api,
+  getAuthMe,
+  getFeatures,
   getPersona,
   getSettings,
   getWizardStatus,
   getPlexSections,
+  listJobs,
+  listUsers,
   putPersona,
   putSystemConfig,
   resolveModelForProvider,
   saveSettings,
   testService,
+  updateUserRole,
 } from "../api/client";
 import PersonaSection from "../components/PersonaSection";
 
@@ -29,7 +34,24 @@ const SECRET_FIELDS = [
   "fanart_api_key",
   "tautulli_api_key",
   "llm_api_key",
+  "seerr_api_key",
 ];
+
+function seerrSecretPlaceholder(settings, fallback = "") {
+  if (settings?.seerr?.api_key_set) {
+    return "Configured (leave blank to keep)";
+  }
+  return fallback;
+}
+
+function settingsPayloadForTest(service, settings) {
+  if (service !== "seerr") return settings;
+  return {
+    ...settings,
+    seerr_url: settings.seerr?.url || "",
+    seerr_api_key: settings.seerr?.api_key || "",
+  };
+}
 
 function secretPlaceholder(settings, field, fallback = "") {
   if (settings?.[`${field}_source`] === "env") {
@@ -131,6 +153,8 @@ function serviceCredentialsPresent(service, settings) {
       return Boolean(settings.fanart_api_key_set);
     case "tautulli":
       return Boolean(settings.tautulli_url && settings.tautulli_api_key_set);
+    case "seerr":
+      return Boolean(settings.seerr?.url && settings.seerr?.api_key_set);
     default:
       return false;
   }
@@ -237,6 +261,16 @@ export default function ConfigPage() {
   const [plexCollapsed, setPlexCollapsed] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [visibleSecrets, setVisibleSecrets] = useState({});
+  const [libraryStats, setLibraryStats] = useState(null);
+  const [libraryHealth, setLibraryHealth] = useState(null);
+  const [exportingCorpus, setExportingCorpus] = useState(false);
+  const [syncingLibrary, setSyncingLibrary] = useState(false);
+  const [activeSyncJob, setActiveSyncJob] = useState(null);
+  const [featureFlags, setFeatureFlags] = useState(null);
+  const [managedUsers, setManagedUsers] = useState([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const trackedSyncJobIdRef = useRef(null);
+  const syncWasRunningRef = useRef(false);
 
   const preview = useMemo(() => wizardPersonaPreview(persona), [persona]);
   const movieSections = useMemo(() => sections.filter((s) => s.type === "movie"), [sections]);
@@ -319,7 +353,15 @@ export default function ConfigPage() {
         }
       },
     );
+    getFeatures()
+      .then((data) => setFeatureFlags(data))
+      .catch(() => setFeatureFlags(null));
   }, []);
+
+  useEffect(() => {
+    if (!settings) return;
+    refreshManagedUsers().catch(() => {});
+  }, [settings?.features?.multi_user_enabled]);
 
   useEffect(() => {
     if (!settings || autoCertifyDone || autoCertifying) return;
@@ -376,8 +418,128 @@ export default function ConfigPage() {
       .catch(() => {});
   }, [settings, verification.plex, sections.length]);
 
+  useEffect(() => {
+    if (showWizard) return;
+    api("/library/stats")
+      .then(setLibraryStats)
+      .catch(() => setLibraryStats(null));
+    api("/library/health")
+      .then(setLibraryHealth)
+      .catch(() => setLibraryHealth(null));
+  }, [showWizard]);
+
+  useEffect(() => {
+    if (showWizard) return undefined;
+
+    let cancelled = false;
+
+    async function pollSyncJobs() {
+      try {
+        const jobs = await listJobs();
+        if (cancelled) return;
+        const syncJobs = jobs.filter((job) => job.job_type === "library_sync");
+        const running = syncJobs.find((job) => job.status === "running" || job.status === "queued");
+        const trackedId = trackedSyncJobIdRef.current;
+        const tracked =
+          (trackedId && syncJobs.find((job) => job.id === trackedId)) || syncJobs[0] || null;
+        const active = running || tracked;
+        setActiveSyncJob(active);
+        const isRunning = Boolean(running);
+        setSyncingLibrary(isRunning);
+        if (syncWasRunningRef.current && !isRunning && active?.status === "completed") {
+          api("/library/stats")
+            .then(setLibraryStats)
+            .catch(() => {});
+          api("/library/health")
+            .then(setLibraryHealth)
+            .catch(() => {});
+        }
+        syncWasRunningRef.current = isRunning;
+      } catch {
+        if (!cancelled) setSyncingLibrary(false);
+      }
+    }
+
+    pollSyncJobs();
+    const interval = setInterval(pollSyncJobs, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [showWizard]);
+
   function updateSettings(patch) {
     setSettings((prev) => ({ ...prev, ...patch }));
+  }
+
+  function updateFeatureFlags(patch) {
+    setSettings((prev) => ({
+      ...prev,
+      features: { ...(prev?.features || {}), ...patch },
+    }));
+  }
+
+  function updateAuthSettings(patch) {
+    setSettings((prev) => ({
+      ...prev,
+      auth: { ...(prev?.auth || {}), ...patch },
+    }));
+  }
+
+  function updateSeerrSettings(patch) {
+    setSettings((prev) => ({
+      ...prev,
+      seerr: { ...(prev?.seerr || {}), ...patch },
+    }));
+  }
+
+  async function refreshManagedUsers() {
+    if (!settings?.features?.multi_user_enabled) {
+      setManagedUsers([]);
+      return;
+    }
+    try {
+      const me = await getAuthMe();
+      if (me?.user?.role !== "owner") {
+        setManagedUsers([]);
+        return;
+      }
+      setUsersLoading(true);
+      const data = await listUsers();
+      setManagedUsers(data.items || []);
+    } catch {
+      setManagedUsers([]);
+    } finally {
+      setUsersLoading(false);
+    }
+  }
+
+  async function handleUserRoleChange(userId, role) {
+    try {
+      await updateUserRole(userId, role);
+      await refreshManagedUsers();
+      setActionFeedback("users", "success", "User role updated.");
+    } catch (error) {
+      setActionFeedback("users", "error", error.message);
+    }
+  }
+
+  function renderSeerrSecretInput(options = {}) {
+    const field = "seerr.api_key";
+    const value = settings?.seerr?.api_key ?? "";
+    const configured = Boolean(settings?.seerr?.api_key_set);
+    return (
+      <SecretInput
+        field={field}
+        settings={settings}
+        value={value}
+        disabled={options.disabled}
+        placeholder={configured ? "Configured (leave blank to keep)" : ""}
+        visible={Boolean(visibleSecrets[field])}
+        onToggleVisible={() => toggleSecretVisibility(field)}
+        onChange={(event) => updateSeerrSettings({ api_key: event.target.value })}
+      />
+    );
   }
 
   function toggleSecretVisibility(field) {
@@ -475,6 +637,36 @@ export default function ConfigPage() {
     }
   }
 
+  async function handleSyncReviewsToggle(enabled) {
+    updateSettings({ sync_reviews_to_plex: enabled });
+    try {
+      await persistSettings({ sync_reviews_to_plex: enabled });
+      setActionFeedback(
+        "plex-sections",
+        "success",
+        enabled ? "Plex rating sync enabled." : "Plex rating sync disabled.",
+      );
+    } catch (error) {
+      setActionFeedback("plex-sections", "error", error.message);
+    }
+  }
+
+  async function handlePlexCollectionsToggle(enabled) {
+    updateFeatureFlags({ plex_collections_enabled: enabled });
+    try {
+      await persistSettings({
+        features: { ...(settings.features || {}), plex_collections_enabled: enabled },
+      });
+      setActionFeedback(
+        "plex-sections",
+        "success",
+        enabled ? "Plex collection management enabled." : "Plex collection management disabled.",
+      );
+    } catch (error) {
+      setActionFeedback("plex-sections", "error", error.message);
+    }
+  }
+
   async function handleSectionChange(field, value) {
     const nextMovie = field === "plex_movie_section" ? value : settings.plex_movie_section;
     const nextTv = field === "plex_tv_section" ? value : settings.plex_tv_section;
@@ -496,7 +688,7 @@ export default function ConfigPage() {
     setTestResults((prev) => ({ ...prev, [service]: { state: "loading" } }));
     if (!silent) clearActionFeedback(service);
     try {
-      const result = await testService(service, settings);
+      const result = await testService(service, settingsPayloadForTest(service, settings));
       setTestResults((prev) => ({
         ...prev,
         [service]: {
@@ -851,12 +1043,109 @@ export default function ConfigPage() {
             </select>
           </label>
         </div>
+        <label className="config-toggle" data-testid="sync-reviews-to-plex">
+          <input
+            type="checkbox"
+            checked={Boolean(settings.sync_reviews_to_plex)}
+            onChange={(event) => handleSyncReviewsToggle(event.target.checked)}
+          />
+          <span>Sync personal reviews to Plex star ratings</span>
+        </label>
+        <label className="config-toggle" data-testid="plex-collections-enabled">
+          <input
+            type="checkbox"
+            checked={Boolean(settings?.features?.plex_collections_enabled)}
+            onChange={(event) => handlePlexCollectionsToggle(event.target.checked)}
+          />
+          <span>Allow curator to manage Plex collections</span>
+        </label>
         <InlineAlert
           type={actionAlert?.area === "plex-sections" ? actionAlert.type : null}
           message={actionAlert?.area === "plex-sections" ? actionAlert.message : null}
         />
       </section>
     );
+  }
+
+  async function handleLibrarySync() {
+    setSyncingLibrary(true);
+    setActionFeedback("library-sync", null);
+    try {
+      const job = await api("/library/sync", { method: "POST" });
+      trackedSyncJobIdRef.current = job.id;
+      setActiveSyncJob(job);
+      syncWasRunningRef.current = job.status === "running" || job.status === "queued";
+      setActionFeedback("library-sync", {
+        type: "success",
+        message: `Library sync started (${job.id}).`,
+      });
+    } catch (error) {
+      setSyncingLibrary(false);
+      setActionFeedback("library-sync", {
+        type: "error",
+        message: error.message || "Library sync failed to start.",
+      });
+    }
+  }
+
+  function formatSyncJobStatus(job) {
+    if (!job) return null;
+    if (job.status === "failed") {
+      return job.error ? `Sync failed: ${job.error}` : "Sync failed.";
+    }
+    if (job.status === "completed") {
+      return "Last sync completed.";
+    }
+    const progress = job.progress || {};
+    const message = progress.message || job.status;
+    const percent = progress.percent;
+    if (typeof percent === "number" && percent > 0) {
+      return `${message} (${percent}%)`;
+    }
+    return message;
+  }
+
+  function formatLastSync(lastSync) {
+    if (!lastSync) return "Never";
+    try {
+      const parsed = typeof lastSync === "string" ? JSON.parse(lastSync) : lastSync;
+      const timestamp = parsed?.finished_at || parsed?.started_at || parsed?.updated_at;
+      if (!timestamp) return "Unknown";
+      return new Date(Number(timestamp) * 1000).toLocaleString();
+    } catch {
+      return String(lastSync);
+    }
+  }
+
+  async function handleExportTrainingCorpus() {
+    setExportingCorpus(true);
+    try {
+      const response = await fetch("/api/admin/export/training-corpus", { credentials: "include" });
+      if (!response.ok) {
+        throw new Error(`Export failed (${response.status})`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      const filename = match?.[1] || "curatorx-training-corpus.json";
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+      setActionFeedback("training-export", {
+        type: "success",
+        message: "Training corpus downloaded.",
+      });
+    } catch (error) {
+      setActionFeedback("training-export", {
+        type: "error",
+        message: error.message || "Training corpus export failed.",
+      });
+    } finally {
+      setExportingCorpus(false);
+    }
   }
 
   function renderMaintenanceDashboard() {
@@ -870,6 +1159,85 @@ export default function ConfigPage() {
             </button>
           </div>
           <p>Re-test integrations, adjust library mapping, and tune advanced settings.</p>
+        </section>
+
+        <section className="config-section" data-testid="library-sync-card">
+          <h2>Library sync</h2>
+          <p>Pull the latest movies and shows from Plex into CuratorX.</p>
+          <div className="config-actions">
+            <button type="button" data-testid="library-sync-button" onClick={handleLibrarySync} disabled={syncingLibrary}>
+              {syncingLibrary ? "Starting sync…" : "Sync library"}
+            </button>
+          </div>
+          {libraryStats ? (
+            <p className="status status-secondary" data-testid="library-sync-stats">
+              {libraryStats.movies} movies · {libraryStats.shows} shows
+              {libraryStats.last_sync ? ` · Last sync ${formatLastSync(libraryStats.last_sync)}` : ""}
+            </p>
+          ) : null}
+          {activeSyncJob && (syncingLibrary || activeSyncJob.status === "failed") ? (
+            <p className="status" data-testid="library-sync-job-status">
+              {formatSyncJobStatus(activeSyncJob)}
+            </p>
+          ) : null}
+          <InlineAlert
+            type={actionAlert?.area === "library-sync" ? actionAlert.type : null}
+            message={actionAlert?.area === "library-sync" ? actionAlert.message : null}
+          />
+        </section>
+
+        <section className="config-section" data-testid="library-health-dashboard">
+          <h2>Library health</h2>
+          <p>Quick signals for backlog, stale adds, and how much of your watched library you have rated.</p>
+          {libraryHealth ? (
+            <div className="library-health-grid">
+              <div className="library-health-metric" data-testid="library-health-unwatched">
+                <span className="library-health-value">{libraryHealth.unwatched_pct}%</span>
+                <span className="library-health-label">Unwatched</span>
+                <span className="library-health-detail">
+                  {libraryHealth.unwatched_count} of {libraryHealth.total} titles
+                </span>
+              </div>
+              <div className="library-health-metric" data-testid="library-health-stale">
+                <span className="library-health-value">{libraryHealth.stale_adds}</span>
+                <span className="library-health-label">Stale adds</span>
+                <span className="library-health-detail">
+                  Added {libraryHealth.stale_add_days}+ days ago, never played
+                </span>
+              </div>
+              <div className="library-health-metric" data-testid="library-health-ratings">
+                <span className="library-health-value">{libraryHealth.rating_coverage_pct}%</span>
+                <span className="library-health-label">Rating coverage</span>
+                <span className="library-health-detail">
+                  {libraryHealth.reviewed_count} reviewed of {libraryHealth.watched_count} watched
+                </span>
+              </div>
+            </div>
+          ) : (
+            <p className="status status-secondary">Run a library sync to populate health metrics.</p>
+          )}
+        </section>
+
+        <section className="config-section" data-testid="training-corpus-export">
+          <h2>Training corpus export</h2>
+          <p>
+            Download message reactions, preference facts, and personal reviews as JSON for offline taste
+            training or backup.
+          </p>
+          <div className="config-actions">
+            <button
+              type="button"
+              data-testid="training-corpus-export-button"
+              onClick={handleExportTrainingCorpus}
+              disabled={exportingCorpus}
+            >
+              {exportingCorpus ? "Preparing export…" : "Download training corpus"}
+            </button>
+          </div>
+          <InlineAlert
+            type={actionAlert?.area === "training-export" ? actionAlert.type : null}
+            message={actionAlert?.area === "training-export" ? actionAlert.message : null}
+          />
         </section>
 
         <PersonaSection
@@ -1040,6 +1408,236 @@ export default function ConfigPage() {
           </div>
         </section>
 
+        {!showWizard ? (
+          <section className="config-section" data-testid="multi-user-settings">
+            <h2>Multi-user auth (optional)</h2>
+            <p className="wizard-note">
+              Require Plex sign-in for household members. The first Plex account to sign in becomes owner; later accounts start as members.
+            </p>
+            <label className="config-toggle" data-testid="multi-user-enabled-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(settings?.features?.multi_user_enabled)}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  const nextAuthMode = enabled ? "plex" : "disabled";
+                  updateFeatureFlags({ multi_user_enabled: enabled });
+                  updateAuthSettings({ mode: nextAuthMode, plex_login_enabled: true });
+                  persistSettings({
+                    features: { ...(settings.features || {}), multi_user_enabled: enabled },
+                    auth: {
+                      ...(settings.auth || {}),
+                      mode: nextAuthMode,
+                      plex_login_enabled: true,
+                    },
+                  })
+                    .then(() =>
+                      setActionFeedback(
+                        "multi-user",
+                        "success",
+                        enabled
+                          ? "Multi-user auth enabled. Sign in with Plex on the login page."
+                          : "Multi-user auth disabled.",
+                      ),
+                    )
+                    .catch((error) => setActionFeedback("multi-user", "error", error.message));
+                }}
+              />
+              <span>Enable multi-user auth</span>
+            </label>
+            {settings?.features?.multi_user_enabled ? (
+              <>
+                <div className="service-fields">
+                  <label>
+                    <span>Auth mode</span>
+                    <select
+                      data-testid="auth-mode-select"
+                      value={settings?.auth?.mode || "plex"}
+                      onChange={(event) => {
+                        const mode = event.target.value;
+                        updateAuthSettings({ mode });
+                        persistSettings({
+                          auth: { ...(settings.auth || {}), mode },
+                        }).catch((error) => setActionFeedback("multi-user", "error", error.message));
+                      }}
+                    >
+                      <option value="plex">Plex token login</option>
+                      <option value="disabled">Disabled</option>
+                      <option value="oidc" disabled>
+                        OIDC (coming soon)
+                      </option>
+                      <option value="local" disabled>
+                        Local accounts (coming soon)
+                      </option>
+                    </select>
+                  </label>
+                  <label className="config-toggle" data-testid="plex-login-enabled-toggle">
+                    <input
+                      type="checkbox"
+                      checked={settings?.auth?.plex_login_enabled !== false}
+                      onChange={(event) => {
+                        const enabled = event.target.checked;
+                        updateAuthSettings({ plex_login_enabled: enabled });
+                        persistSettings({
+                          auth: { ...(settings.auth || {}), plex_login_enabled: enabled },
+                        }).catch((error) => setActionFeedback("multi-user", "error", error.message));
+                      }}
+                    />
+                    <span>Allow Plex sign-in</span>
+                  </label>
+                </div>
+                {featureFlags?.user?.role === "owner" || !featureFlags?.features?.multi_user_enabled ? (
+                  <div className="user-management" data-testid="user-management">
+                    <h3>Users</h3>
+                    {usersLoading ? <p className="wizard-note">Loading users…</p> : null}
+                    {!usersLoading && managedUsers.length === 0 ? (
+                      <p className="wizard-note">No Plex users have signed in yet.</p>
+                    ) : null}
+                    {managedUsers.length ? (
+                      <ul className="user-management-list">
+                        {managedUsers.map((entry) => (
+                          <li key={entry.id} className="user-management-row" data-testid={`user-row-${entry.id}`}>
+                            <div>
+                              <strong>{entry.display_name}</strong>
+                              <span>{entry.email || entry.plex_user_id || entry.id}</span>
+                              {entry.seerr_user_id ? (
+                                <span className="user-management-meta">Seerr #{entry.seerr_user_id}</span>
+                              ) : (
+                                <span className="user-management-meta">Seerr not linked</span>
+                              )}
+                            </div>
+                            <select
+                              value={entry.role}
+                              disabled={entry.id === featureFlags?.user?.id && entry.role === "owner"}
+                              onChange={(event) => handleUserRoleChange(entry.id, event.target.value)}
+                            >
+                              <option value="owner">Owner</option>
+                              <option value="member">Member</option>
+                              <option value="guest">Guest</option>
+                            </select>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {actionAlert?.area === "users" || actionAlert?.area === "multi-user" ? (
+                      <InlineAlert
+                        type={actionAlert.type}
+                        message={actionAlert.message}
+                        testId="multi-user-alert"
+                      />
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="wizard-note">Sign in as owner to manage household users.</p>
+                )}
+              </>
+            ) : null}
+          </section>
+        ) : null}
+
+        {!showWizard ? (
+          <section className="config-section" data-testid="seerr-settings">
+            <h2>Seerr (optional)</h2>
+            <p className="wizard-note">
+              Household discovery and requests via Seerr/Overseerr. Members see &quot;Request in Seerr&quot; instead of Radarr/Sonarr adds.
+            </p>
+            <label className="config-toggle" data-testid="seerr-enabled-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(settings?.features?.seerr_enabled)}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  updateFeatureFlags({ seerr_enabled: enabled });
+                  persistSettings({
+                    features: { ...(settings.features || {}), seerr_enabled: enabled },
+                  })
+                    .then(() =>
+                      setActionFeedback(
+                        "seerr",
+                        "success",
+                        enabled ? "Seerr integration enabled." : "Seerr integration disabled.",
+                      ),
+                    )
+                    .catch((error) => setActionFeedback("seerr", "error", error.message));
+                }}
+              />
+              <span>Enable Seerr integration</span>
+            </label>
+            <div className={`service-card ${testResults.seerr?.state === "success" ? "service-ok" : ""} ${testing === "seerr" ? "service-loading" : ""} ${testResults.seerr?.state === "error" ? "service-error" : ""}`}>
+                <div className="service-card-header">
+                  <div className="service-card-title">
+                    <h3>Seerr connection</h3>
+                    <CertifiedBadge
+                      certified={certifications.seerr?.certified}
+                      testing={testing === "seerr"}
+                      serviceId="seerr"
+                    />
+                  </div>
+                  <button type="button" data-testid="verify-seerr" onClick={() => runTest("seerr")} disabled={testing === "seerr"}>
+                    {testing === "seerr" ? "Testing…" : "Test connection"}
+                  </button>
+                </div>
+                <div className="service-fields">
+                  <label>
+                    <span>Seerr URL</span>
+                    <input
+                      type="text"
+                      data-testid="seerr-url"
+                      value={settings?.seerr?.url ?? ""}
+                      onChange={(event) => updateSeerrSettings({ url: event.target.value })}
+                      onBlur={() =>
+                        persistSettings({
+                          seerr: { ...(settings.seerr || {}), url: settings?.seerr?.url ?? "" },
+                        }).catch((error) => setActionFeedback("seerr", "error", error.message))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>API key</span>
+                    {renderSeerrSecretInput({ disabled: testing === "seerr" })}
+                  </label>
+                </div>
+                <label className="config-toggle" data-testid="seerr-link-on-login">
+                  <input
+                    type="checkbox"
+                    checked={settings?.seerr?.link_on_login !== false}
+                    onChange={(event) => {
+                      const linkOnLogin = event.target.checked;
+                      updateSeerrSettings({ link_on_login: linkOnLogin });
+                      persistSettings({
+                        seerr: { ...(settings.seerr || {}), link_on_login: linkOnLogin },
+                      }).catch((error) => setActionFeedback("seerr", "error", error.message));
+                    }}
+                  />
+                  <span>Link Plex users to Seerr on login (Phase 8)</span>
+                </label>
+                <label className="config-toggle" data-testid="seerr-require-linked-user">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(settings?.seerr?.require_linked_user_for_requests)}
+                    onChange={(event) => {
+                      const required = event.target.checked;
+                      updateSeerrSettings({ require_linked_user_for_requests: required });
+                      persistSettings({
+                        seerr: {
+                          ...(settings.seerr || {}),
+                          require_linked_user_for_requests: required,
+                        },
+                      }).catch((error) => setActionFeedback("seerr", "error", error.message));
+                    }}
+                  />
+                  <span>Require linked Seerr user before requests</span>
+                </label>
+                {testResults.seerr?.message ? (
+                  <InlineAlert
+                    type={actionAlert?.area === "seerr" ? actionAlert.type : testResults.seerr.state}
+                    message={actionAlert?.area === "seerr" ? actionAlert.message : testResults.seerr.message}
+                  />
+                ) : null}
+              </div>
+          </section>
+        ) : null}
+
         <section className="config-section" data-testid="plex-library-mapping">
           <h2>Plex library mapping</h2>
           <p className="wizard-note">Update movie and TV libraries when your Plex layout changes.</p>
@@ -1085,6 +1683,28 @@ export default function ConfigPage() {
               </select>
             </label>
           </div>
+          <label className="config-toggle" data-testid="sync-reviews-to-plex">
+            <input
+              type="checkbox"
+              checked={Boolean(settings.sync_reviews_to_plex)}
+              onChange={(event) => handleSyncReviewsToggle(event.target.checked)}
+            />
+            <span>Sync personal reviews to Plex star ratings</span>
+          </label>
+          <p className="wizard-note">
+            When enabled, saving a 1–5 star review in CuratorX writes the matching Plex rating (2, 4, 6, 8, or 10).
+          </p>
+          <label className="config-toggle" data-testid="plex-collections-enabled">
+            <input
+              type="checkbox"
+              checked={Boolean(settings?.features?.plex_collections_enabled)}
+              onChange={(event) => handlePlexCollectionsToggle(event.target.checked)}
+            />
+            <span>Allow curator to manage Plex collections</span>
+          </label>
+          <p className="wizard-note">
+            When enabled, the curator can propose creating Plex collections or adding owned titles to existing ones (confirmation required).
+          </p>
           <InlineAlert
             type={actionAlert?.area === "plex-sections" ? actionAlert.type : null}
             message={actionAlert?.area === "plex-sections" ? actionAlert.message : null}

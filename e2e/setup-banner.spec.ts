@@ -8,7 +8,7 @@ test.describe("Setup incomplete banner", () => {
     await resetOnboarding(request, false);
     await mockCuratorApis(page);
     await page.goto("/");
-    await page.getByTestId("command-input").waitFor();
+    await page.getByTestId("composer-input").waitFor();
   });
 
   test("shows setup banner when onboarding is incomplete", async ({ page }) => {

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:unit": "node --test src/lib/*.test.mjs",
     "preview": "vite preview",
     "test:e2e": "cd .. && npm run test:e2e"
   },

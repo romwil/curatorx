@@ -20,6 +20,7 @@ from curatorx.config_store import (
 from curatorx.connectors.fanart import FanartClient
 from curatorx.connectors.plex import PlexClient
 from curatorx.connectors.radarr import RadarrClient
+from curatorx.connectors.seerr import SeerrClient
 from curatorx.connectors.sonarr import SonarrClient
 from curatorx.connectors.tautulli import TautulliClient
 from curatorx.connectors.tmdb import TMDBClient
@@ -36,6 +37,7 @@ SECRET_FIELDS = (
     "fanart_api_key",
     "tautulli_api_key",
     "llm_api_key",
+    "webhook_secret",
 )
 
 # Masked or omitted in partial PUT payloads — preserve existing when incoming is empty.
@@ -52,6 +54,7 @@ CERTIFIED_SERVICES = (
     "tmdb",
     "fanart",
     "tautulli",
+    "seerr",
 )
 
 ONBOARDING_HINTS = [
@@ -236,6 +239,25 @@ def test_tautulli(url: str, api_key: str) -> CheckResult:
         return {"ok": False, "message": str(error)}
 
 
+def test_seerr(url: str, api_key: str) -> CheckResult:
+    if not url or not api_key:
+        return {"ok": False, "message": "Seerr URL and API key are required."}
+    try:
+        client = SeerrClient(url.strip().rstrip("/"), api_key.strip())
+        user = client.get_user()
+        display = str(user.get("displayName") or user.get("email") or "service account")
+        pending = client.list_requests(take=1, filter="pending")
+        pending_count = int((pending.get("pageInfo") or {}).get("results") or 0)
+        return {
+            "ok": True,
+            "message": f"Connected — signed in as {display} | {pending_count} pending requests",
+            "user_id": user.get("id"),
+            "pending_requests": pending_count,
+        }
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "message": str(error)}
+
+
 async def _ping_llm(settings: Settings) -> None:
     provider = get_chat_provider(settings)
     response = await provider.chat([{"role": "user", "content": "ping"}])
@@ -321,6 +343,16 @@ def _incoming_secret_changed(
     return incoming_value != str(before_value or "").strip()
 
 
+def _incoming_seerr_secret_changed(incoming: Mapping[str, Any], before_value: str) -> bool:
+    seerr = incoming.get("seerr")
+    if not isinstance(seerr, Mapping):
+        return _incoming_secret_changed(incoming, "seerr_api_key", before_value)
+    incoming_value = str(seerr.get("api_key") or "").strip()
+    if not incoming_value:
+        return False
+    return incoming_value != str(before_value or "").strip()
+
+
 def invalidate_certifications_on_settings_change(
     db: Database,
     before: Settings,
@@ -357,6 +389,11 @@ def invalidate_certifications_on_settings_change(
         "tautulli": (
             before.tautulli_url != after.tautulli_url
             or _incoming_secret_changed(incoming, "tautulli_api_key", before.tautulli_api_key)
+        ),
+        "seerr": (
+            before.seerr.url != after.seerr.url
+            or _incoming_seerr_secret_changed(incoming, before.seerr.api_key)
+            or before.features.seerr_enabled != after.features.seerr_enabled
         ),
     }
     for service_name, changed in checks.items():
@@ -456,6 +493,14 @@ def merge_secret_fields(incoming: Mapping[str, Any], existing: Settings) -> Dict
     for field in SECRET_FIELDS:
         if not str(merged.get(field) or "").strip():
             merged[field] = getattr(existing, field)
+    seerr_incoming = merged.get("seerr")
+    if isinstance(seerr_incoming, Mapping):
+        seerr_merged = dict(seerr_incoming)
+        if not str(seerr_merged.get("api_key") or "").strip():
+            seerr_merged["api_key"] = existing.seerr.api_key
+        merged["seerr"] = seerr_merged
+    elif not str(merged.get("seerr_api_key") or "").strip():
+        merged["seerr_api_key"] = existing.seerr.api_key
     for field in PRESERVE_IF_EMPTY_FIELDS:
         if not str(merged.get(field) or "").strip():
             merged[field] = getattr(existing, field)
@@ -485,6 +530,16 @@ def resolve_test_payload(payload: Mapping[str, Any], existing: Settings) -> Dict
     for field in ("plex_url", "radarr_url", "sonarr_url", "tautulli_url", "llm_base_url"):
         if not str(merged.get(field) or "").strip():
             merged[field] = getattr(existing, field)
+    if not str(merged.get("seerr_url") or "").strip():
+        merged["seerr_url"] = existing.seerr.url
+    if not str(merged.get("seerr_api_key") or "").strip():
+        merged["seerr_api_key"] = existing.seerr.api_key
+    seerr_incoming = merged.get("seerr")
+    if isinstance(seerr_incoming, Mapping):
+        if not str(merged.get("seerr_url") or "").strip():
+            merged["seerr_url"] = str(seerr_incoming.get("url") or "")
+        if not str(merged.get("seerr_api_key") or "").strip():
+            merged["seerr_api_key"] = str(seerr_incoming.get("api_key") or "")
     if not str(merged.get("llm_provider") or "").strip():
         merged["llm_provider"] = existing.llm_provider
     if not str(merged.get("llm_model") or "").strip():

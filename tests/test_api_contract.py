@@ -56,6 +56,13 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(body["val_bro_prof"], 0.5)
         self.assertEqual(body["persona_mode"], "sliders")
         self.assertIn("assembled_prompt", body)
+        self.assertIn("persona_ui", body)
+        self.assertIn("preset_tagline", body["persona_ui"])
+
+    def test_plex_collections_requires_feature_flag(self) -> None:
+        resp = self.client.get("/api/plex/collections")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("not enabled", resp.json()["detail"].lower())
 
     def test_create_lens_and_switch_active(self) -> None:
         create = self.client.post(
@@ -715,6 +722,97 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(body["suggested_root_folder"], "/movies")
         self.assertIn("radarr_root_folder", body["message"])
 
+    def test_features_endpoint_defaults(self) -> None:
+        resp = self.client.get("/api/features")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["features"]["multi_user_enabled"])
+        self.assertFalse(body["features"]["seerr_enabled"])
+        self.assertEqual(body["auth"]["mode"], "disabled")
+        self.assertTrue(body["auth"]["plex_login_enabled"])
+        self.assertFalse(body["auth"]["oidc_enabled"])
+        self.assertFalse(body["auth"]["local_login_enabled"])
+        self.assertTrue(body["authenticated"])
+        self.assertEqual(body["user"]["role"], "owner")
+        self.assertEqual(body["request_path"], "arr")
+
+    def test_auth_me_endpoint(self) -> None:
+        resp = self.client.get("/api/auth/me")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["authenticated"])
+        self.assertEqual(body["user"]["id"], "bootstrap-owner")
+
+    def test_bootstrap_owner_seeded(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        row = db.get_user("bootstrap-owner")
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row["role"]), "owner")
+
+    def test_message_feedback_helpful_records_preference(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        session_id = "feedback-session"
+        message_id = "assistant-feedback-1"
+        db.create_chat_thread(session_id, thread_title="Feedback test")
+        db.save_chat_message(
+            session_id,
+            message_id,
+            "assistant",
+            [{"type": "text", "content": "Try Blade Runner for neo-noir vibes."}],
+        )
+
+        resp = self.client.post(
+            f"/api/chat/messages/{message_id}/feedback",
+            json={"session_id": session_id, "feedback": "helpful"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["saved"])
+        self.assertEqual(body["feedback"]["feedback"], "helpful")
+        self.assertEqual(body["feedback"]["message_id"], message_id)
+
+        facts = db.preference_facts(limit=5)
+        self.assertTrue(any(f["signal_type"] == "positive" for f in facts))
+
+        listed = self.client.get(f"/api/chat/threads/{session_id}/feedback")
+        self.assertEqual(listed.status_code, 200)
+        items = listed.json()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["message_id"], message_id)
+        self.assertEqual(items[0]["feedback"], "helpful")
+
+    def test_message_feedback_rejects_user_messages(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        session_id = "feedback-user-session"
+        message_id = "user-feedback-1"
+        db.create_chat_thread(session_id, thread_title="Feedback user test")
+        db.save_chat_message(
+            session_id,
+            message_id,
+            "user",
+            [{"type": "text", "content": "Find neo-noir films"}],
+        )
+
+        resp = self.client.post(
+            f"/api/chat/messages/{message_id}/feedback",
+            json={"session_id": session_id, "feedback": "helpful"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("assistant", resp.json()["detail"].lower())
+
+    def test_message_feedback_not_found(self) -> None:
+        resp = self.client.post(
+            "/api/chat/messages/missing-message/feedback",
+            json={"session_id": "missing-session", "feedback": "not_helpful"},
+        )
+        self.assertEqual(resp.status_code, 404)
+
     def test_confirm_action_cancels_pending_token(self) -> None:
         self.client.put(
             "/api/settings",
@@ -747,6 +845,211 @@ class ApiContractTests(unittest.TestCase):
         )
         self.assertEqual(cancel.status_code, 200)
         self.assertTrue(cancel.json()["cancelled"])
+
+    def test_watchlist_crud(self) -> None:
+        create = self.client.post(
+            "/api/watchlist",
+            json={
+                "media_type": "movie",
+                "tmdb_id": 27205,
+                "title": "Inception",
+            },
+        )
+        self.assertEqual(create.status_code, 200)
+        pin = create.json()
+        self.assertEqual(pin["title"], "Inception")
+        self.assertEqual(pin["tmdb_id"], 27205)
+
+        listing = self.client.get("/api/watchlist")
+        self.assertEqual(listing.status_code, 200)
+        body = listing.json()
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(len(body["items"]), 1)
+
+        duplicate = self.client.post(
+            "/api/watchlist",
+            json={
+                "media_type": "movie",
+                "tmdb_id": 27205,
+                "title": "Inception",
+            },
+        )
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(self.client.get("/api/watchlist").json()["count"], 1)
+
+        removed = self.client.delete(f"/api/watchlist/{pin['id']}")
+        self.assertEqual(removed.status_code, 200)
+        self.assertTrue(removed.json()["removed"])
+        self.assertEqual(self.client.get("/api/watchlist").json()["count"], 0)
+
+    def test_engagement_streak(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        for index in range(3):
+            db.create_chat_thread(f"streak-session-{index}", thread_title=f"Streak {index}")
+        resp = self.client.get("/api/engagement/streak")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertGreaterEqual(body["session_count_30d"], 3)
+        self.assertTrue(body["streak_visible"])
+
+    def test_message_feedback_clear_via_delete(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        session_id = "feedback-clear-session"
+        message_id = "assistant-feedback-clear"
+        db.create_chat_thread(session_id, thread_title="Feedback clear test")
+        db.save_chat_message(
+            session_id,
+            message_id,
+            "assistant",
+            [{"type": "text", "content": "Try Blade Runner for neo-noir vibes."}],
+        )
+
+        saved = self.client.post(
+            f"/api/chat/messages/{message_id}/feedback",
+            json={"session_id": session_id, "feedback": "helpful"},
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        cleared = self.client.delete(
+            f"/api/chat/messages/{message_id}/feedback",
+            params={"session_id": session_id},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertTrue(cleared.json()["deleted"])
+
+        listed = self.client.get(f"/api/chat/threads/{session_id}/feedback")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["items"], [])
+
+    def test_message_feedback_clear_via_post_null(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        session_id = "feedback-null-session"
+        message_id = "assistant-feedback-null"
+        db.create_chat_thread(session_id, thread_title="Feedback null test")
+        db.save_chat_message(
+            session_id,
+            message_id,
+            "assistant",
+            [{"type": "text", "content": "Queue The Matrix tonight."}],
+        )
+
+        saved = self.client.post(
+            f"/api/chat/messages/{message_id}/feedback",
+            json={"session_id": session_id, "feedback": "not_helpful"},
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        cleared = self.client.post(
+            f"/api/chat/messages/{message_id}/feedback",
+            json={"session_id": session_id, "feedback": None},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertTrue(cleared.json()["deleted"])
+
+        listed = self.client.get(f"/api/chat/threads/{session_id}/feedback")
+        self.assertEqual(listed.json()["items"], [])
+
+    def test_library_health_endpoint(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        db.upsert_library_item(
+            {
+                "rating_key": "health-1",
+                "media_type": "movie",
+                "title": "Unwatched Film",
+                "view_count": 0,
+                "added_at": 1,
+            }
+        )
+        db.upsert_library_item(
+            {
+                "rating_key": "health-2",
+                "media_type": "movie",
+                "title": "Watched Film",
+                "view_count": 2,
+            }
+        )
+        resp = self.client.get("/api/library/health")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("unwatched_pct", body)
+        self.assertIn("stale_adds", body)
+        self.assertIn("rating_coverage_pct", body)
+        self.assertGreaterEqual(body["total"], 2)
+
+    def test_library_purge_candidates_endpoint(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        db.upsert_library_item(
+            {
+                "rating_key": "purge-1",
+                "media_type": "movie",
+                "title": "Big Unwatched",
+                "file_size": 2_000_000_000,
+                "view_count": 0,
+                "genres": ["Horror"],
+            }
+        )
+        resp = self.client.get("/api/library/purge-candidates?limit=5")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertGreaterEqual(body["count"], 1)
+        self.assertTrue(body["items"][0]["title"])
+
+    def test_training_corpus_export(self) -> None:
+        import curatorx.web.jobs as jobs
+
+        db = jobs.get_job_manager().db
+        db.add_preference("explicit", "loves neo-noir")
+        db.create_chat_thread("export-session", thread_title="Export test")
+        db.save_chat_message(
+            "export-session",
+            "assistant-export",
+            "assistant",
+            [{"type": "text", "content": "Try Chinatown."}],
+        )
+        db.upsert_message_feedback(
+            feedback_id="feedback-export-1",
+            message_id="assistant-export",
+            session_id="export-session",
+            user_id=None,
+            feedback_type="helpful",
+            excerpt="Try Chinatown.",
+        )
+
+        resp = self.client.get("/api/admin/export/training-corpus")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("message_feedback", body)
+        self.assertIn("preference_facts", body)
+        self.assertIn("user_title_reviews", body)
+        self.assertGreaterEqual(len(body["preference_facts"]), 1)
+        self.assertGreaterEqual(len(body["message_feedback"]), 1)
+
+    def test_persona_ui_copy_endpoint(self) -> None:
+        resp = self.client.get("/api/persona/ui-copy")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("welcome_greeting", body)
+        self.assertIn("composer_placeholders", body)
+        self.assertIn("review_prompt_templates", body)
+        self.assertIn("accent_hue", body)
+        self.assertIn("preset_tagline", body)
+
+    def test_persona_typing_phrases(self) -> None:
+        resp = self.client.get("/api/persona/typing-phrases")
+        self.assertEqual(resp.status_code, 200)
+        phrases = resp.json()["phrases"]
+        self.assertIsInstance(phrases, list)
+        self.assertGreater(len(phrases), 0)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from curatorx.library.query import filters_from_mapping, query_library_async
 from curatorx.models.schemas import TitleCard
 
 
-def row_to_title_card(row, *, reason: str = "") -> TitleCard:
+def row_to_title_card(row, *, reason: str = "", facet_matches: Optional[List[str]] = None) -> TitleCard:
     genres = json.loads(row["genres"]) if row["genres"] else []
     return TitleCard(
         media_type=row["media_type"],
@@ -28,7 +28,14 @@ def row_to_title_card(row, *, reason: str = "") -> TitleCard:
         in_radarr=bool(row["in_radarr"]),
         in_sonarr=bool(row["in_sonarr"]),
         recommendation_reason=reason,
+        facet_matches=list(facet_matches or []),
         runtime_minutes=int(row["runtime_minutes"]) if "runtime_minutes" in row.keys() and row["runtime_minutes"] else None,
+        total_episode_count=int(row["total_episode_count"])
+        if "total_episode_count" in row.keys() and row["total_episode_count"]
+        else None,
+        unwatched_episode_count=int(row["unwatched_episode_count"])
+        if "unwatched_episode_count" in row.keys() and row["unwatched_episode_count"] is not None
+        else None,
     )
 
 

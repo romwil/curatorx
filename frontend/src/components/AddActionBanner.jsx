@@ -1,3 +1,5 @@
+import { serviceLabelForTarget } from "../lib/addActions";
+
 export default function AddActionBanner({
   pendingAdd,
   pendingBulk,
@@ -9,17 +11,27 @@ export default function AddActionBanner({
 }) {
   if (pendingBulk) {
     const { items, target } = pendingBulk;
-    const service = target === "sonarr" ? "Sonarr" : "Radarr";
+    const service = serviceLabelForTarget(target);
     const count = items.length;
     const progressLabel =
       inProgress && progress?.total
-        ? `Adding ${Math.min(progress.current, progress.total)} of ${progress.total}…`
+        ? target === "seerr"
+          ? `Requesting ${Math.min(progress.current, progress.total)} of ${progress.total}…`
+          : `Adding ${Math.min(progress.current, progress.total)} of ${progress.total}…`
         : null;
 
     return (
       <div className="add-action-banner" data-testid="bulk-add-banner" role="alertdialog" aria-modal="true">
         <p data-testid="bulk-add-prompt">
-          Add all <strong>{count}</strong> titles to {service}?
+          {target === "seerr" ? (
+            <>
+              Request all <strong>{count}</strong> titles in Seerr?
+            </>
+          ) : (
+            <>
+              Add all <strong>{count}</strong> titles to {service}?
+            </>
+          )}
         </p>
         {progressLabel ? <p className="bulk-add-progress">{progressLabel}</p> : null}
         <div className="add-action-buttons">
@@ -63,12 +75,20 @@ export default function AddActionBanner({
 
   const { item, target } = pendingAdd;
   const label = item.title || "this title";
-  const service = target === "sonarr" ? "Sonarr" : "Radarr";
+  const service = serviceLabelForTarget(target);
 
   return (
     <div className="add-action-banner" data-testid="add-action-banner" role="alertdialog" aria-modal="true">
       <p data-testid="add-action-prompt">
-        Add <strong>{label}</strong> to {service}?
+        {target === "seerr" ? (
+          <>
+            Request <strong>{label}</strong> in Seerr?
+          </>
+        ) : (
+          <>
+            Add <strong>{label}</strong> to {service}?
+          </>
+        )}
       </p>
       <div className="add-action-buttons">
         <button
@@ -77,7 +97,13 @@ export default function AddActionBanner({
           onClick={onConfirm}
           disabled={inProgress}
         >
-          {inProgress ? "Adding…" : `Add to ${service}`}
+          {inProgress
+            ? target === "seerr"
+              ? "Requesting…"
+              : "Adding…"
+            : target === "seerr"
+              ? "Request in Seerr"
+              : `Add to ${service}`}
         </button>
         <button type="button" className="ghost" data-testid="add-action-cancel" onClick={onCancel} disabled={inProgress}>
           Cancel

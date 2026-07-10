@@ -1,0 +1,123 @@
+import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { getAuthMe, getFeatures, logout } from "../api/client";
+
+function initials(name) {
+  const parts = String(name || "U")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!parts.length) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] || ""}${parts[1][0] || ""}`.toUpperCase();
+}
+
+export default function UserMenu() {
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [user, setUser] = useState(null);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    getAuthMe()
+      .then((payload) => setUser(payload?.user || null))
+      .catch(() => setUser(null));
+  }, []);
+
+  useEffect(() => {
+    function handleClick(event) {
+      if (!menuRef.current?.contains(event.target)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // Still redirect after clearing cookie attempt.
+    }
+    navigate("/login", { replace: true });
+  }
+
+  if (!user) return null;
+
+  return (
+    <div className="user-menu" ref={menuRef} data-testid="user-menu">
+      <button
+        type="button"
+        className="user-menu-trigger"
+        data-testid="user-menu-trigger"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        {user.avatar_url ? (
+          <img src={user.avatar_url} alt="" className="user-menu-avatar" />
+        ) : (
+          <span className="user-menu-avatar user-menu-avatar-fallback">{initials(user.display_name)}</span>
+        )}
+        <span className="user-menu-name">{user.display_name}</span>
+      </button>
+      {open ? (
+        <div className="user-menu-panel" data-testid="user-menu-panel">
+          <p className="user-menu-meta">
+            {user.display_name}
+            <span>{user.role}</span>
+          </p>
+          {user.role === "owner" ? (
+            <Link to="/config" className="user-menu-link" onClick={() => setOpen(false)}>
+              Configuration
+            </Link>
+          ) : null}
+          <button type="button" className="user-menu-link" data-testid="logout-button" onClick={handleLogout}>
+            Sign out
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+export function useAuthGate() {
+  const navigate = useNavigate();
+  const [authReady, setAuthReady] = useState(false);
+  const [multiUserEnabled, setMultiUserEnabled] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkAuth() {
+      try {
+        const features = await getFeatures();
+        const enabled = Boolean(features?.features?.multi_user_enabled);
+        if (cancelled) return;
+        setMultiUserEnabled(enabled);
+        if (!enabled) {
+          setAuthReady(true);
+          return;
+        }
+        const me = await getAuthMe();
+        if (cancelled) return;
+        if (!me) {
+          navigate("/login", { replace: true });
+          return;
+        }
+        setAuthReady(true);
+      } catch {
+        if (!cancelled) {
+          setAuthReady(true);
+        }
+      }
+    }
+
+    checkAuth();
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate]);
+
+  return { authReady, multiUserEnabled };
+}

@@ -1,7 +1,64 @@
-export default function TitleCard({ item, onAdd, onDismiss, compact = false }) {
+import { useState } from "react";
+import { setTitleCardDragData } from "../lib/easterEggs.js";
+
+function ShowProgressRing({ total, unwatched }) {
+  if (!total || total <= 0) return null;
+  const watched = Math.max(0, total - (unwatched ?? 0));
+  const pct = Math.min(1, watched / total);
+  const radius = 14;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference * (1 - pct);
+
+  return (
+    <svg
+      className="title-card-progress-ring"
+      viewBox="0 0 32 32"
+      aria-hidden="true"
+      data-testid="title-card-progress-ring"
+    >
+      <circle className="title-card-progress-track" cx="16" cy="16" r={radius} />
+      <circle
+        className="title-card-progress-fill"
+        cx="16"
+        cy="16"
+        r={radius}
+        strokeDasharray={circumference}
+        strokeDashoffset={offset}
+      />
+    </svg>
+  );
+}
+
+export default function TitleCard({
+  item,
+  onAdd,
+  onDismiss,
+  onTogglePin,
+  pinRecord = null,
+  compact = false,
+  requestPath = "arr",
+  draggableToDock = false,
+}) {
+  const [hovered, setHovered] = useState(false);
+  const [whyOpen, setWhyOpen] = useState(false);
   const badge = item.in_library ? "In library" : item.in_radarr || item.in_sonarr ? "In queue" : "New";
-  const canAddRadarr = !item.in_library && item.media_type === "movie" && item.tmdb_id;
-  const canAddSonarr = !item.in_library && item.media_type === "show" && item.tvdb_id;
+  const userStars = item.user_stars;
+  const useSeerr = requestPath === "seerr";
+  const canRequestSeerr = useSeerr && !item.in_library && item.tmdb_id;
+  const canAddRadarr = !useSeerr && !item.in_library && item.media_type === "movie" && item.tmdb_id;
+  const canAddSonarr = !useSeerr && !item.in_library && item.media_type === "show" && item.tvdb_id;
+  const backdropUrl = item.backdrop_url || item.art || "";
+  const showRing =
+    item.media_type === "show" &&
+    (item.total_episode_count > 0 || item.unwatched_episode_count != null);
+  const isPinned = Boolean(pinRecord);
+  const facetMatches = item.facet_matches || [];
+  const hasWhyDetail = Boolean(item.recommendation_reason || facetMatches.length);
+
+  function handleDragStart(event) {
+    if (!draggableToDock) return;
+    setTitleCardDragData(event, item);
+  }
 
   function handleAdd(target) {
     return (event) => {
@@ -15,8 +72,18 @@ export default function TitleCard({ item, onAdd, onDismiss, compact = false }) {
     onDismiss?.(item);
   }
 
+  function handleTogglePin(event) {
+    event.stopPropagation();
+    onTogglePin?.(item, pinRecord);
+  }
+
   const addActions = (
     <>
+      {canRequestSeerr ? (
+        <button type="button" data-testid="request-seerr-button" onClick={handleAdd("seerr")}>
+          Request in Seerr
+        </button>
+      ) : null}
       {canAddRadarr ? (
         <button type="button" data-testid="add-radarr-button" onClick={handleAdd("radarr")}>
           Add to Radarr
@@ -31,7 +98,21 @@ export default function TitleCard({ item, onAdd, onDismiss, compact = false }) {
   );
 
   return (
-    <article className={`title-card ${compact ? "compact" : ""}`} data-testid="title-card">
+    <article
+      className={`title-card ${compact ? "compact" : ""} ${hovered && backdropUrl ? "has-hover-backdrop" : ""}`}
+      data-testid="title-card"
+      draggable={draggableToDock}
+      onDragStart={handleDragStart}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      {hovered && backdropUrl ? (
+        <div
+          className="title-card-hover-backdrop"
+          style={{ backgroundImage: `url(${backdropUrl})` }}
+          aria-hidden="true"
+        />
+      ) : null}
       <div className="poster-wrap">
         {item.poster_url ? (
           <img src={item.poster_url} alt="" loading="lazy" />
@@ -39,7 +120,30 @@ export default function TitleCard({ item, onAdd, onDismiss, compact = false }) {
           <div className="poster-fallback">{item.title?.slice(0, 1) || "?"}</div>
         )}
         <span className="badge">{badge}</span>
-        {compact && (canAddRadarr || canAddSonarr) ? (
+        {userStars ? (
+          <span className="user-review-badge" data-testid="user-review-badge" title={`You rated ${userStars}/5`}>
+            {"★".repeat(userStars)}
+          </span>
+        ) : null}
+        {showRing ? (
+          <ShowProgressRing
+            total={item.total_episode_count}
+            unwatched={item.unwatched_episode_count}
+          />
+        ) : null}
+        {onTogglePin ? (
+          <button
+            type="button"
+            className={`title-card-pin ${isPinned ? "pinned" : ""}`}
+            data-testid="title-card-pin"
+            onClick={handleTogglePin}
+            aria-label={isPinned ? "Remove from watchlist" : "Pin to watchlist"}
+            title={isPinned ? "Remove from watchlist" : "Pin to watchlist"}
+          >
+            {isPinned ? "★" : "☆"}
+          </button>
+        ) : null}
+        {compact && (canRequestSeerr || canAddRadarr || canAddSonarr) ? (
           <div className="title-card-overlay-actions">{addActions}</div>
         ) : null}
       </div>
@@ -49,9 +153,39 @@ export default function TitleCard({ item, onAdd, onDismiss, compact = false }) {
           {item.year ? <span className="year"> ({item.year})</span> : null}
         </h3>
         {item.rating ? <p className="rating">★ {item.rating.toFixed(1)}</p> : null}
+        {userStars ? <p className="user-review-stars" data-testid="user-review-stars">Your rating: {"★".repeat(userStars)}</p> : null}
         {item.genres?.length ? <p className="genres">{item.genres.slice(0, 3).join(" · ")}</p> : null}
         {!compact && item.overview ? <p className="overview">{item.overview.slice(0, 160)}…</p> : null}
-        {item.recommendation_reason ? <p className="reason">{item.recommendation_reason}</p> : null}
+        {item.recommendation_reason && !whyOpen ? (
+          <p className="reason">{item.recommendation_reason}</p>
+        ) : null}
+        {hasWhyDetail ? (
+          <div className="title-card-why">
+            <button
+              type="button"
+              className="ghost title-card-why-toggle"
+              data-testid="title-card-why-toggle"
+              onClick={(event) => {
+                event.stopPropagation();
+                setWhyOpen((open) => !open);
+              }}
+            >
+              {whyOpen ? "Hide why" : "Why this?"}
+            </button>
+            {whyOpen ? (
+              <div className="title-card-why-detail" data-testid="title-card-why-detail">
+                {item.recommendation_reason ? <p>{item.recommendation_reason}</p> : null}
+                {facetMatches.length ? (
+                  <ul>
+                    {facetMatches.map((match) => (
+                      <li key={match}>{match}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div className="card-actions">
           {!compact ? addActions : null}
           {!compact ? (

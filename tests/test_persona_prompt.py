@@ -18,11 +18,13 @@ from curatorx.persona import (
     build_persona_prompt,
     build_rendered_behavioral_prompt,
     derive_persona_mode,
+    format_review_prompt,
     get_preset,
+    persona_ui_for,
     slider_band,
     substitute_curator_name,
 )
-from curatorx.persona.presets import PERSONA_PRESETS
+from curatorx.persona.presets import PERSONA_PRESETS, welcome_greeting_for
 
 
 class PersonaPromptTests(unittest.TestCase):
@@ -53,6 +55,8 @@ class PersonaPromptTests(unittest.TestCase):
         self.assertIn("Atlas", prompt)
         self.assertIn("Vocabulary", prompt)
         self.assertIn("Library curation:", prompt)
+        self.assertIn("Review memory:", prompt)
+        self.assertIn("get_user_reviews", prompt)
 
     def test_slider_template_uses_name_placeholder(self) -> None:
         template = build_behavioral_prompt_from_sliders(
@@ -147,6 +151,35 @@ class PersonaPromptTests(unittest.TestCase):
             self.assertTrue(preset.identity_blurb)
             self.assertTrue(preset.behavioral_anchor)
             self.assertTrue(preset.tagline)
+            self.assertTrue(preset.composer_placeholders)
+            self.assertTrue(preset.welcome_greeting)
+            self.assertTrue(preset.welcome_starters)
+            self.assertIn("near_complete", preset.review_prompt_templates)
+            self.assertTrue(preset.accent_hue)
+
+    def test_persona_ui_for_includes_immersion_fields(self) -> None:
+        ui = persona_ui_for("blunt-archivist", "Flemming")
+        self.assertIn("Flemming", ui["welcome_greeting"])
+        self.assertGreater(len(ui["composer_placeholders"]), 0)
+        self.assertGreater(len(ui["welcome_starters"]), 0)
+        self.assertIn("near_complete", ui["review_prompt_templates"])
+        self.assertTrue(str(ui["accent_hue"]).startswith("hsl("))
+
+    def test_format_review_prompt_substitutes_title_and_pct(self) -> None:
+        message = format_review_prompt(
+            "enthusiastic-scout",
+            "near_complete",
+            curator_name="Scout",
+            title="Dune",
+            completion_pct=87.4,
+        )
+        self.assertIn("Dune", message)
+        self.assertIn("87", message)
+
+    def test_welcome_greeting_uses_curator_name(self) -> None:
+        greeting = welcome_greeting_for("classic-curator", "Atlas")
+        self.assertIn("Atlas", greeting)
+        self.assertNotIn("{curator_name}", greeting)
 
     def test_apply_preset_via_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,10 +255,14 @@ class PersonaApiTests(unittest.TestCase):
             "persona_mode",
             "behavioral_prompt",
             "assembled_prompt",
+            "persona_ui",
         ):
             self.assertIn(key, body)
         self.assertEqual(body["persona_mode"], "sliders")
         self.assertIn("Library curation:", body["behavioral_prompt"])
+        self.assertIn("welcome_greeting", body["persona_ui"])
+        self.assertIn("composer_placeholders", body["persona_ui"])
+        self.assertIn("Review memory:", body["assembled_prompt"])
 
     def test_persona_presets_list(self) -> None:
         resp = self.client.get("/api/persona/presets")
@@ -247,6 +284,9 @@ class PersonaApiTests(unittest.TestCase):
         self.assertIn("tagline", classic)
         self.assertIn("behavioral_anchor", classic)
         self.assertTrue(classic["behavioral_anchor"])
+        self.assertIn("composer_placeholders", classic)
+        self.assertIn("welcome_greeting", classic)
+        self.assertIn("accent_hue", classic)
 
     def test_custom_override_blocks_slider_change_until_confirmed(self) -> None:
         put = self.client.put(

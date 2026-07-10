@@ -8,7 +8,7 @@ import uuid
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 from curatorx.agent.providers import get_chat_provider
-from curatorx.agent.tools import TOOL_DEFINITIONS, ToolRegistry, build_system_prompt
+from curatorx.agent.tools import build_tool_definitions, ToolRegistry, build_system_prompt
 from curatorx.config_store import Settings
 from curatorx.library.db import DEFAULT_LENS_ID, Database
 from curatorx.models.schemas import TitleCard
@@ -85,6 +85,11 @@ def _extract_text(response: Mapping[str, Any]) -> str:
 MAX_TOOL_ROUNDS = 8
 
 
+def _append_review_conflict_blocks(blocks: List[Dict[str, Any]], registry: ToolRegistry) -> None:
+    for conflict in registry.review_conflicts:
+        blocks.append({"type": "plex_rating_conflict", "payload": conflict})
+
+
 class CuratorAgent:
     def __init__(self, db: Database, settings: Settings, lens_id: Optional[str] = None) -> None:
         self.db = db
@@ -127,6 +132,7 @@ class CuratorAgent:
                             "payload": {"title": "Results", "items": [c.model_dump() for c in cards]},
                         }
                     )
+            _append_review_conflict_blocks(blocks, registry)
             user_id = uuid.uuid4().hex
             assistant_id = uuid.uuid4().hex
             self.db.save_chat_message(
@@ -155,7 +161,7 @@ class CuratorAgent:
 
         registry = ToolRegistry(self.db, self.settings, self.lens_id)
         use_tools = bool(self.settings.llm_api_key or self.settings.llm_provider == "ollama")
-        tool_defs = TOOL_DEFINITIONS if use_tools else None
+        tool_defs = build_tool_definitions(self.settings) if use_tools else None
         response = await self.provider.chat(messages, tools=tool_defs)
 
         for _ in range(MAX_TOOL_ROUNDS):
@@ -216,6 +222,7 @@ class CuratorAgent:
                         "payload": {"title": viewport_title, "items": [c.model_dump() for c in cards]},
                     }
                 )
+        _append_review_conflict_blocks(blocks, registry)
 
         user_id = uuid.uuid4().hex
         assistant_id = uuid.uuid4().hex

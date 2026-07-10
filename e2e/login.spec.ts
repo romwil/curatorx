@@ -1,0 +1,55 @@
+import { expect, test } from "@playwright/test";
+import {
+  mockAuthUnauthenticated,
+  mockAuthUser,
+  mockCuratorApis,
+  mockFeatures,
+  mockPlexLogin,
+  resetMockCertifications,
+} from "./fixtures/api-mocks";
+
+test.describe("Login flow", () => {
+  test.beforeEach(async ({ page }) => {
+    resetMockCertifications();
+    await mockCuratorApis(page);
+  });
+
+  test("skips login when multi-user auth is disabled", async ({ page }) => {
+    await mockFeatures(page, { multi_user_enabled: false });
+    await page.goto("/");
+    await page.getByTestId("composer-input").waitFor();
+    await expect(page.getByTestId("login-page")).toHaveCount(0);
+    await expect(page.getByTestId("workspace-main")).toBeVisible();
+  });
+
+  test("redirects to login when multi-user is enabled and session is missing", async ({ page }) => {
+    await mockFeatures(page, { multi_user_enabled: true });
+    await mockAuthUnauthenticated(page);
+    await page.goto("/");
+    await expect(page.getByTestId("login-page")).toBeVisible();
+    await expect(page.getByTestId("sign-in-with-plex")).toBeVisible();
+  });
+
+  test("plex token login returns to chat workspace", async ({ page }) => {
+    await mockFeatures(page, { multi_user_enabled: true });
+    await mockPlexLogin(page);
+
+    await page.goto("/login");
+    await page.getByTestId("sign-in-with-plex").click();
+    await page.getByTestId("plex-token-input").fill("mock-plex-token");
+    await page.getByTestId("submit-plex-login").click();
+
+    await expect(page).toHaveURL("/");
+    await page.getByTestId("composer-input").waitFor();
+    await expect(page.getByTestId("workspace-main")).toBeVisible();
+  });
+
+  test("shows user menu when authenticated in multi-user mode", async ({ page }) => {
+    await mockFeatures(page, { multi_user_enabled: true });
+    await mockAuthUser(page);
+    await page.goto("/");
+    await page.getByTestId("composer-input").waitFor();
+    await expect(page.getByTestId("user-menu")).toBeVisible();
+    await expect(page.getByTestId("user-menu-trigger")).toContainText("Test User");
+  });
+});

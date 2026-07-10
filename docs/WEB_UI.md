@@ -2,31 +2,53 @@
 
 The CuratorX frontend is a Vite + React SPA served from the same origin as the FastAPI backend (`/` and `/api/*`).
 
+This guide describes what you see after opening CuratorX in a browser — whether you run it with Docker on Unraid, `docker compose`, or a local dev server.
+
 ---
 
-## View modes
+## First visit (self-hosted)
 
-CuratorX toggles between two operational states without leaving the browser:
+1. **Open the app** — In your browser, go to the host and port where CuratorX is running (for example `http://your-unraid-ip:8765` or the URL in your compose file).
+2. **Setup banner** — If Plex, TMDB, or your LLM provider are not configured yet, a blue banner appears under the top bar: *Finish setup in Settings…* Click **Settings** (or **Config** in the top bar) to open the wizard.
+3. **Top bar** — You always see **CuratorX**, a small **agent pulse** dot (idle / running / error), library counts like `142 movies · 38 shows` when stats are loaded, and a **Config** link.
+4. **Conversation sidebar** — On the left, past chats are listed. Use **New** to start a fresh thread. On smaller screens, collapse the sidebar with the `«` / `»` toggle.
+5. **Main chat** — The center area is full-width chat: thread title, ambient context tag (e.g. `⧉ Neo-noir exploration`), scrollable messages, and a composer at the bottom.
+6. **Status dock** — Bottom-left corner shows background jobs (library sync, etc.) and add-to-Radarr/Sonarr confirmations — not a center-screen modal.
 
-### Turnstyle widget
+There is **one workspace layout**. The old Turnstyle compact view and Immersive split view are removed.
 
-Lightweight overlay optimized for fast intent entry:
+---
 
-- **Command lane** — borderless monospace input; auto-focus on load.
-- **Ambient context prefix** — inferred context indicator, e.g. `⧉ [Neo-noir exploration] > _`.
-- **Thoughtstream feed** — compact activity log (sync status, job pulse) capped at ~320px height.
+## Layout overview
 
-Expand to Immersive via hotkey, `/expand` token, or viewport card click.
+```
+┌─────────────────────────────────────────────────────────────┐
+│ CuratorX ●  142 movies · 38 shows              [ Config ]   │  ← top bar
+├──────────────┬──────────────────────────────────────────────┤
+│ Conversations│  Conversation                                │
+│  [ New ]     │  Neo-noir thread                             │
+│  • Thread 1  │  ⧉ Neo-noir exploration                      │
+│  • Thread 2  │  ┌────────────────────────────────────────┐  │
+│              │  │ chat messages + title cards            │  │  ← chat-scroll-region
+│              │  └────────────────────────────────────────┘  │
+│              │  [ composer textarea ]          [ Send ]     │
+└──────────────┴──────────────────────────────────────────────┘
+  ▲ status dock (jobs, add confirmations) — bottom-left
+```
 
-### Immersive viewport
+| Area | What it does |
+|------|----------------|
+| **Top bar** | Branding, agent pulse after logo, indexed movie/show counts, link to Config |
+| **Sidebar** | Thread list only — switch or create conversations |
+| **Chat workspace** | Full-width thread, scroll region, composer |
+| **Status dock** | Running jobs, bulk-add progress, Radarr/Sonarr confirm prompts, drag-to-queue drop target |
+| **Turnstyle overlay** | Optional expand-in-overlay for large title-card result sets |
 
-Full workspace for deep curation:
+**Sync library** lives on the **Config** page (not the main chat sidebar). After onboarding, the maintenance dashboard shows a **Library sync** card with movie/show counts, last sync time, and live job status while a sync runs.
 
-- **Sidebar (240px)** — ambient context label, thoughtstream, settings link, job pulse (`.agent-pulse`).
-- **Chat pane (~45%)** — message thread with ambient context tag in composer.
-- **Visual array (~55%)** — title cards clustered by genre, trope, or recommendation context.
+### Single workspace (default)
 
-Context is inferred automatically from conversation — no manual lens switching in the UI.
+With `features.multi_user_enabled` left at `false` (the default), CuratorX runs as one household workspace: no login screen, one implicit **owner** account in the database, and all chat threads share the same taste profile. Multi-user login and per-member Seerr requests appear only after you opt in via feature flags.
 
 ---
 
@@ -34,7 +56,7 @@ Context is inferred automatically from conversation — no manual lens switching
 
 | Route | Purpose |
 |-------|---------|
-| `/` | Curator chat — Turnstyle or Immersive depending on view state |
+| `/` | Curator chat — single workspace |
 | `/config` | Onboarding wizard (first run) or maintenance dashboard |
 | `/title/{movie\|show}/{id}` | Title detail — backdrop hero, metadata, purge notes |
 
@@ -48,12 +70,91 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 
 ## Chat features
 
-- Streaming via `GET /api/chat/stream` (SSE; simulated deltas today, true LLM streaming planned)
-- Inline **title cards** — poster, rating, genres, `recommendation_reason`
-- **Turnstyle viewport** — horizontal scroll overlay for expanded result sets
-- **Add to Radarr/Sonarr** — browser confirm + server confirmation token
+- **Intelligent scroll** — New messages anchor into view; a typing indicator shows while the curator responds (persona name, e.g. *Flemming is thinking*). If you scroll up while a reply arrives, a **New reply ↓** chip appears — click it to jump back to the latest message.
+- **Empty-thread welcome** — New conversations show a persona greeting and three starter prompt chips you can click to send your first message.
+- **Slash commands** — Type commands in the composer (no LLM call for `/help`):
+  - `/help` — list available commands
+  - `/stats` — library movie/show counts and last sync time
+  - `/sync` — queue a Plex library index job (blocked in chat when multi-user mode is on; use Config instead)
+  - `/rate <title>` — open an inline 1–5 star review for a library title (e.g. `/rate Inception`)
+  - `/purge` — summarize top drive-space purge candidates (large, unwatched, low-taste)
+  - `/collections` — list Plex movie and TV collections (only when **Allow curator to manage Plex collections** is enabled in Config)
+- **Easter eggs** — Konami code in the composer (↑↑↓↓←→←→BA) or type your curator's name **backwards** for a one-time hidden reply. Drag a **movie** title card onto the status dock to queue it in **Radarr**, or drag a **show** card to queue in **Sonarr**, when the respective *arr service is connected.
+- **Keyboard shortcuts** — Press `?` anywhere outside a text field for the cheat sheet:
+  - `/` — focus composer
+  - `Cmd/Ctrl+N` — new conversation
+  - `Esc` — close Turnstyle results overlay
+- **Ambient tint** — The workspace background subtly shifts based on inferred conversation context (e.g. neo-noir, 1970s).
+- **Watchlist shelf** — Pin titles from any title card with the ☆ button. Pinned count appears in the top bar; open the list from the sidebar footer or the top-bar chip.
+- **Card hover backdrop** — Hover a title card to see a blurred backdrop image when art is available.
+- **Cinema mode** — In the Turnstyle overlay, toggle **Cinema mode** to enlarge cards and dim surrounding chrome.
+- **TV progress rings** — Show cards display a small ring for watched vs total episodes when that data is available.
+- **Curator streaks** — After three or more conversations in the last 30 days, a subtle streak chip appears in the top bar.
+- **Sync completion chime** — When a library sync job finishes, a short chime plays (toggle mute with the bell in the status dock).
+- **Late-night mode** — After 11 p.m. local time, the top bar shifts to a softer night-owl palette.
+- **Persona typing copy** — The typing indicator uses flavor text from your active persona preset.
+- **Persona welcome & composer** — Empty threads greet you with your curator's preset voice and starter chips; the composer placeholder rotates every few seconds with preset-specific suggestions.
+- **Persona tint** — The workspace background subtly blends your persona accent with conversation context (neo-noir, horror, etc.).
+
+### Persona presets (for novices)
+
+CuratorX ships five **persona presets** — ready-made curator personalities you pick in **Config → Persona**. Each preset sets tone sliders, greeting copy, composer hints, review prompts, and a subtle UI accent. You can still rename your curator and fine-tune sliders afterward.
+
+| Preset | Vibe | Good if you want… |
+|--------|------|-------------------|
+| **Classic Curator** | Warm film buff | Canon picks, double features, friendly deep cuts |
+| **Blunt Archivist** | Direct & data-driven | Gap analysis, purge advice, no fluff |
+| **Enthusiastic Scout** | Hype, but grounded | Excited recommendations that still match your taste |
+| **Academic Critic** | Analytical | Movements, craft, critical lineage |
+| **Night Owl Host** | Casual, tonight-focused | Short lists and finishable late-night picks |
+
+What changes when you switch presets:
+
+- **Welcome panel** — Greeting and starter chips on new conversations
+- **Typing indicator** — e.g. *Flemming is indexing your chaos…*
+- **Composer placeholder** — Rotating prompt ideas in the message box
+- **Review cards** — Persona-voiced near-completion rating prompts
+- **Ambient tint** — Background color blends preset accent with chat context
+- **Agent behavior** — System prompt and tool use (including review memory via `get_user_reviews`)
+
+Presets hot-reload: change persona in Config and return to chat — no server restart needed.
+- Inline **title cards** — poster, rating, genres, `recommendation_reason`, and **Why this?** to expand facet-match detail when the query engine provided it
+- **Confirm all** — bulk Radarr/Sonarr adds via in-chat buttons (not a center modal)
+- **Turnstyle overlay** — horizontal scroll overlay for expanded result sets (`Expand N titles…`); title cards support the same drag-to-dock behavior as inline chat cards
+- **Add to Radarr/Sonarr** — confirm in the status dock; server confirmation token required. Drag a movie or show card onto the dock to start the same confirm flow without clicking **Add to Radarr/Sonarr**
 - **Not interested** — `POST /api/preferences` with `dismiss` signal
-- **Ambient context** — inferred from conversation; backend may still accept `lens_id` for compatibility
+- **Ambient context** — inferred from conversation; shown as a tag under the thread title
+- **Message reactions** — thumbs up / thumbs down under each curator reply; your choice helps train future recommendations (stored per conversation)
+
+### Helpful / not helpful reactions
+
+After the curator answers, you may see **👍** and **👎** under that reply.
+
+- **👍 Helpful** — the suggestion or explanation matched what you wanted.
+- **👎 Not helpful** — the reply missed the mark.
+
+Tap the same button again to clear your choice for that message. Reactions are saved per conversation and help CuratorX learn your taste over time. They appear only on curator (assistant) messages, not on your own prompts.
+
+### Personal title reviews
+
+CuratorX keeps a **personal review log** for titles you have watched — separate from helpful/not-helpful reactions on curator replies.
+
+- After a **library sync** or **Plex webhook** (playback stop/scrobble), near-complete watches (≥85% through a movie or episode) may appear as an inline **rating card** at the bottom of the chat.
+- Cards use your **persona preset** opener (`review_prompt_templates`) — warm film-buff, blunt archivist, etc.
+- Use **1–5 stars**, optional short notes, then **Save review** or **Skip**. Skipping sets a 30-day cooldown before that title is prompted again.
+- Type **`/rate Title Name`** any time to rate a library title on demand.
+- The curator can run a **multi-turn review dialogue** via the `start_review_dialogue` agent tool — one persona-voiced question per turn before saving.
+- Title cards show **your stars** (gold badge on the poster and “Your rating” in the card body) when you have already reviewed that title.
+
+When a rating card appears in chat, CuratorX records `prompted_at` on the queue row (so the system knows you were shown the prompt, even if you skip without saving).
+
+Reviews are stored in SQLite (`user_title_reviews`) and feed taste training via preference signals.
+
+**Optional Plex sync:** In Configuration → Plex library mapping, enable **Sync personal reviews to Plex star ratings**. When on, each saved review pushes your stars to Plex (1★→2, 2★→4, … 5★→10 on Plex’s 0–10 scale). Your review is always saved locally even if Plex is unreachable.
+
+**Plex rating conflicts:** If Plex already has a different star rating when you save (from a rating card, `/rate`, or the curator's `save_user_review` tool), an inline **keep / replace** banner appears in chat: **Keep Plex rating** leaves Plex unchanged; **Replace on Plex** overwrites Plex with your CuratorX stars. The same banner appears on proactive rating cards when the REST API returns a 409 conflict.
+
+The curator can also propose **Plex collection** create/add actions; those require confirmation like Radarr/Sonarr adds.
 
 ---
 
@@ -67,6 +168,9 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 | GET | `/api/chat/stream` | SSE stream; query `message`, `session_id`, `lens_id` |
 | POST | `/api/library/sync` | Start Plex index job |
 | GET | `/api/library/stats` | Item counts and last sync |
+| GET | `/api/library/health` | Unwatched %, stale adds, rating coverage |
+| GET | `/api/library/purge-candidates` | Purge candidate title cards for `/purge` |
+| GET | `/api/admin/export/training-corpus` | Owner-only JSON export of taste-training tables |
 | GET | `/api/title/{media_type}/{id}` | Title detail (`id_type` query) |
 | GET | `/api/context/active` | Inferred ambient context label |
 
@@ -96,12 +200,49 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 | POST | `/api/actions/propose` | Create confirmation token |
 | POST | `/api/actions/confirm` | Execute or cancel pending action |
 | POST | `/api/preferences` | Record taste signal |
+| POST | `/api/chat/messages/{id}/feedback` | Mark assistant reply helpful or not helpful; send `"feedback": null` to clear |
+| DELETE | `/api/chat/messages/{id}/feedback?session_id=…` | Clear helpful/not-helpful reaction for a message |
+| GET | `/api/chat/threads/{id}/feedback` | List feedback for a thread |
+| GET | `/api/reviews` | List personal title reviews (filter by `rating_key`, `tmdb_id`, `title`, `min_stars`) |
+| POST | `/api/reviews` | Save or update a 1–5 star review |
+| GET | `/api/reviews/prompts` | Pending near-completion rating prompts (sets `prompted_at` when surfaced) |
+| POST | `/api/reviews/prompts/{id}/dismiss` | Skip a proactive rating prompt |
+| POST | `/api/webhooks/plex` | Plex play/stop/scrobble ingest for near-completion prompts |
+| GET | `/api/plex/collections` | List Plex collections (`media_type=movie\|show`; owner only) |
+| POST | `/api/plex/collections/propose` | Propose creating a Plex collection (returns confirmation token; owner only) |
+| POST | `/api/plex/collections/{key}/items/propose` | Propose adding titles to a collection (owner only) |
+| GET | `/api/features` | Feature flags (multi-user, Seerr, auth modes) |
+| GET | `/api/auth/me` | Current user when multi-user auth is enabled |
+| POST | `/api/auth/plex` | Plex token login (sets HttpOnly session cookie) |
+| POST | `/api/auth/logout` | Sign out |
+| GET | `/api/users` | Household user list (owner only) |
+| PATCH | `/api/users/{id}` | Update user role (owner only) |
+| GET | `/api/watchlist` | List pinned watchlist titles |
+| POST | `/api/watchlist` | Pin a title (`tmdb_id` or `tvdb_id`, `media_type`, `title`) |
+| DELETE | `/api/watchlist/{id}` | Remove a watchlist pin |
+| GET | `/api/engagement/streak` | Conversation count in last 30 days |
+| GET | `/api/persona/typing-phrases` | Persona-flavored typing indicator phrases |
+| GET | `/api/persona/ui-copy` | Persona UI strings (welcome, composer placeholders, review templates, accent) |
+
+---
+
+## Login flow (optional multi-user)
+
+When `features.multi_user_enabled` is `true` in settings:
+
+1. The app loads `GET /api/features` and `GET /api/auth/me`.
+2. If features show multi-user mode and `/api/auth/me` returns **401**, the browser redirects to **`/login`**.
+3. **Sign in with Plex** opens a token field (v1). Paste a Plex account token; CuratorX validates it with Plex.tv and stores a signed **HttpOnly** session cookie.
+4. After login, the main chat UI loads. The top bar shows an avatar menu with display name, role, and **Sign out**.
+5. **Owners** can open **Config → Multi-user auth** to manage roles and review Seerr linkage. **Members** see Seerr request buttons instead of Radarr/Sonarr adds when Seerr is enabled.
+
+When multi-user is **off** (default), there is no login screen and the bootstrap owner is used implicitly.
 
 ---
 
 ## Security
 
-No built-in authentication. Run on a trusted LAN or behind an authenticated reverse proxy. Destructive *arr operations always require confirmation tokens (10-minute TTL).
+Single-owner installs have no built-in authentication — run on a trusted LAN or behind an authenticated reverse proxy. When multi-user auth is enabled, Plex token login and signed session cookies protect the UI; set `CURATORX_SESSION_SECRET` in production. Destructive *arr operations always require confirmation tokens (10-minute TTL).
 
 ---
 

@@ -7,13 +7,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from curatorx.agent.tools import (
+    PLEX_COLLECTION_TOOL_NAMES,
+    SEERR_TOOL_NAMES,
     TOOL_DEFINITIONS,
     ToolRegistry,
     _append_recommendation_cards,
     _card_to_tool_item,
     build_system_prompt,
+    build_tool_definitions,
 )
-from curatorx.config_store import Settings
+from curatorx.config_store import FeatureFlags, Settings
 from curatorx.library.db import DEFAULT_LENS_ID, Database
 from curatorx.models.schemas import TitleCard
 
@@ -75,8 +78,147 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             "explore_genre",
             "what_to_watch_tonight",
             "analyze_watch_patterns",
+            "list_plex_collections",
+            "create_plex_collection",
+            "add_to_plex_collection",
+            "get_user_reviews",
+            "save_user_review",
+            "suggest_titles_to_rate",
+            "start_review_dialogue",
+            "query_watchlist",
+            "upcoming_premieres",
         ):
             self.assertIn(expected, names)
+
+    def test_build_tool_definitions_omits_disabled_features(self) -> None:
+        disabled = Settings(
+            features=FeatureFlags(
+                seerr_enabled=False,
+                plex_collections_enabled=False,
+            )
+        )
+        names = {tool["function"]["name"] for tool in build_tool_definitions(disabled)}
+        for omitted in PLEX_COLLECTION_TOOL_NAMES | SEERR_TOOL_NAMES:
+            self.assertNotIn(omitted, names)
+        self.assertIn("save_user_review", names)
+
+    def test_build_tool_definitions_includes_enabled_features(self) -> None:
+        enabled = Settings(
+            features=FeatureFlags(
+                seerr_enabled=True,
+                plex_collections_enabled=True,
+            )
+        )
+        names = {tool["function"]["name"] for tool in build_tool_definitions(enabled)}
+        for expected in PLEX_COLLECTION_TOOL_NAMES | SEERR_TOOL_NAMES:
+            self.assertIn(expected, names)
+
+    async def test_save_user_review_returns_conflict_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(
+                db,
+                Settings(plex_url="http://plex.test", plex_token="token", sync_reviews_to_plex=True),
+                DEFAULT_LENS_ID,
+            )
+            with patch(
+                "curatorx.reviews.plex_sync.lookup_plex_user_rating_stars",
+                return_value=5,
+            ), patch("curatorx.connectors.plex.PlexClient.set_user_rating"):
+                result = await registry.execute(
+                    "save_user_review",
+                    {
+                        "title": "Blade Runner",
+                        "media_type": "movie",
+                        "stars": 3,
+                        "rating_key": "555",
+                    },
+                )
+            payload = json.loads(result)
+            self.assertTrue(payload["saved"])
+            self.assertTrue(payload["plex_rating_conflict"])
+            self.assertEqual(payload["code"], "plex_rating_conflict")
+            self.assertEqual(payload["plex_stars"], 5)
+            self.assertEqual(payload["submitted_stars"], 3)
+            self.assertIn("replace_plex_rating=true", payload["message"])
+
+    async def test_save_user_review_force_replace_overwrites_plex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(
+                db,
+                Settings(plex_url="http://plex.test", plex_token="token", sync_reviews_to_plex=True),
+                DEFAULT_LENS_ID,
+            )
+            with patch(
+                "curatorx.reviews.plex_sync.lookup_plex_user_rating_stars",
+                return_value=5,
+            ), patch("curatorx.connectors.plex.PlexClient.set_user_rating") as mock_rate:
+                result = await registry.execute(
+                    "save_user_review",
+                    {
+                        "title": "Blade Runner",
+                        "media_type": "movie",
+                        "stars": 3,
+                        "rating_key": "555",
+                        "force_replace": True,
+                    },
+                )
+            payload = json.loads(result)
+            self.assertTrue(payload["review"]["plex_rating_synced"])
+            self.assertNotIn("plex_rating_conflict", payload)
+            mock_rate.assert_called_once_with("555", 3)
+
+    async def test_query_watchlist_returns_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.add_watchlist_pin(
+                pin_id="pin-1",
+                user_id=None,
+                tmdb_id=27205,
+                tvdb_id=None,
+                media_type="movie",
+                title="Inception",
+            )
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
+            result = await registry.execute("query_watchlist", {"limit": 10})
+            payload = json.loads(result)
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["items"][0]["title"], "Inception")
+
+    async def test_upcoming_premieres_without_tmdb_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
+            result = await registry.execute("upcoming_premieres", {})
+            payload = json.loads(result)
+            self.assertIn("error", payload)
+
+    async def test_query_library_attaches_facet_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "test.db")
+            db.upsert_library_item(
+                {
+                    "rating_key": "1",
+                    "media_type": "movie",
+                    "title": "Blade Runner",
+                    "genres": ["Sci-Fi"],
+                    "directors": ["Ridley Scott"],
+                    "view_count": 0,
+                }
+            )
+            from curatorx.library.facets import rebuild_library_facets
+
+            rebuild_library_facets(db)
+            registry = ToolRegistry(db, Settings(), DEFAULT_LENS_ID)
+            await registry.execute(
+                "query_library",
+                {"genres": "Sci-Fi", "directors": "Ridley Scott", "unwatched_only": True},
+            )
+            self.assertEqual(len(registry.cards), 1)
+            card = registry.cards[0]
+            self.assertIn("Sci-Fi", card.recommendation_reason)
+            self.assertTrue(any("Genre" in match for match in card.facet_matches))
 
     async def test_get_facet_catalog_directors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,6 +12,7 @@ from typing import Any, Dict, Generator, Iterable, List, Mapping, Optional, Sequ
 DEFAULT_LENS_ID = "general"
 DEFAULT_CONTEXT_HASH = "general"
 DEFAULT_PERSONA_ID = "current_profile"
+BOOTSTRAP_OWNER_ID = "bootstrap-owner"
 ACTIVE_LENS_CONFIG_KEY = "active_lens_id"
 ACTIVE_CONTEXT_CONFIG_KEY = "active_context_hash"
 CURATOR_NAME_CONFIG_KEY = "curator_name"
@@ -212,6 +213,9 @@ class Database:
             self._migrate_persona_columns(conn)
             self._migrate_library_intelligence(conn)
             self._migrate_library_indexes(conn)
+            self._migrate_phase0_tables(conn)
+            self._migrate_multi_user_columns(conn)
+            self._migrate_phase4_tables(conn)
             self._seed_defaults(conn)
 
     def _table_columns(self, conn: sqlite3.Connection, table: str) -> set[str]:
@@ -269,6 +273,41 @@ class Database:
                 WHERE connection_status = 'verified'
                 """
             )
+
+    def _migrate_phase0_tables(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email TEXT,
+                role TEXT NOT NULL CHECK (role IN ('owner', 'member', 'guest')),
+                plex_user_id TEXT UNIQUE,
+                plex_token_enc TEXT,
+                seerr_user_id INTEGER,
+                seerr_permissions INTEGER,
+                oidc_sub TEXT UNIQUE,
+                avatar_url TEXT,
+                created_at REAL NOT NULL,
+                last_login_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS message_feedback (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                user_id TEXT,
+                feedback_type TEXT NOT NULL CHECK (feedback_type IN ('helpful', 'not_helpful')),
+                excerpt TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES chat_messages(id) ON DELETE CASCADE,
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL,
+                UNIQUE(message_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_feedback_session ON message_feedback(session_id);
+            """
+        )
 
     def _migrate_library_indexes(self, conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_library_year ON library_items(year)")
@@ -353,6 +392,68 @@ class Database:
                 "ALTER TABLE curator_persona_metrics ADD COLUMN persona_prompt_override TEXT"
             )
 
+    def _migrate_multi_user_columns(self, conn: sqlite3.Connection) -> None:
+        session_cols = self._table_columns(conn, "chat_sessions")
+        if "user_id" not in session_cols:
+            conn.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT REFERENCES users(id)")
+
+    def _migrate_phase4_tables(self, conn: sqlite3.Connection) -> None:
+        item_cols = self._table_columns(conn, "library_items")
+        for name, typedef in {
+            "view_offset_ms": "INTEGER",
+            "duration_ms": "INTEGER",
+            "plex_user_rating_stars": "INTEGER",
+        }.items():
+            if name not in item_cols:
+                conn.execute(f"ALTER TABLE library_items ADD COLUMN {name} {typedef}")
+
+        episode_cols = self._table_columns(conn, "library_episodes")
+        for name, typedef in {
+            "view_offset_ms": "INTEGER",
+            "duration_ms": "INTEGER",
+            "plex_user_rating_stars": "INTEGER",
+        }.items():
+            if name not in episode_cols:
+                conn.execute(f"ALTER TABLE library_episodes ADD COLUMN {name} {typedef}")
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS user_title_reviews (
+                id TEXT PRIMARY KEY,
+                rating_key TEXT,
+                tmdb_id INTEGER,
+                tvdb_id INTEGER,
+                media_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                stars INTEGER CHECK (stars BETWEEN 1 AND 5),
+                review_text TEXT DEFAULT '',
+                review_tags TEXT DEFAULT '[]',
+                prompted_by TEXT DEFAULT 'user',
+                session_id TEXT,
+                lens_id TEXT,
+                plex_rating_synced INTEGER DEFAULT 0,
+                plex_synced_at REAL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reviews_rating_key ON user_title_reviews(rating_key);
+            CREATE INDEX IF NOT EXISTS idx_reviews_tmdb ON user_title_reviews(tmdb_id, media_type);
+
+            CREATE TABLE IF NOT EXISTS rating_prompt_queue (
+                id TEXT PRIMARY KEY,
+                rating_key TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                completion_pct REAL NOT NULL,
+                detected_at REAL NOT NULL,
+                prompted_at REAL,
+                dismissed_at REAL,
+                review_id TEXT,
+                UNIQUE(rating_key)
+            );
+            """
+        )
+
     def _migrate_phase3_tables(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
             """
@@ -383,6 +484,24 @@ class Database:
                 connection_status AS verification_state,
                 last_tested_at AS synchronized_at
             FROM service_integrations;
+
+            CREATE TABLE IF NOT EXISTS watchlist_pins (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                tmdb_id INTEGER,
+                tvdb_id INTEGER,
+                media_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_watchlist_pins_user ON watchlist_pins(user_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_pins_identity ON watchlist_pins(
+                COALESCE(user_id, ''),
+                media_type,
+                COALESCE(tmdb_id, -1),
+                COALESCE(tvdb_id, -1)
+            );
             """
         )
 
@@ -431,6 +550,258 @@ class Database:
             """,
             (CURATOR_NAME_CONFIG_KEY, "Curator"),
         )
+        self.ensure_bootstrap_owner(conn)
+
+    def ensure_bootstrap_owner(self, conn: Optional[sqlite3.Connection] = None) -> None:
+        now = time.time()
+        if conn is not None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO users (id, display_name, email, role, created_at)
+                VALUES (?, 'Owner', NULL, 'owner', ?)
+                """,
+                (BOOTSTRAP_OWNER_ID, now),
+            )
+            return
+        with self.connect() as managed:
+            self.ensure_bootstrap_owner(managed)
+
+    def get_user(self, user_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+    def get_user_by_plex_id(self, plex_user_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM users WHERE plex_user_id = ?",
+                (plex_user_id,),
+            ).fetchone()
+
+    def count_users_with_role(self, role: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE role = ?",
+                (role,),
+            ).fetchone()
+            return int(row["count"] or 0) if row else 0
+
+    def count_users_with_plex_id(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE plex_user_id IS NOT NULL",
+            ).fetchone()
+            return int(row["count"] or 0) if row else 0
+
+    def upsert_plex_user(
+        self,
+        *,
+        user_id: str,
+        display_name: str,
+        email: Optional[str],
+        plex_user_id: str,
+        role: str,
+        avatar_url: Optional[str] = None,
+        seerr_user_id: Optional[int] = None,
+        seerr_permissions: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, display_name, email, role, plex_user_id, avatar_url,
+                    seerr_user_id, seerr_permissions, created_at, last_login_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plex_user_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    avatar_url = excluded.avatar_url,
+                    seerr_user_id = COALESCE(excluded.seerr_user_id, users.seerr_user_id),
+                    seerr_permissions = COALESCE(excluded.seerr_permissions, users.seerr_permissions),
+                    last_login_at = excluded.last_login_at
+                """,
+                (
+                    user_id,
+                    display_name,
+                    email,
+                    role,
+                    plex_user_id,
+                    avatar_url,
+                    seerr_user_id,
+                    seerr_permissions,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM users WHERE plex_user_id = ?", (plex_user_id,)).fetchone()
+        assert row is not None
+        return self._row_to_user(row)
+
+    def list_users(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._row_to_user(row) for row in rows]
+
+    def update_user_role(self, user_id: str, role: str) -> Dict[str, Any]:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if existing is None:
+                raise ValueError("User not found")
+            conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        assert row is not None
+        return self._row_to_user(row)
+
+    def update_user_seerr(
+        self,
+        user_id: str,
+        *,
+        seerr_user_id: int,
+        seerr_permissions: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        with self.connect() as conn:
+            existing = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            if existing is None:
+                raise ValueError("User not found")
+            conn.execute(
+                """
+                UPDATE users
+                SET seerr_user_id = ?, seerr_permissions = ?
+                WHERE id = ?
+                """,
+                (seerr_user_id, seerr_permissions, user_id),
+            )
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        assert row is not None
+        return self._row_to_user(row)
+
+    def _row_to_user(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "display_name": str(row["display_name"]),
+            "email": str(row["email"]) if row["email"] is not None else None,
+            "role": str(row["role"]),
+            "plex_user_id": str(row["plex_user_id"]) if row["plex_user_id"] is not None else None,
+            "seerr_user_id": int(row["seerr_user_id"]) if row["seerr_user_id"] is not None else None,
+            "seerr_permissions": int(row["seerr_permissions"]) if row["seerr_permissions"] is not None else None,
+            "avatar_url": str(row["avatar_url"]) if row["avatar_url"] is not None else None,
+            "created_at": float(row["created_at"]),
+            "last_login_at": float(row["last_login_at"]) if row["last_login_at"] is not None else None,
+        }
+
+    def get_chat_message(self, message_id: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM chat_messages WHERE id = ?", (message_id,)).fetchone()
+
+    def upsert_message_feedback(
+        self,
+        *,
+        feedback_id: str,
+        message_id: str,
+        session_id: str,
+        user_id: Optional[str],
+        feedback_type: str,
+        excerpt: str,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO message_feedback (
+                    id, message_id, session_id, user_id, feedback_type, excerpt, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(message_id, user_id) DO UPDATE SET
+                    feedback_type = excluded.feedback_type,
+                    excerpt = excluded.excerpt,
+                    created_at = excluded.created_at
+                """,
+                (feedback_id, message_id, session_id, user_id, feedback_type, excerpt, now),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM message_feedback
+                WHERE message_id = ? AND (
+                    (user_id IS NULL AND ? IS NULL) OR user_id = ?
+                )
+                """,
+                (message_id, user_id, user_id),
+            ).fetchone()
+        assert row is not None
+        return {
+            "id": str(row["id"]),
+            "message_id": str(row["message_id"]),
+            "session_id": str(row["session_id"]),
+            "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+            "feedback": str(row["feedback_type"]),
+            "excerpt": str(row["excerpt"] or ""),
+            "created_at": float(row["created_at"]),
+        }
+
+    def list_message_feedback(
+        self,
+        session_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            if user_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM message_feedback
+                    WHERE session_id = ? AND user_id IS NULL
+                    ORDER BY created_at ASC
+                    """,
+                    (session_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM message_feedback
+                    WHERE session_id = ? AND user_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (session_id, user_id),
+                ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "message_id": str(row["message_id"]),
+                "session_id": str(row["session_id"]),
+                "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+                "feedback": str(row["feedback_type"]),
+                "excerpt": str(row["excerpt"] or ""),
+                "created_at": float(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def delete_message_feedback(
+        self,
+        message_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        with self.connect() as conn:
+            if user_id is None:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM message_feedback
+                    WHERE message_id = ? AND user_id IS NULL
+                    """,
+                    (message_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM message_feedback
+                    WHERE message_id = ? AND user_id = ?
+                    """,
+                    (message_id, user_id),
+                )
+            return cursor.rowcount > 0
 
     def ensure_seed_data(self) -> None:
         with self.connect() as conn:
@@ -458,8 +829,9 @@ class Database:
                     runtime_minutes, content_rating, vote_average, original_language, countries,
                     season_count, leaf_count, viewed_leaf_count,
                     unwatched_episode_count, total_episode_count,
-                    last_episode_watched_at, last_episode_sync_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_episode_watched_at, last_episode_sync_at, view_offset_ms, duration_ms,
+                    plex_user_rating_stars, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rating_key) DO UPDATE SET
                     media_type=excluded.media_type,
                     title=excluded.title,
@@ -498,6 +870,9 @@ class Database:
                     total_episode_count=excluded.total_episode_count,
                     last_episode_watched_at=excluded.last_episode_watched_at,
                     last_episode_sync_at=excluded.last_episode_sync_at,
+                    view_offset_ms=excluded.view_offset_ms,
+                    duration_ms=excluded.duration_ms,
+                    plex_user_rating_stars=excluded.plex_user_rating_stars,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -533,6 +908,9 @@ class Database:
                     item.get("total_episode_count", 0),
                     item.get("last_episode_watched_at"),
                     item.get("last_episode_sync_at"),
+                    item.get("view_offset_ms"),
+                    item.get("duration_ms"),
+                    item.get("plex_user_rating_stars"),
                     now,
                 ),
             )
@@ -713,8 +1091,9 @@ class Database:
                 """
                 INSERT INTO library_episodes (
                     show_item_id, rating_key, season_number, episode_number, title,
-                    runtime_minutes, view_count, last_viewed_at, file_size, aired_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    runtime_minutes, view_count, last_viewed_at, file_size, aired_at,
+                    view_offset_ms, duration_ms, plex_user_rating_stars
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rating_key) DO UPDATE SET
                     show_item_id=excluded.show_item_id,
                     season_number=excluded.season_number,
@@ -724,7 +1103,10 @@ class Database:
                     view_count=excluded.view_count,
                     last_viewed_at=excluded.last_viewed_at,
                     file_size=excluded.file_size,
-                    aired_at=excluded.aired_at
+                    aired_at=excluded.aired_at,
+                    view_offset_ms=excluded.view_offset_ms,
+                    duration_ms=excluded.duration_ms,
+                    plex_user_rating_stars=excluded.plex_user_rating_stars
                 """,
                 (
                     episode["show_item_id"],
@@ -737,6 +1119,9 @@ class Database:
                     episode.get("last_viewed_at"),
                     episode.get("file_size", 0),
                     episode.get("aired_at"),
+                    episode.get("view_offset_ms"),
+                    episode.get("duration_ms"),
+                    episode.get("plex_user_rating_stars"),
                 ),
             )
             row = conn.execute(
@@ -839,6 +1224,24 @@ class Database:
                     (limit,),
                 ).fetchall()
             )
+
+    def export_training_corpus(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            feedback_rows = conn.execute(
+                "SELECT * FROM message_feedback ORDER BY created_at ASC"
+            ).fetchall()
+            fact_rows = conn.execute(
+                "SELECT * FROM preference_facts ORDER BY created_at ASC"
+            ).fetchall()
+            review_rows = conn.execute(
+                "SELECT * FROM user_title_reviews ORDER BY created_at ASC"
+            ).fetchall()
+        return {
+            "exported_at": time.time(),
+            "message_feedback": [dict(row) for row in feedback_rows],
+            "preference_facts": [dict(row) for row in fact_rows],
+            "user_title_reviews": [dict(row) for row in review_rows],
+        }
 
     def save_pending_action(self, token: str, action_type: str, payload: Mapping[str, Any], ttl_seconds: int = 600) -> None:
         now = time.time()
@@ -1241,6 +1644,7 @@ class Database:
         lens_id: str = DEFAULT_LENS_ID,
         context_hash: str = DEFAULT_CONTEXT_HASH,
         thread_title: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = time.time()
         resolved_lens = lens_id or DEFAULT_LENS_ID
@@ -1250,18 +1654,24 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO chat_sessions (
-                    id, created_at, updated_at, lens_id, thread_title, context_hash
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    id, created_at, updated_at, lens_id, thread_title, context_hash, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, now, now, resolved_lens, title, resolved_context),
+                (session_id, now, now, resolved_lens, title, resolved_context, user_id),
             )
             row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
         assert row is not None
         return self._row_to_thread_summary(row)
 
-    def get_chat_thread(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_chat_thread(self, session_id: str, *, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+            if user_id is None:
+                row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM chat_sessions WHERE id = ? AND (user_id IS NULL OR user_id = ?)",
+                    (session_id, user_id),
+                ).fetchone()
             if not row:
                 return None
             count_row = conn.execute(
@@ -1446,3 +1856,102 @@ class Database:
                     }
                 )
             return messages
+
+    def list_watchlist_pins(self, *, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            if user_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM watchlist_pins
+                    WHERE user_id IS NULL
+                    ORDER BY created_at DESC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM watchlist_pins
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    """,
+                    (user_id,),
+                ).fetchall()
+        return [self._row_to_watchlist_pin(row) for row in rows]
+
+    def add_watchlist_pin(
+        self,
+        *,
+        pin_id: str,
+        user_id: Optional[str],
+        tmdb_id: Optional[int],
+        tvdb_id: Optional[int],
+        media_type: str,
+        title: str,
+    ) -> Dict[str, Any]:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watchlist_pins (
+                    id, user_id, tmdb_id, tvdb_id, media_type, title, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (pin_id, user_id, tmdb_id, tvdb_id, media_type, title, now),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM watchlist_pins
+                WHERE media_type = ?
+                  AND COALESCE(tmdb_id, -1) = COALESCE(?, -1)
+                  AND COALESCE(tvdb_id, -1) = COALESCE(?, -1)
+                  AND (
+                    (user_id IS NULL AND ? IS NULL) OR user_id = ?
+                  )
+                """,
+                (media_type, tmdb_id, tvdb_id, user_id, user_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Could not save watchlist pin")
+        return self._row_to_watchlist_pin(row)
+
+    def delete_watchlist_pin(self, pin_id: str, *, user_id: Optional[str] = None) -> bool:
+        with self.connect() as conn:
+            if user_id is None:
+                row = conn.execute(
+                    """
+                    SELECT id FROM watchlist_pins
+                    WHERE id = ? AND user_id IS NULL
+                    """,
+                    (pin_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM watchlist_pins WHERE id = ? AND user_id = ?",
+                    (pin_id, user_id),
+                ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM watchlist_pins WHERE id = ?", (pin_id,))
+            return True
+
+    def count_chat_sessions_last_days(self, days: int = 30) -> int:
+        cutoff = time.time() - (days * 86400)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM chat_sessions WHERE created_at >= ?",
+                (cutoff,),
+            ).fetchone()
+        return int(row["count"] or 0) if row else 0
+
+    @staticmethod
+    def _row_to_watchlist_pin(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+            "tmdb_id": int(row["tmdb_id"]) if row["tmdb_id"] is not None else None,
+            "tvdb_id": int(row["tvdb_id"]) if row["tvdb_id"] is not None else None,
+            "media_type": str(row["media_type"]),
+            "title": str(row["title"]),
+            "created_at": float(row["created_at"]),
+        }

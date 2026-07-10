@@ -32,12 +32,15 @@ export function formatApiError(error) {
 
 export async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, {
+    credentials: "include",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(parseApiErrorBody(text, response.statusText));
+    const error = new Error(parseApiErrorBody(text, response.statusText));
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) return null;
   return response.json();
@@ -73,6 +76,132 @@ export async function createThread(payload = {}) {
 
 export async function getThreadMessages(sessionId) {
   return api(`/chat/threads/${encodeURIComponent(sessionId)}/messages`);
+}
+
+export async function getFeatures() {
+  return api("/features");
+}
+
+export async function getAuthMe() {
+  const response = await fetch(`${API}/auth/me`, {
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (response.status === 401) {
+    return null;
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(parseApiErrorBody(text, response.statusText));
+  }
+  return response.json();
+}
+
+export async function loginWithPlex(authToken) {
+  return api("/auth/plex", {
+    method: "POST",
+    body: JSON.stringify({ auth_token: authToken }),
+  });
+}
+
+export async function logout() {
+  return api("/auth/logout", { method: "POST" });
+}
+
+export async function listUsers() {
+  return api("/users");
+}
+
+export async function updateUserRole(userId, role) {
+  return api(`/users/${encodeURIComponent(userId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ role }),
+  });
+}
+
+export async function syncUserSeerr(userId, authToken) {
+  return api(`/users/${encodeURIComponent(userId)}/sync-seerr`, {
+    method: "POST",
+    body: JSON.stringify({ auth_token: authToken }),
+  });
+}
+
+export async function listSeerrRequests(params = {}) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      search.set(key, String(value));
+    }
+  }
+  const query = search.toString();
+  return api(`/requests${query ? `?${query}` : ""}`);
+}
+
+export async function getThreadFeedback(sessionId) {
+  return api(`/chat/threads/${encodeURIComponent(sessionId)}/feedback`);
+}
+
+export async function submitMessageFeedback(messageId, sessionId, feedback) {
+  if (!feedback) {
+    const query = new URLSearchParams({ session_id: sessionId });
+    return api(
+      `/chat/messages/${encodeURIComponent(messageId)}/feedback?${query.toString()}`,
+      { method: "DELETE" },
+    );
+  }
+  return api(`/chat/messages/${encodeURIComponent(messageId)}/feedback`, {
+    method: "POST",
+    body: JSON.stringify({ session_id: sessionId, feedback }),
+  });
+}
+
+export async function listReviews(params = {}) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      search.set(key, String(value));
+    }
+  }
+  const query = search.toString();
+  return api(`/reviews${query ? `?${query}` : ""}`);
+}
+
+export async function saveReview(payload) {
+  const response = await fetch(`${API}/reviews`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const text = await response.text();
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = null;
+    }
+  }
+  if (response.status === 409 && data?.detail?.code === "plex_rating_conflict") {
+    const conflict = new Error(data.detail.message || "Plex rating conflict");
+    conflict.code = "plex_rating_conflict";
+    conflict.conflict = data.detail;
+    throw conflict;
+  }
+  if (!response.ok) {
+    throw new Error(parseApiErrorBody(text, response.statusText));
+  }
+  return data;
+}
+
+export async function listReviewPrompts(limit = 5) {
+  return api(`/reviews/prompts?limit=${encodeURIComponent(limit)}`);
+}
+
+export async function dismissReviewPrompt(promptId) {
+  return api(`/reviews/prompts/${encodeURIComponent(promptId)}/dismiss`, {
+    method: "POST",
+  });
 }
 
 export async function updateThreadTitle(sessionId, threadTitle) {
@@ -166,6 +295,31 @@ export async function putSystemConfig(values) {
     method: "PUT",
     body: JSON.stringify({ values }),
   });
+}
+
+export async function listWatchlist() {
+  return api("/watchlist");
+}
+
+export async function addWatchlistPin(payload) {
+  return api("/watchlist", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function removeWatchlistPin(pinId) {
+  return api(`/watchlist/${encodeURIComponent(pinId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function getEngagementStreak() {
+  return api("/engagement/streak");
+}
+
+export async function getTypingPhrases() {
+  return api("/persona/typing-phrases");
 }
 
 export async function listJobs() {
@@ -333,6 +487,7 @@ export const AUTO_CERTIFY_SERVICES = [
   "tmdb",
   "fanart",
   "tautulli",
+  "seerr",
 ];
 
 export async function getWizardStatus() {
@@ -341,6 +496,14 @@ export async function getWizardStatus() {
 
 export async function getActiveContext() {
   return api("/context/active");
+}
+
+export async function getLibraryStats() {
+  return api("/library/stats");
+}
+
+export async function startLibrarySync() {
+  return api("/library/sync", { method: "POST" });
 }
 
 export async function getPlexSections() {
@@ -363,10 +526,26 @@ export async function saveSettings(payload) {
 }
 
 export async function testService(service, settings) {
+  const payload = {
+    ...settings,
+    seerr_url: settings?.seerr?.url ?? settings?.seerr_url ?? "",
+    seerr_api_key: settings?.seerr?.api_key ?? settings?.seerr_api_key ?? "",
+  };
   return api(`/setup/test/${service}`, {
     method: "POST",
-    body: JSON.stringify(settings),
+    body: JSON.stringify(payload),
   });
+}
+
+export async function listRequests(params = {}) {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      search.set(key, String(value));
+    }
+  }
+  const query = search.toString();
+  return api(`/requests${query ? `?${query}` : ""}`);
 }
 
 export async function proposeAction(body) {

@@ -6,9 +6,11 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Type
+
+NESTED_SETTINGS_TYPES: Dict[str, Type[Any]] = {}
 
 ENV_TO_FIELD = {
     "PLEX_URL": "plex_url",
@@ -36,6 +38,7 @@ ENV_TO_FIELD = {
     "LLM_MODEL": "llm_model",
     "LLM_EMBEDDING_MODEL": "llm_embedding_model",
     "LLM_EMBEDDING_BASE_URL": "llm_embedding_base_url",
+    "CURATORX_WEBHOOK_SECRET": "webhook_secret",
 }
 
 FIELD_TO_ENV = {value: key for key, value in ENV_TO_FIELD.items()}
@@ -318,6 +321,39 @@ def sonarr_add_configuration_error(settings: Settings) -> str | None:
     return None
 
 
+def plex_configuration_error(settings: Settings) -> str | None:
+    if not str(settings.plex_url or "").strip() or not str(settings.plex_token or "").strip():
+        return "Plex is not configured. Add Plex URL and token in Configuration."
+    return None
+
+
+def seerr_configuration_error(settings: Settings) -> str | None:
+    if not settings.features.seerr_enabled:
+        return "Seerr is not enabled. Turn on features.seerr_enabled in Configuration."
+    if not str(settings.seerr.url or "").strip() or not str(settings.seerr.api_key or "").strip():
+        return "Seerr is not configured. Add Seerr URL and API key in Configuration."
+    return None
+
+
+def uses_seerr_request_path(settings: Settings, *, role: str) -> bool:
+    return bool(settings.features.seerr_enabled and str(role or "").lower() != "owner")
+
+
+def plex_collections_configuration_error(settings: Settings) -> str | None:
+    if not settings.features.plex_collections_enabled:
+        return (
+            "Plex collection management is not enabled. "
+            "Turn on features.plex_collections_enabled in Configuration."
+        )
+    return plex_configuration_error(settings)
+
+
+def resolve_plex_section(settings: Settings, media_type: str) -> str:
+    if media_type == "movie":
+        return str(settings.plex_movie_section or "").strip()
+    return str(settings.plex_tv_section or "").strip()
+
+
 def normalize_path_settings(settings: Settings) -> Settings:
     fresh = Settings()
     merged = asdict(settings)
@@ -439,6 +475,38 @@ def resolve_llm_base_url(provider: str, base_url: str = "") -> str:
 
 
 @dataclass
+class FeatureFlags:
+    multi_user_enabled: bool = False
+    seerr_enabled: bool = False
+    plex_collections_enabled: bool = False
+
+
+@dataclass
+class AuthSettings:
+    mode: str = "disabled"
+    plex_login_enabled: bool = True
+    oidc_enabled: bool = False
+    local_login_enabled: bool = False
+
+
+@dataclass
+class SeerrSettings:
+    url: str = ""
+    api_key: str = ""
+    link_on_login: bool = True
+    require_linked_user_for_requests: bool = False
+
+
+NESTED_SETTINGS_TYPES.update(
+    {
+        "features": FeatureFlags,
+        "auth": AuthSettings,
+        "seerr": SeerrSettings,
+    }
+)
+
+
+@dataclass
 class Settings:
     plex_url: str = ""
     plex_token: str = ""
@@ -469,6 +537,11 @@ class Settings:
     setup_wizard_pending: bool = False
     library_sync_interval_hours: int = 24
     tv_page_size: int = 500
+    sync_reviews_to_plex: bool = True
+    webhook_secret: str = ""
+    features: FeatureFlags = field(default_factory=FeatureFlags)
+    auth: AuthSettings = field(default_factory=AuthSettings)
+    seerr: SeerrSettings = field(default_factory=SeerrSettings)
 
     def apply_to_environ(self) -> None:
         for env_name, field_name in ENV_TO_FIELD.items():
@@ -484,7 +557,12 @@ class Settings:
             if key not in data:
                 continue
             value = data[key]
-            if key.endswith("_id") and value is not None:
+            nested_cls = NESTED_SETTINGS_TYPES.get(key)
+            if nested_cls and isinstance(value, Mapping):
+                nested_known = {field.name for field in nested_cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+                nested_filtered = {k: v for k, v in value.items() if k in nested_known}
+                filtered[key] = nested_cls(**nested_filtered)
+            elif key.endswith("_id") and value is not None:
                 filtered[key] = int(value)
             elif key.endswith("_hours") or key == "tv_page_size":
                 filtered[key] = int(value) if value is not None else value
@@ -591,6 +669,7 @@ def secret_field_sources(data_dir: Path) -> Dict[str, str]:
         "fanart_api_key",
         "tautulli_api_key",
         "llm_api_key",
+        "webhook_secret",
     )
     for field in secret_fields:
         if _file_field_explicitly_set(file_data, field):

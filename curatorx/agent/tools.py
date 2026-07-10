@@ -10,14 +10,17 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from curatorx.config_store import (
     Settings,
+    plex_collections_configuration_error,
     radarr_add_configuration_error,
     resolve_radarr_root_folder,
     resolve_sonarr_root_folder,
+    seerr_configuration_error,
     sonarr_add_configuration_error,
     validate_arr_root_folder,
 )
 from curatorx.connectors.arr_errors import ArrTitleExistsError
 from curatorx.connectors.radarr import RadarrClient
+from curatorx.connectors.seerr import SeerrClient
 from curatorx.connectors.sonarr import SonarrClient
 from curatorx.connectors.tmdb import TMDBClient
 from curatorx.library.db import Database
@@ -27,6 +30,7 @@ from curatorx.library.query import (
     LibraryFilters,
     _build_where,
     aggregate_library,
+    build_facet_match_details,
     filters_from_mapping,
     format_overview_for_prompt,
     library_overview,
@@ -40,6 +44,8 @@ from curatorx.library.titles import get_title_detail
 from curatorx.models.schemas import TitleCard
 from curatorx.preferences.purge import suggest_purge_candidates
 from curatorx.preferences.store import preference_context, remember_preference
+from curatorx.reviews.store import get_reviews, list_pending_prompts, mark_prompts_surfaced, save_review
+from curatorx.reviews.plex_sync import sync_review_rating_to_plex
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +143,72 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
                 "type": "object",
                 "properties": {"tvdb_id": {"type": "integer"}, "title": {"type": "string"}},
                 "required": ["tvdb_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_via_seerr",
+            "description": (
+                "Queue a movie or TV show request in Seerr for household members. "
+                "Returns a confirmation token by default; set require_confirmation=false to submit immediately."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "tmdb_id": {"type": "integer"},
+                    "tvdb_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "require_confirmation": {
+                        "type": "boolean",
+                        "description": "When false, submit the Seerr request immediately.",
+                    },
+                },
+                "required": ["media_type", "tmdb_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_seerr_request",
+            "description": "Approve a pending Seerr media request by request id (owner only).",
+            "parameters": {
+                "type": "object",
+                "properties": {"request_id": {"type": "integer"}},
+                "required": ["request_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_seerr_movie",
+            "description": "Search Seerr/Overseerr for movies to request (requires Seerr enabled).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Movie title to search"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_seerr_tv",
+            "description": "Search Seerr/Overseerr for TV shows to request (requires Seerr enabled).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "TV show title to search"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -439,7 +511,224 @@ TOOL_DEFINITIONS: List[Mapping[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_reviews",
+            "description": "Query the user's personal title reviews by title, rating, or media type.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "rating_key": {"type": "string"},
+                    "tmdb_id": {"type": "integer"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "min_stars": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_user_review",
+            "description": "Save or update a 1-5 star personal review for a watched title.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "stars": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "review_text": {"type": "string"},
+                    "review_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "rating_key": {"type": "string"},
+                    "tmdb_id": {"type": "integer"},
+                    "tvdb_id": {"type": "integer"},
+                    "replace_plex_rating": {
+                        "type": "boolean",
+                        "description": "Overwrite an existing Plex star rating when it differs.",
+                    },
+                    "force_replace": {
+                        "type": "boolean",
+                        "description": "Alias for replace_plex_rating.",
+                    },
+                },
+                "required": ["title", "media_type", "stars"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_titles_to_rate",
+            "description": "List watched or near-complete titles that do not have a personal review yet.",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "start_review_dialogue",
+            "description": (
+                "Start a persona-voiced multi-turn review dialogue for a title. "
+                "Returns an opener from review_prompt_templates plus follow-up questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "rating_key": {"type": "string"},
+                    "template_key": {
+                        "type": "string",
+                        "enum": ["near_complete", "rewatch", "family"],
+                    },
+                    "completion_pct": {"type": "number"},
+                },
+                "required": ["title", "media_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_watchlist",
+            "description": "List titles the user pinned to their personal watchlist.",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upcoming_premieres",
+            "description": (
+                "List upcoming episode premieres for TV shows in the user's library "
+                "using TMDB next_episode_to_air metadata."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "days_ahead": {
+                        "type": "integer",
+                        "description": "How many days ahead to include (default 14)",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_plex_collections",
+            "description": "List Plex collections in the user's movie or TV library section.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                },
+                "required": ["media_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_plex_collection",
+            "description": (
+                "Propose creating a Plex collection in the user's library. "
+                "Returns a confirmation token before any Plex write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Collection name"},
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "rating_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional initial Plex rating keys to include",
+                    },
+                },
+                "required": ["title", "media_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_to_plex_collection",
+            "description": (
+                "Propose adding owned titles to an existing Plex collection. "
+                "Returns a confirmation token before any Plex write."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "collection_title": {
+                        "type": "string",
+                        "description": "Existing collection title (case-insensitive match)",
+                    },
+                    "collection_rating_key": {
+                        "type": "string",
+                        "description": "Existing collection rating key (preferred when known)",
+                    },
+                    "media_type": {"type": "string", "enum": ["movie", "show"]},
+                    "rating_keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Plex rating keys to add",
+                    },
+                },
+                "required": ["media_type", "rating_keys"],
+            },
+        },
+    },
 ]
+
+
+PLEX_COLLECTION_TOOL_NAMES = frozenset(
+    {
+        "list_plex_collections",
+        "create_plex_collection",
+        "add_to_plex_collection",
+    }
+)
+
+SEERR_TOOL_NAMES = frozenset(
+    {
+        "request_via_seerr",
+        "approve_seerr_request",
+        "search_seerr_movie",
+        "search_seerr_tv",
+    }
+)
+
+
+def build_tool_definitions(settings: Settings) -> List[Mapping[str, Any]]:
+    """Return LLM tool schemas with feature-gated tools omitted when disabled."""
+    omitted: set[str] = set()
+    if not settings.features.plex_collections_enabled:
+        omitted |= PLEX_COLLECTION_TOOL_NAMES
+    if not settings.features.seerr_enabled:
+        omitted |= SEERR_TOOL_NAMES
+    if not omitted:
+        return list(TOOL_DEFINITIONS)
+    return [
+        tool
+        for tool in TOOL_DEFINITIONS
+        if str((tool.get("function") or {}).get("name") or "") not in omitted
+    ]
 
 
 def _tmdb_result_year(item: Mapping[str, Any]) -> Optional[int]:
@@ -475,6 +764,35 @@ def _tmdb_search_item_to_tool_item(item: Mapping[str, Any], media_type: str) -> 
         external = item.get("external_ids") or {}
         if external.get("tvdb_id"):
             payload["tvdb_id"] = int(external["tvdb_id"])
+    return payload
+
+
+def _seerr_result_year(item: Mapping[str, Any]) -> Optional[int]:
+    date = item.get("releaseDate") or item.get("firstAirDate") or item.get("release_date") or ""
+    if not date:
+        return None
+    try:
+        return int(str(date)[:4])
+    except ValueError:
+        return None
+
+
+def _seerr_search_item_to_tool_item(item: Mapping[str, Any], media_type: str) -> Dict[str, Any]:
+    title = str(item.get("title") or item.get("name") or "")
+    overview = str(item.get("overview") or "")
+    payload: Dict[str, Any] = {
+        "title": title,
+        "year": _seerr_result_year(item),
+        "media_type": media_type,
+        "overview": overview[:200] if overview else "",
+        "in_library": False,
+    }
+    tmdb_id = item.get("tmdbId") or item.get("tmdb_id")
+    tvdb_id = item.get("tvdbId") or item.get("tvdb_id")
+    if tmdb_id is not None:
+        payload["tmdb_id"] = int(tmdb_id)
+    if tvdb_id is not None:
+        payload["tvdb_id"] = int(tvdb_id)
     return payload
 
 
@@ -585,11 +903,22 @@ def _detail_to_tool_payload(detail: Any, settings: Settings) -> Dict[str, Any]:
     return payload
 
 
-def _attach_query_cards(registry: "ToolRegistry", db: Database, items: List[Mapping[str, Any]]) -> None:
+def _attach_query_cards(
+    registry: "ToolRegistry",
+    db: Database,
+    items: List[Mapping[str, Any]],
+    filters: Optional[LibraryFilters] = None,
+) -> None:
     for item in items:
         row = db.library_item_by_id(int(item["id"])) if item.get("id") else None
         if row is not None:
-            registry._cards.append(row_to_title_card(row, reason="In your library"))
+            reason = "In your library"
+            facet_matches: List[str] = []
+            if filters is not None:
+                reason, facet_matches = build_facet_match_details(filters, item)
+            registry._cards.append(
+                row_to_title_card(row, reason=reason, facet_matches=facet_matches)
+            )
 
 
 def _append_recommendation_cards(registry: "ToolRegistry", cards: List[TitleCard]) -> None:
@@ -599,13 +928,22 @@ def _append_recommendation_cards(registry: "ToolRegistry", cards: List[TitleCard
 
 
 class ToolRegistry:
-    def __init__(self, db: Database, settings: Settings, lens_id: str) -> None:
+    def __init__(
+        self,
+        db: Database,
+        settings: Settings,
+        lens_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> None:
         self.db = db
         self.settings = settings
         self.lens_id = lens_id
+        self.user_id = user_id
         self._cards: List[TitleCard] = []
         self._pending_tokens: List[str] = []
         self._recommendation_context = False
+        self._review_conflicts: List[Dict[str, Any]] = []
 
     @property
     def cards(self) -> List[TitleCard]:
@@ -618,6 +956,10 @@ class ToolRegistry:
     @property
     def pending_tokens(self) -> List[str]:
         return list(self._pending_tokens)
+
+    @property
+    def review_conflicts(self) -> List[Dict[str, Any]]:
+        return list(self._review_conflicts)
 
     async def execute(self, name: str, arguments: Mapping[str, Any]) -> str:
         handler: Optional[Callable] = getattr(self, f"_tool_{name}", None)
@@ -656,7 +998,7 @@ class ToolRegistry:
             result = await query_library_async(self.db, filters, self.settings)
         else:
             result = query_library(self.db, filters)
-        _attach_query_cards(self, self.db, result["items"])
+        _attach_query_cards(self, self.db, result["items"], filters)
         maybe_set_audit_context_label(self.db, filters)
         payload = {
             **result,
@@ -881,6 +1223,103 @@ class ToolRegistry:
         self.db.save_pending_action(token, "add_sonarr", payload)
         self._pending_tokens.append(token)
         return json.dumps({"confirmation_token": token, "message": "Awaiting user confirmation to add to Sonarr"})
+
+    async def _tool_request_via_seerr(self, args: Mapping[str, Any]) -> str:
+        config_error = seerr_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        media_type = str(args.get("media_type") or "movie")
+        tmdb_id = int(args["tmdb_id"])
+        tvdb_id = args.get("tvdb_id")
+        title = str(args.get("title") or "")
+        require_confirmation = bool(args.get("require_confirmation", True))
+        pending_payload: Dict[str, Any] = {
+            "action": "request_seerr",
+            "media_type": media_type,
+            "tmdb_id": tmdb_id,
+            "title": title,
+        }
+        if tvdb_id is not None:
+            pending_payload["tvdb_id"] = int(tvdb_id)
+        if not require_confirmation:
+            client = SeerrClient(self.settings.seerr.url, self.settings.seerr.api_key)
+            result = client.create_request(
+                media_type,
+                tmdb_id,
+                tvdb_id=int(tvdb_id) if tvdb_id is not None else None,
+            )
+            return json.dumps(
+                {
+                    "requested": True,
+                    "request_id": result.get("id"),
+                    "status": result.get("status"),
+                    "title": title,
+                }
+            )
+        token = uuid.uuid4().hex
+        self.db.save_pending_action(token, "request_seerr", pending_payload)
+        self._pending_tokens.append(token)
+        return json.dumps(
+            {
+                "confirmation_token": token,
+                "message": "Awaiting user confirmation to request in Seerr",
+            }
+        )
+
+    async def _tool_approve_seerr_request(self, args: Mapping[str, Any]) -> str:
+        config_error = seerr_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        request_id = int(args["request_id"])
+        client = SeerrClient(self.settings.seerr.url, self.settings.seerr.api_key)
+        result = client.approve_request(request_id)
+        return json.dumps({"approved": True, "request_id": request_id, "status": result.get("status")})
+
+    async def _tool_search_seerr_movie(self, args: Mapping[str, Any]) -> str:
+        config_error = seerr_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return json.dumps({"error": "query is required"})
+        limit = min(int(args.get("limit") or 10), 20)
+        client = SeerrClient(self.settings.seerr.url, self.settings.seerr.api_key)
+        results = client.search_movie(query)
+        owned = self.db.owned_tmdb_ids("movie")
+        items: List[Dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, Mapping):
+                continue
+            tool_item = _seerr_search_item_to_tool_item(item, "movie")
+            tmdb_id = tool_item.get("tmdb_id")
+            tool_item["in_library"] = bool(tmdb_id and int(tmdb_id) in owned)
+            items.append(tool_item)
+            if len(items) >= limit:
+                break
+        return json.dumps({"total_matched": len(results), "returned": len(items), "items": items})
+
+    async def _tool_search_seerr_tv(self, args: Mapping[str, Any]) -> str:
+        config_error = seerr_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return json.dumps({"error": "query is required"})
+        limit = min(int(args.get("limit") or 10), 20)
+        client = SeerrClient(self.settings.seerr.url, self.settings.seerr.api_key)
+        results = client.search_tv(query)
+        owned = self.db.owned_tvdb_ids()
+        items: List[Dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, Mapping):
+                continue
+            tool_item = _seerr_search_item_to_tool_item(item, "show")
+            tvdb_id = tool_item.get("tvdb_id")
+            tool_item["in_library"] = bool(tvdb_id and int(tvdb_id) in owned)
+            items.append(tool_item)
+            if len(items) >= limit:
+                break
+        return json.dumps({"total_matched": len(results), "returned": len(items), "items": items})
 
     async def _tool_remove_from_arr(self, args: Mapping[str, Any]) -> str:
         token = uuid.uuid4().hex
@@ -1110,6 +1549,342 @@ class ToolRegistry:
         }
         return json.dumps(summary)
 
+    async def _tool_get_user_reviews(self, args: Mapping[str, Any]) -> str:
+        items = get_reviews(
+            self.db,
+            rating_key=str(args["rating_key"]) if args.get("rating_key") else None,
+            tmdb_id=int(args["tmdb_id"]) if args.get("tmdb_id") is not None else None,
+            media_type=str(args["media_type"]) if args.get("media_type") else None,
+            title=str(args["title"]) if args.get("title") else None,
+            min_stars=int(args["min_stars"]) if args.get("min_stars") is not None else None,
+            limit=int(args.get("limit") or 25),
+        )
+        return json.dumps({"items": items, "count": len(items)})
+
+    async def _tool_save_user_review(self, args: Mapping[str, Any]) -> str:
+        stars = int(args["stars"])
+        review = save_review(
+            self.db,
+            stars=stars,
+            title=str(args.get("title") or ""),
+            media_type=str(args.get("media_type") or "movie"),
+            rating_key=str(args["rating_key"]) if args.get("rating_key") else None,
+            tmdb_id=int(args["tmdb_id"]) if args.get("tmdb_id") is not None else None,
+            tvdb_id=int(args["tvdb_id"]) if args.get("tvdb_id") is not None else None,
+            review_text=str(args.get("review_text") or ""),
+            review_tags=list(args.get("review_tags") or []),
+            prompted_by="curator_suggestion",
+            lens_id=self.lens_id,
+        )
+        review = sync_review_rating_to_plex(
+            self.db,
+            self.settings,
+            review,
+            replace_plex_rating=bool(
+                args.get("replace_plex_rating") or args.get("force_replace")
+            ),
+        )
+        payload: Dict[str, Any] = {"saved": True, "review": review}
+        if review.get("reason") == "plex_rating_conflict":
+            plex_stars = int(review.get("plex_stars") or 0)
+            submitted_stars = int(review.get("submitted_stars") or stars)
+            payload["plex_rating_conflict"] = True
+            payload["code"] = "plex_rating_conflict"
+            payload["plex_stars"] = plex_stars
+            payload["submitted_stars"] = submitted_stars
+            payload["message"] = (
+                f"Plex has {plex_stars}★ but you submitted {submitted_stars}★. "
+                "Resubmit with replace_plex_rating=true or force_replace=true to overwrite Plex."
+            )
+            self._review_conflicts.append(
+                {
+                    "review": review,
+                    "plex_stars": plex_stars,
+                    "submitted_stars": submitted_stars,
+                }
+            )
+        return json.dumps(payload)
+
+    def _plex_section_for_media_type(self, media_type: str) -> Optional[str]:
+        normalized = str(media_type or "").strip().lower()
+        if normalized == "movie":
+            section = str(self.settings.plex_movie_section or "").strip()
+        elif normalized == "show":
+            section = str(self.settings.plex_tv_section or "").strip()
+        else:
+            return None
+        return section or None
+
+    def _plex_configuration_error(self) -> Optional[str]:
+        if not self.settings.plex_url or not self.settings.plex_token:
+            return "Plex is not configured. Add Plex URL and token in Configuration."
+        return None
+
+    async def _tool_list_plex_collections(self, args: Mapping[str, Any]) -> str:
+        from curatorx.connectors.plex import PlexClient
+        from curatorx.connectors.plex_collections import list_collections
+
+        config_error = plex_collections_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        media_type = str(args.get("media_type") or "movie")
+        section_id = self._plex_section_for_media_type(media_type)
+        if not section_id:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Plex {media_type} library section is not configured. "
+                        "Open Configuration → Plex library mapping."
+                    )
+                }
+            )
+        client = PlexClient(self.settings.plex_url, self.settings.plex_token)
+        items = list_collections(client, section_id)
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "rating_key": item.rating_key,
+                        "title": item.title,
+                        "section_id": item.section_id,
+                        "media_type": item.media_type,
+                    }
+                    for item in items
+                ],
+                "count": len(items),
+            }
+        )
+
+    async def _tool_create_plex_collection(self, args: Mapping[str, Any]) -> str:
+        config_error = plex_collections_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        media_type = str(args.get("media_type") or "movie")
+        section_id = self._plex_section_for_media_type(media_type)
+        if not section_id:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Plex {media_type} library section is not configured. "
+                        "Open Configuration → Plex library mapping."
+                    )
+                }
+            )
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return json.dumps({"error": "title is required"})
+        rating_keys = [str(key).strip() for key in (args.get("rating_keys") or []) if str(key).strip()]
+        token = uuid.uuid4().hex
+        payload = {
+            "action": "create_plex_collection",
+            "title": title,
+            "media_type": media_type,
+            "section_id": section_id,
+            "rating_keys": rating_keys,
+        }
+        self.db.save_pending_action(token, "create_plex_collection", payload)
+        self._pending_tokens.append(token)
+        return json.dumps(
+            {
+                "confirmation_token": token,
+                "message": f"Awaiting user confirmation to create Plex collection '{title}'",
+            }
+        )
+
+    async def _tool_add_to_plex_collection(self, args: Mapping[str, Any]) -> str:
+        config_error = plex_collections_configuration_error(self.settings)
+        if config_error:
+            return json.dumps({"error": config_error})
+        media_type = str(args.get("media_type") or "movie")
+        section_id = self._plex_section_for_media_type(media_type)
+        if not section_id:
+            return json.dumps(
+                {
+                    "error": (
+                        f"Plex {media_type} library section is not configured. "
+                        "Open Configuration → Plex library mapping."
+                    )
+                }
+            )
+        rating_keys = [str(key).strip() for key in (args.get("rating_keys") or []) if str(key).strip()]
+        if not rating_keys:
+            return json.dumps({"error": "rating_keys is required"})
+        collection_rating_key = str(args.get("collection_rating_key") or "").strip()
+        collection_title = str(args.get("collection_title") or "").strip()
+        if not collection_rating_key and not collection_title:
+            return json.dumps({"error": "collection_rating_key or collection_title is required"})
+        token = uuid.uuid4().hex
+        payload = {
+            "action": "add_to_plex_collection",
+            "media_type": media_type,
+            "section_id": section_id,
+            "rating_keys": rating_keys,
+            "collection_rating_key": collection_rating_key,
+            "collection_title": collection_title,
+        }
+        self.db.save_pending_action(token, "add_to_plex_collection", payload)
+        self._pending_tokens.append(token)
+        label = collection_title or collection_rating_key
+        return json.dumps(
+            {
+                "confirmation_token": token,
+                "message": f"Awaiting user confirmation to add items to Plex collection '{label}'",
+            }
+        )
+
+    async def _tool_suggest_titles_to_rate(self, args: Mapping[str, Any]) -> str:
+        limit = int(args.get("limit") or 10)
+        prompts = list_pending_prompts(self.db, limit=limit)
+        suggestions = [
+            {
+                "title": prompt["title"],
+                "rating_key": prompt["rating_key"],
+                "media_type": prompt["media_type"],
+                "completion_pct": prompt["completion_pct"],
+                "reason": "near_complete",
+            }
+            for prompt in prompts
+        ]
+        if len(suggestions) < limit:
+            with self.db.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT rating_key, media_type, title, view_count, last_viewed_at
+                    FROM library_items
+                    WHERE view_count > 0
+                      AND rating_key IS NOT NULL AND rating_key != ''
+                      AND rating_key NOT IN (
+                          SELECT rating_key FROM user_title_reviews
+                          WHERE rating_key IS NOT NULL
+                      )
+                    ORDER BY last_viewed_at DESC
+                    LIMIT ?
+                    """,
+                    (limit - len(suggestions),),
+                ).fetchall()
+            for row in rows:
+                rating_key = str(row["rating_key"])
+                if any(item["rating_key"] == rating_key for item in suggestions):
+                    continue
+                suggestions.append(
+                    {
+                        "title": str(row["title"]),
+                        "rating_key": rating_key,
+                        "media_type": str(row["media_type"]),
+                        "view_count": int(row["view_count"] or 0),
+                        "reason": "watched_no_review",
+                    }
+                )
+                if len(suggestions) >= limit:
+                    break
+        return json.dumps({"items": suggestions[:limit], "count": len(suggestions[:limit])})
+
+    async def _tool_query_watchlist(self, args: Mapping[str, Any]) -> str:
+        limit = int(args.get("limit") or 50)
+        user_id = self.user_id if self.settings.features.multi_user_enabled else None
+        pins = self.db.list_watchlist_pins(user_id=user_id)[:limit]
+        items = [
+            {
+                "id": pin["id"],
+                "title": pin["title"],
+                "media_type": pin["media_type"],
+                "tmdb_id": pin.get("tmdb_id"),
+                "tvdb_id": pin.get("tvdb_id"),
+                "created_at": pin.get("created_at"),
+            }
+            for pin in pins
+        ]
+        return json.dumps({"items": items, "count": len(items)})
+
+    async def _tool_upcoming_premieres(self, args: Mapping[str, Any]) -> str:
+        if not self.settings.tmdb_api_key:
+            return json.dumps({"error": "TMDB API key not configured"})
+        from datetime import datetime, timedelta, timezone
+
+        limit = int(args.get("limit") or 15)
+        days_ahead = int(args.get("days_ahead") or 14)
+        today = datetime.now(timezone.utc).date()
+        cutoff = today + timedelta(days=days_ahead)
+        tmdb = TMDBClient(self.settings.tmdb_api_key)
+        premieres: List[Dict[str, Any]] = []
+
+        for row in self.db.all_library_items():
+            if row["media_type"] != "show":
+                continue
+            tmdb_id = row["tmdb_id"]
+            if not tmdb_id:
+                continue
+            try:
+                details = tmdb.tv_details(int(tmdb_id))
+            except RuntimeError:
+                continue
+            next_ep = details.get("next_episode_to_air")
+            if not isinstance(next_ep, dict):
+                continue
+            air_date_raw = str(next_ep.get("air_date") or "")
+            if not air_date_raw:
+                continue
+            try:
+                air_date = datetime.strptime(air_date_raw, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if air_date < today or air_date > cutoff:
+                continue
+            premieres.append(
+                {
+                    "title": str(row["title"]),
+                    "tmdb_id": int(tmdb_id),
+                    "air_date": air_date_raw,
+                    "episode_name": next_ep.get("name"),
+                    "season_number": next_ep.get("season_number"),
+                    "episode_number": next_ep.get("episode_number"),
+                }
+            )
+
+        premieres.sort(key=lambda item: item["air_date"])
+        trimmed = premieres[:limit]
+        return json.dumps(
+            {
+                "items": trimmed,
+                "count": len(trimmed),
+                "days_ahead": days_ahead,
+                "note": "Premieres from TMDB next_episode_to_air for shows in your library.",
+            }
+        )
+
+    async def _tool_start_review_dialogue(self, args: Mapping[str, Any]) -> str:
+        from curatorx.persona.presets import build_review_dialogue
+
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return json.dumps({"error": "title is required"})
+        media_type = str(args.get("media_type") or "movie")
+        rating_key = str(args["rating_key"]).strip() if args.get("rating_key") else None
+        template_key = str(args.get("template_key") or "near_complete")
+        completion_pct = float(args.get("completion_pct") or 0)
+
+        persona = self.db.get_persona()
+        preset_id = str(persona["preset_id"]) if persona and persona.get("preset_id") else None
+        curator_name = str(persona["curator_name"]) if persona and persona.get("curator_name") else "Curator"
+
+        if rating_key:
+            prompts = list_pending_prompts(self.db, limit=50)
+            matching = [prompt for prompt in prompts if prompt["rating_key"] == rating_key]
+            if matching:
+                completion_pct = float(matching[0].get("completion_pct") or completion_pct)
+                mark_prompts_surfaced(self.db, [str(matching[0]["id"])])
+
+        dialogue = build_review_dialogue(
+            preset_id,
+            template_key,
+            curator_name=curator_name,
+            title=title,
+            media_type=media_type,
+            rating_key=rating_key,
+            completion_pct=completion_pct,
+        )
+        return json.dumps({"dialogue": dialogue})
+
 
 def _build_where_for_patterns(filters: LibraryFilters) -> tuple[str, List[Any]]:
     return _build_where(filters)
@@ -1209,6 +1984,27 @@ async def execute_confirmed_action(db: Database, settings: Settings, token: str)
             return _already_exists_response(action, error)
         mark_in_sonarr(db, tvdb_id)
         return {"action": action, "result": result}
+    if action == "request_seerr":
+        config_error = seerr_configuration_error(settings)
+        if config_error:
+            raise RuntimeError(config_error)
+        client = SeerrClient(settings.seerr.url, settings.seerr.api_key)
+        media_type = str(payload.get("media_type") or "movie")
+        tmdb_id = int(payload["tmdb_id"])
+        tvdb_id = payload.get("tvdb_id")
+        result = client.create_request(
+            media_type,
+            tmdb_id,
+            tvdb_id=int(tvdb_id) if tvdb_id is not None else None,
+        )
+        return {
+            "action": action,
+            "result": {
+                "id": result.get("id"),
+                "status": result.get("status"),
+                "title": payload.get("title", ""),
+            },
+        }
     if action == "remove_arr":
         delete_files = bool(payload.get("delete_files"))
         if payload.get("media_type") == "movie":
@@ -1220,6 +2016,49 @@ async def execute_confirmed_action(db: Database, settings: Settings, token: str)
                 int(payload["arr_id"]), delete_files=delete_files
             )
         return {"action": action, "removed": True}
+    if action == "create_plex_collection":
+        from curatorx.connectors.plex import PlexClient
+        from curatorx.connectors.plex_collections import create_collection
+
+        config_error = plex_collections_configuration_error(settings)
+        if config_error:
+            raise RuntimeError(config_error)
+        client = PlexClient(settings.plex_url, settings.plex_token)
+        collection = create_collection(
+            client,
+            section_id=str(payload["section_id"]),
+            title=str(payload["title"]),
+            media_type=str(payload["media_type"]),
+            rating_keys=list(payload.get("rating_keys") or []),
+        )
+        return {
+            "action": action,
+            "result": {
+                "rating_key": collection.rating_key,
+                "title": collection.title,
+                "section_id": collection.section_id,
+            },
+        }
+    if action == "add_to_plex_collection":
+        from curatorx.connectors.plex import PlexClient
+        from curatorx.connectors.plex_collections import add_items_to_collection, find_collection_by_title
+
+        config_error = plex_collections_configuration_error(settings)
+        if config_error:
+            raise RuntimeError(config_error)
+        client = PlexClient(settings.plex_url, settings.plex_token)
+        collection_key = str(payload.get("collection_rating_key") or "").strip()
+        if not collection_key:
+            match = find_collection_by_title(
+                client,
+                str(payload["section_id"]),
+                str(payload.get("collection_title") or ""),
+            )
+            if match is None:
+                raise RuntimeError("Plex collection not found")
+            collection_key = match.rating_key
+        add_items_to_collection(client, collection_key, list(payload.get("rating_keys") or []))
+        return {"action": action, "result": {"collection_rating_key": collection_key, "added": True}}
     raise RuntimeError(f"Unknown action {action}")
 
 
@@ -1249,13 +2088,15 @@ def build_system_prompt(db: Database, lens_id: Optional[str] = None) -> str:
         f"You are {curator_name}, an expert movie and TV collection curator for CuratorX. "
         "You know the user's Plex library and help them discover what to add, what to watch tonight, "
         "and what to purge to save drive space. Use tools to ground recommendations in their actual library. "
-        "Explain why each recommendation fits their taste. Never add or remove titles without confirmation tokens. "
+        "Never add or remove titles without confirmation tokens. "
+        "Plex collection create/add actions also require confirmation tokens. "
         "When proposing adds, always use the exact tmdb_id or tvdb_id from tool item responses — never guess or invent external IDs. "
         "For titles to add, use find_collection_gaps, recommend_hidden_gems, search_tmdb, or explore_genre(include_missing=true) — "
         "never query_library or search_library (those only return owned titles). "
         "Never present in_library=true titles as recommendations to add; title cards for adds exclude owned titles. "
         "For exact external title lookup before add_to_radarr or add_to_sonarr, use search_tmdb — not search_library. "
         "For movies use tmdb_id with add_to_radarr; for shows use tvdb_id with add_to_sonarr.\n"
+        "When Seerr is enabled for household members, use request_via_seerr instead of add_to_radarr/add_to_sonarr.\n"
         f"{overview_block}\n"
         f"{_persona_prompt_block(db)}"
         f"{lens_block}\n\n"

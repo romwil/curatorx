@@ -4,6 +4,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import App from "./App";
 import TitleDetailPage from "./pages/TitleDetailPage";
 import ConfigPage from "./pages/ConfigPage";
+import LoginPage from "./pages/LoginPage";
 import "./styles.css";
 
 createRoot(document.getElementById("root")).render(
@@ -11,6 +12,7 @@ createRoot(document.getElementById("root")).render(
     <BrowserRouter>
       <Routes>
         <Route path="/" element={<App />} />
+        <Route path="/login" element={<LoginPage />} />
         <Route path="/config" element={<ConfigPage />} />
         <Route path="/title/:mediaType/:itemId" element={<TitleDetailPage />} />
       </Routes>

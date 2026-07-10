@@ -298,6 +298,37 @@ class ConfigStoreTests(unittest.TestCase):
         )
         self.assertIn("Available root folders", error or "")
 
+    def test_feature_flags_defaults(self) -> None:
+        settings = Settings()
+        self.assertFalse(settings.features.multi_user_enabled)
+        self.assertFalse(settings.features.seerr_enabled)
+        self.assertEqual(settings.auth.mode, "disabled")
+        self.assertTrue(settings.auth.plex_login_enabled)
+        self.assertFalse(settings.auth.oidc_enabled)
+        self.assertFalse(settings.auth.local_login_enabled)
+        self.assertEqual(settings.seerr.url, "")
+        self.assertTrue(settings.seerr.link_on_login)
+        self.assertFalse(settings.seerr.require_linked_user_for_requests)
+
+    def test_feature_flags_round_trip(self) -> None:
+        from curatorx.config_store import AuthSettings, FeatureFlags, SeerrSettings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            settings = Settings(
+                features=FeatureFlags(multi_user_enabled=True, seerr_enabled=True),
+                auth=AuthSettings(mode="plex", oidc_enabled=True),
+                seerr=SeerrSettings(url="http://seerr.local", api_key="secret"),
+            )
+            save_settings(data_dir, settings)
+            loaded = load_merged_settings(data_dir)
+            self.assertTrue(loaded.features.multi_user_enabled)
+            self.assertTrue(loaded.features.seerr_enabled)
+            self.assertEqual(loaded.auth.mode, "plex")
+            self.assertTrue(loaded.auth.oidc_enabled)
+            self.assertEqual(loaded.seerr.url, "http://seerr.local")
+            self.assertEqual(loaded.seerr.api_key, "secret")
+
     def test_load_merged_settings_normalizes_empty_path_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

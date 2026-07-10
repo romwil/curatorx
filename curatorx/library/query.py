@@ -224,6 +224,75 @@ def _parse_json_list(raw: Any) -> List[str]:
     return []
 
 
+def build_facet_match_details(
+    filters: LibraryFilters,
+    item: Mapping[str, Any],
+) -> tuple[str, List[str]]:
+    """Build recommendation_reason and facet_matches from active query filters."""
+    matches: List[str] = []
+
+    if filters.genres:
+        item_genres = {str(g).lower() for g in (item.get("genres") or [])}
+        for genre in filters.genres:
+            needle = genre.lower()
+            if needle in item_genres or any(needle in g for g in item_genres):
+                matches.append(f"Genre: {genre}")
+
+    for facet_label, filter_values, item_key in (
+        ("Director", filters.directors, "directors"),
+        ("Cast", filters.cast, "cast"),
+        ("Keyword", filters.keywords, "keywords"),
+    ):
+        if not filter_values:
+            continue
+        item_values = [str(v).lower() for v in (item.get(item_key) or [])]
+        for value in filter_values:
+            needle = value.lower()
+            if any(needle in entry for entry in item_values):
+                matches.append(f"{facet_label}: {value}")
+
+    if filters.countries:
+        item_countries = {str(c).lower() for c in (item.get("countries") or [])}
+        for country in filters.countries:
+            needle = country.lower()
+            if needle in item_countries or any(needle in c for c in item_countries):
+                matches.append(f"Country: {country}")
+
+    if filters.year_from is not None or filters.year_to is not None:
+        year = item.get("year")
+        if year is not None:
+            year_from = filters.year_from if filters.year_from is not None else year
+            year_to = filters.year_to if filters.year_to is not None else year
+            if year_from <= int(year) <= year_to:
+                if filters.year_from is not None and filters.year_to is not None:
+                    matches.append(f"Year: {filters.year_from}–{filters.year_to}")
+                elif filters.year_from is not None:
+                    matches.append(f"Year: {filters.year_from}+")
+                else:
+                    matches.append(f"Year: ≤{filters.year_to}")
+
+    if filters.unwatched_only and int(item.get("view_count") or 0) == 0:
+        matches.append("Unwatched")
+    if filters.in_progress_only:
+        total_eps = int(item.get("total_episode_count") or 0)
+        unwatched_eps = int(item.get("unwatched_episode_count") or 0)
+        if total_eps > 0 and 0 < unwatched_eps < total_eps:
+            matches.append("In progress")
+    if filters.semantic_query:
+        matches.append(f"Mood: {filters.semantic_query}")
+    if filters.query:
+        matches.append(f"Title/summary: {filters.query}")
+    if filters.fts_query:
+        matches.append(f"Full-text: {filters.fts_query}")
+
+    if matches:
+        reason = "Matches your query — " + "; ".join(matches[:4])
+        if len(matches) > 4:
+            reason += f" (+{len(matches) - 4} more)"
+        return reason, matches
+    return "In your library", []
+
+
 def row_to_query_item(row: Mapping[str, Any]) -> Dict[str, Any]:
     keys = row.keys()
     total_eps = int(row["total_episode_count"] or 0) if "total_episode_count" in keys else 0

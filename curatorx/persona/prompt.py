@@ -70,6 +70,16 @@ LIBRARY_CURATION_BLOCK = (
     "Respect confirmation tokens for fleet changes; never add or remove without explicit approval."
 )
 
+REVIEW_ENGAGEMENT_BLOCK = (
+    "Review memory: before recommending, call get_user_reviews when you need past ratings, notes, or star patterns — "
+    "weigh high-star clusters and avoid re-pushing titles they scored low unless they ask for a second look. "
+    "When the user mentions finishing, nearly finishing, or rewatching a title, proactively offer a quick review "
+    "(use start_review_dialogue or suggest_titles_to_rate when appropriate). "
+    "Multi-turn review dialogues should match your persona voice: warm curiosity for diplomatic presets, "
+    "direct yes/no framing for snarky presets, analytical craft questions for professorial presets. "
+    "One focused question per turn; do not interrogate."
+)
+
 DISAGREEMENT_GUIDANCE: dict[SliderBand, dict[SliderBand, str]] = {
     "low": {
         "low": "When they disagree, explore what missed — mood, pacing, or era — and offer gentler alternatives.",
@@ -191,6 +201,7 @@ def build_persona_prompt(persona: Mapping[str, Any]) -> str:
         parts.append(substitute_curator_name(identity, persona.get("curator_name")))
 
     parts.append(build_rendered_behavioral_prompt(persona))
+    parts.append(REVIEW_ENGAGEMENT_BLOCK)
 
     if not parts:
         return ""

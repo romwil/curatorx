@@ -12,8 +12,8 @@ from pathlib import Path
 import asyncio
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -37,20 +37,28 @@ from curatorx.config_store import (
     load_merged_settings,
     normalize_path_settings,
     normalize_settings_llm,
+    plex_configuration_error,
     radarr_add_configuration_error,
     resolve_llm_model,
+    resolve_plex_section,
     resolve_radarr_root_folder,
     resolve_sonarr_root_folder,
     save_settings,
     secret_field_sources,
     sonarr_add_configuration_error,
+    seerr_configuration_error,
+    plex_collections_configuration_error,
+    uses_seerr_request_path,
     validate_arr_root_folder,
     validate_llm_settings,
 )
 from curatorx.connectors.plex import PlexClient
+from curatorx.connectors.plex_collections import list_collections as list_plex_collections
 from curatorx.connectors.radarr import RadarrClient
+from curatorx.connectors.seerr import SeerrClient
 from curatorx.connectors.sonarr import SonarrClient
 from curatorx.library.db import DEFAULT_LENS_ID
+from curatorx.library.health import compute_library_health
 from curatorx.library.facets import ensure_library_facet_index
 from curatorx.library.episodes import query_episodes, summarize_tv_progress
 from curatorx.library.facets import library_facet_catalog
@@ -66,15 +74,24 @@ from curatorx.models.schemas import (
     ActionConfirmRequest,
     ActiveLensPayload,
     ChatRequest,
+    EngagementStreakResponse,
     Lens,
     LensCreate,
     LensUpdate,
+    MessageFeedbackRequest,
     PersonaMetrics,
     PersonaMetricsUpdate,
     PersonaPresetSummary,
     PersonaPreviewResponse,
+    PersonaUiCopy,
     PreferenceSignal,
+    RatingPrompt,
     SystemConfigUpdate,
+    UserReview,
+    UserReviewCreate,
+    WatchlistCreate,
+    WatchlistListResponse,
+    WatchlistPin,
 )
 from curatorx.persona import (
     build_assembled_persona_prompt,
@@ -84,8 +101,23 @@ from curatorx.persona import (
     list_presets,
     persona_row_to_dict,
 )
+from curatorx.persona.presets import persona_ui_for, typing_phrases_for
+from curatorx.preferences.purge import suggest_purge_candidates
 from curatorx.preferences.store import remember_preference
+from curatorx.reviews.store import dismiss_prompt, get_reviews, list_pending_prompts, mark_prompts_surfaced, save_review
+from curatorx.reviews.plex_sync import sync_review_rating_to_plex
+from curatorx.web.auth import (
+    authenticate_plex_user,
+    bootstrap_owner,
+    clear_session_cookie,
+    get_current_user_dep,
+    require_role,
+    set_session_cookie,
+    sync_user_seerr_from_token,
+    try_get_current_user,
+)
 from curatorx.web.jobs import get_job_manager, get_sync_scheduler
+from curatorx.web.webhooks import register_webhook_routes
 from curatorx.web.setup import (
     SECRET_FIELDS,
     build_certifications_status,
@@ -101,6 +133,7 @@ from curatorx.web.setup import (
     test_llm,
     test_plex,
     test_radarr,
+    test_seerr,
     test_sonarr,
     test_tautulli,
     test_tmdb,
@@ -145,20 +178,24 @@ def _persona_dict(row: Any) -> dict[str, Any]:
 
 def _row_to_persona(row: Any) -> PersonaMetrics:
     data = _persona_dict(row)
+    curator_name = str(data.get("curator_name") or "Curator")
+    preset_id = str(data["persona_preset_id"]) if data.get("persona_preset_id") else None
+    ui = persona_ui_for(preset_id, curator_name)
     return PersonaMetrics(
         metric_id=str(data.get("metric_id") or "current_profile"),
-        curator_name=str(data.get("curator_name") or "Curator"),
+        curator_name=curator_name,
         persona_identity=str(data.get("persona_identity") or ""),
         val_bro_prof=float(data.get("val_bro_prof") or 0.5),
         val_dipl_snark=float(data.get("val_dipl_snark") or 0.5),
         val_pass_auto=float(data.get("val_pass_auto") or 0.5),
-        persona_preset_id=str(data["persona_preset_id"]) if data.get("persona_preset_id") else None,
+        persona_preset_id=preset_id,
         persona_prompt_override=str(data["persona_prompt_override"])
         if data.get("persona_prompt_override") is not None
         else None,
         persona_mode=str(data.get("persona_mode") or "sliders"),
         behavioral_prompt=str(data.get("behavioral_prompt") or ""),
         assembled_prompt=str(data.get("assembled_prompt") or ""),
+        persona_ui=PersonaUiCopy(**ui),
         last_modified=str(data["last_modified"]) if data.get("last_modified") is not None else None,
     )
 
@@ -185,6 +222,38 @@ if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 elif STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+class FeatureFlagsPayload(BaseModel):
+    multi_user_enabled: bool = False
+    seerr_enabled: bool = False
+    plex_collections_enabled: bool = False
+
+
+class AuthSettingsPayload(BaseModel):
+    mode: str = "disabled"
+    plex_login_enabled: bool = True
+    oidc_enabled: bool = False
+    local_login_enabled: bool = False
+
+
+class PlexLoginPayload(BaseModel):
+    auth_token: str = Field(min_length=1)
+
+
+class UserRoleUpdatePayload(BaseModel):
+    role: str = Field(pattern="^(owner|member|guest)$")
+
+
+class SeerrSyncPayload(BaseModel):
+    auth_token: str = Field(min_length=1)
+
+
+class SeerrSettingsPayload(BaseModel):
+    url: str = ""
+    api_key: str = ""
+    link_on_login: bool = True
+    require_linked_user_for_requests: bool = False
 
 
 class SettingsPayload(BaseModel):
@@ -216,6 +285,23 @@ class SettingsPayload(BaseModel):
     onboarding_complete: bool = False
     library_sync_interval_hours: int = Field(default=24, ge=1, le=168)
     tv_page_size: int = Field(default=500, ge=50, le=2000)
+    sync_reviews_to_plex: bool = True
+    features: FeatureFlagsPayload = Field(default_factory=FeatureFlagsPayload)
+    auth: AuthSettingsPayload = Field(default_factory=AuthSettingsPayload)
+    seerr: SeerrSettingsPayload = Field(default_factory=SeerrSettingsPayload)
+
+
+class PlexCollectionProposePayload(BaseModel):
+    title: str = Field(min_length=1)
+    media_type: str
+    rating_keys: List[str] = Field(default_factory=list)
+
+
+class PlexCollectionItemsProposePayload(BaseModel):
+    media_type: str
+    rating_keys: List[str] = Field(min_length=1)
+    collection_title: Optional[str] = None
+    collection_rating_key: Optional[str] = None
 
 
 class ThreadCreatePayload(BaseModel):
@@ -243,6 +329,8 @@ class TestPayload(BaseModel):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    seerr_url: str = ""
+    seerr_api_key: str = ""
 
 
 def _settings() -> Settings:
@@ -256,11 +344,67 @@ def _mask_settings(settings: Settings) -> Dict[str, Any]:
         payload[f"{field}_set"] = bool(getattr(settings, field))
         payload[f"{field}_source"] = sources.get(field, "")
         payload[field] = ""
+    seerr_payload = dict(payload.get("seerr") or {})
+    seerr_payload["api_key_set"] = bool(settings.seerr.api_key)
+    seerr_payload["api_key"] = ""
+    payload["seerr"] = seerr_payload
     return payload
 
 
 def _db():
     return get_job_manager().db
+
+
+register_webhook_routes(app, db_factory=_db, settings_factory=_settings)
+
+
+def _features_payload(user=None, *, authenticated: bool = True) -> Dict[str, Any]:
+    settings = _settings()
+    if user is None:
+        user = bootstrap_owner(_db())
+    request_path = "seerr" if uses_seerr_request_path(settings, role=user.role) else "arr"
+    payload: Dict[str, Any] = {
+        "features": {
+            "multi_user_enabled": settings.features.multi_user_enabled,
+            "seerr_enabled": settings.features.seerr_enabled,
+        },
+        "auth": {
+            "mode": settings.auth.mode,
+            "plex_login_enabled": settings.auth.plex_login_enabled,
+            "oidc_enabled": settings.auth.oidc_enabled,
+            "local_login_enabled": settings.auth.local_login_enabled,
+        },
+        "seerr": {
+            "link_on_login": settings.seerr.link_on_login,
+            "require_linked_user_for_requests": settings.seerr.require_linked_user_for_requests,
+        },
+        "request_path": request_path,
+        "authenticated": authenticated,
+    }
+    if authenticated and user is not None:
+        payload["user"] = {
+            "id": user.id,
+            "display_name": user.display_name,
+            "role": user.role,
+            "seerr_user_id": user.seerr_user_id,
+            "avatar_url": user.avatar_url,
+        }
+    else:
+        payload["user"] = None
+    return payload
+
+
+def _message_text_excerpt(blocks: List[Mapping[str, Any]], *, limit: int = 500) -> str:
+    parts: List[str] = []
+    for block in blocks:
+        if str(block.get("type") or "") == "text":
+            content = str(block.get("content") or "").strip()
+            if content:
+                parts.append(content)
+    text = " ".join(parts).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _serve_index() -> HTMLResponse:
@@ -288,9 +432,76 @@ def title_page(media_type: str, item_id: str) -> HTMLResponse:
     return _serve_index()
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page() -> HTMLResponse:
+    return _serve_index()
+
+
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     return {"status": "ok", "version": __version__}
+
+
+@app.get("/api/features")
+def get_features(request: Request) -> Dict[str, Any]:
+    settings = _settings()
+    db = _db()
+    if settings.features.multi_user_enabled:
+        user = try_get_current_user(request, db)
+        if user is None:
+            return _features_payload(None, authenticated=False)
+        return _features_payload(user, authenticated=True)
+    return _features_payload(bootstrap_owner(db), authenticated=True)
+
+
+@app.get("/api/auth/me")
+def auth_me(user=Depends(get_current_user_dep)) -> Dict[str, Any]:
+    return {"user": user.to_dict(), "authenticated": True}
+
+
+@app.post("/api/auth/plex")
+def auth_plex(payload: PlexLoginPayload, response: Response) -> Dict[str, Any]:
+    user = authenticate_plex_user(payload.auth_token, _db())
+    set_session_cookie(response, user.id)
+    return {"user": user.to_dict(), "authenticated": True}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(response: Response) -> Dict[str, bool]:
+    clear_session_cookie(response)
+    return {"logged_out": True}
+
+
+@app.get("/api/users")
+def list_users(user=Depends(require_role("owner"))) -> Dict[str, Any]:
+    items = _db().list_users()
+    return {"items": items, "count": len(items)}
+
+
+@app.patch("/api/users/{user_id}")
+def patch_user_role(
+    user_id: str,
+    payload: UserRoleUpdatePayload,
+    user=Depends(require_role("owner")),
+) -> Dict[str, Any]:
+    if user_id == user.id and payload.role != "owner":
+        raise HTTPException(status_code=400, detail="Cannot demote your own owner account")
+    try:
+        updated = _db().update_user_role(user_id, payload.role)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {"user": updated}
+
+
+@app.post("/api/users/{user_id}/sync-seerr")
+def sync_user_seerr(
+    user_id: str,
+    payload: SeerrSyncPayload,
+    user=Depends(require_role("owner")),
+) -> Dict[str, Any]:
+    del user
+    updated = sync_user_seerr_from_token(user_id, payload.auth_token, _db())
+    return {"user": updated}
 
 
 @app.get("/api/setup/status")
@@ -430,6 +641,20 @@ def api_test_tautulli(payload: TestPayload) -> Dict[str, Any]:
     return result
 
 
+@app.post("/api/setup/test/seerr")
+def api_test_seerr(payload: TestPayload) -> Dict[str, Any]:
+    resolved = resolve_test_payload(payload.model_dump(), _settings())
+    result = test_seerr(resolved["seerr_url"], resolved["seerr_api_key"])
+    record_service_integration(
+        _db(),
+        "seerr",
+        base_url=resolved["seerr_url"],
+        api_token=resolved["seerr_api_key"],
+        ok=bool(result.get("ok")),
+    )
+    return result
+
+
 @app.post("/api/setup/test/llm")
 def api_test_llm(payload: TestPayload) -> Dict[str, Any]:
     resolved = resolve_test_payload(payload.model_dump(), _settings())
@@ -506,6 +731,31 @@ def library_stats() -> Dict[str, Any]:
         "shows": shows,
         "last_sync": db.get_sync_state("last_sync"),
     }
+
+
+@app.get("/api/library/health")
+def library_health() -> Dict[str, Any]:
+    return compute_library_health(_db())
+
+
+@app.get("/api/library/purge-candidates")
+def library_purge_candidates(limit: int = 12) -> Dict[str, Any]:
+    cards = suggest_purge_candidates(_db(), _settings(), limit=min(max(1, limit), 25))
+    return {
+        "count": len(cards),
+        "items": [card.model_dump() for card in cards],
+    }
+
+
+@app.get("/api/admin/export/training-corpus")
+def export_training_corpus(user=Depends(require_role("owner"))) -> JSONResponse:
+    del user
+    payload = _db().export_training_corpus()
+    filename = f"curatorx-training-corpus-{int(payload['exported_at'])}.json"
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/library/overview")
@@ -747,6 +997,12 @@ def get_persona_presets() -> List[PersonaPresetSummary]:
             val_pass_auto=preset.val_pass_auto,
             identity_blurb=preset.identity_blurb,
             behavioral_anchor=preset.behavioral_anchor,
+            typing_phrases=list(preset.typing_phrases),
+            composer_placeholders=list(preset.composer_placeholders),
+            welcome_greeting=preset.welcome_greeting,
+            welcome_starters=list(preset.welcome_starters),
+            review_prompt_templates=dict(preset.review_prompt_templates),
+            accent_hue=preset.accent_hue,
         )
         for preset in list_presets()
     ]
@@ -952,6 +1208,80 @@ def delete_chat_thread(session_id: str) -> Dict[str, bool]:
     return {"deleted": True}
 
 
+@app.post("/api/chat/messages/{message_id}/feedback")
+def submit_message_feedback(
+    message_id: str,
+    payload: MessageFeedbackRequest,
+    user=Depends(get_current_user_dep),
+) -> Dict[str, Any]:
+    db = _db()
+    thread = db.get_chat_thread(payload.session_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    row = db.get_chat_message(message_id)
+    if not row or str(row["session_id"]) != payload.session_id:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if str(row["role"]) != "assistant":
+        raise HTTPException(status_code=400, detail="Feedback is only supported on assistant messages")
+
+    if payload.feedback is None:
+        deleted = db.delete_message_feedback(message_id, user_id=user.id)
+        return {"saved": False, "deleted": deleted, "feedback": None}
+
+    blocks = json.loads(str(row["blocks_json"]))
+    excerpt = _message_text_excerpt(blocks)
+    signal_type = "positive" if payload.feedback == "helpful" else "negative"
+    remember_preference(
+        db,
+        PreferenceSignal(
+            signal_type=signal_type,
+            text=excerpt or f"Curator response marked {payload.feedback}",
+            lens_id=str(row["lens_id"]) if row["lens_id"] is not None else None,
+        ),
+    )
+    saved = db.upsert_message_feedback(
+        feedback_id=uuid.uuid4().hex,
+        message_id=message_id,
+        session_id=payload.session_id,
+        user_id=user.id,
+        feedback_type=payload.feedback,
+        excerpt=excerpt,
+    )
+    return {"saved": True, "deleted": False, "feedback": saved}
+
+
+@app.delete("/api/chat/messages/{message_id}/feedback")
+def delete_message_feedback(
+    message_id: str,
+    session_id: str,
+    user=Depends(get_current_user_dep),
+) -> Dict[str, Any]:
+    db = _db()
+    thread = db.get_chat_thread(session_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    row = db.get_chat_message(message_id)
+    if not row or str(row["session_id"]) != session_id:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if str(row["role"]) != "assistant":
+        raise HTTPException(status_code=400, detail="Feedback is only supported on assistant messages")
+    deleted = db.delete_message_feedback(message_id, user_id=user.id)
+    return {"saved": False, "deleted": deleted, "feedback": None}
+
+
+@app.get("/api/chat/threads/{session_id}/feedback")
+def list_thread_feedback(
+    session_id: str,
+    user=Depends(get_current_user_dep),
+) -> Dict[str, Any]:
+    db = _db()
+    thread = db.get_chat_thread(session_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    items = db.list_message_feedback(session_id, user_id=user.id)
+    return {"session_id": session_id, "items": items}
+
+
 @app.get("/api/chat/stream")
 async def chat_stream(
     message: str,
@@ -1072,7 +1402,55 @@ def propose_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             token[:8],
         )
         return {"confirmation_token": token}
+    if action == "request_seerr":
+        settings = _settings()
+        config_error = seerr_configuration_error(settings)
+        if config_error:
+            raise HTTPException(status_code=400, detail=config_error)
+        media_type = str(payload.get("media_type") or "movie")
+        tmdb_id = int(payload["tmdb_id"])
+        token = uuid_mod.uuid4().hex
+        pending = {
+            "action": "request_seerr",
+            "media_type": media_type,
+            "tmdb_id": tmdb_id,
+            "title": payload.get("title", ""),
+        }
+        if payload.get("tvdb_id") is not None:
+            pending["tvdb_id"] = int(payload["tvdb_id"])
+        _db().save_pending_action(token, "request_seerr", pending)
+        logger.info(
+            "Proposed request_seerr tmdb_id=%s media_type=%s title=%r token=%s",
+            tmdb_id,
+            media_type,
+            payload.get("title", ""),
+            token[:8],
+        )
+        return {"confirmation_token": token}
     raise HTTPException(status_code=400, detail="Unknown action")
+
+
+@app.get("/api/requests")
+def list_seerr_requests(
+    take: int = 20,
+    skip: int = 0,
+    filter: Optional[str] = None,
+    user=Depends(get_current_user_dep),
+) -> Dict[str, Any]:
+    settings = _settings()
+    config_error = seerr_configuration_error(settings)
+    if config_error:
+        raise HTTPException(status_code=400, detail=config_error)
+    client = SeerrClient(settings.seerr.url, settings.seerr.api_key)
+    requested_by = None
+    if settings.features.multi_user_enabled and user.role != "owner":
+        if user.seerr_user_id is None:
+            raise HTTPException(status_code=403, detail="Seerr account not linked for this user")
+        requested_by = user.seerr_user_id
+    try:
+        return client.list_requests(take=take, skip=skip, filter=filter, requested_by=requested_by)
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.post("/api/actions/confirm")
@@ -1090,7 +1468,267 @@ async def confirm_action(payload: ActionConfirmRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
+@app.get("/api/persona/typing-phrases")
+def get_persona_typing_phrases() -> Dict[str, List[str]]:
+    row = _db().get_persona()
+    if not row:
+        _db().ensure_seed_data()
+        row = _db().get_persona()
+    data = persona_row_to_dict(row)
+    curator_name = str(data.get("curator_name") or "Curator")
+    preset_id = str(data["persona_preset_id"]) if data.get("persona_preset_id") else None
+    return {"phrases": typing_phrases_for(preset_id, curator_name)}
+
+
+@app.get("/api/persona/ui-copy", response_model=PersonaUiCopy)
+def get_persona_ui_copy() -> PersonaUiCopy:
+    row = _db().get_persona()
+    if not row:
+        _db().ensure_seed_data()
+        row = _db().get_persona()
+    data = persona_row_to_dict(row)
+    curator_name = str(data.get("curator_name") or "Curator")
+    preset_id = str(data["persona_preset_id"]) if data.get("persona_preset_id") else None
+    return PersonaUiCopy(**persona_ui_for(preset_id, curator_name))
+
+
+@app.get("/api/engagement/streak", response_model=EngagementStreakResponse)
+def get_engagement_streak() -> EngagementStreakResponse:
+    count = _db().count_chat_sessions_last_days(30)
+    return EngagementStreakResponse(session_count_30d=count, streak_visible=count >= 3)
+
+
+@app.get("/api/watchlist", response_model=WatchlistListResponse)
+def list_watchlist(user=Depends(get_current_user_dep)) -> WatchlistListResponse:
+    user_id = user.id if _settings().features.multi_user_enabled else None
+    items = _db().list_watchlist_pins(user_id=user_id)
+    return WatchlistListResponse(
+        items=[WatchlistPin(**item) for item in items],
+        count=len(items),
+    )
+
+
+@app.post("/api/watchlist", response_model=WatchlistPin)
+def add_watchlist_pin(
+    payload: WatchlistCreate,
+    user=Depends(get_current_user_dep),
+) -> WatchlistPin:
+    if not payload.tmdb_id and not payload.tvdb_id:
+        raise HTTPException(status_code=400, detail="tmdb_id or tvdb_id is required")
+    user_id = user.id if _settings().features.multi_user_enabled else None
+    try:
+        pin = _db().add_watchlist_pin(
+            pin_id=str(uuid.uuid4()),
+            user_id=user_id,
+            tmdb_id=payload.tmdb_id,
+            tvdb_id=payload.tvdb_id,
+            media_type=payload.media_type,
+            title=payload.title.strip(),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return WatchlistPin(**pin)
+
+
+@app.delete("/api/watchlist/{pin_id}")
+def delete_watchlist_pin(
+    pin_id: str,
+    user=Depends(get_current_user_dep),
+) -> Dict[str, bool]:
+    user_id = user.id if _settings().features.multi_user_enabled else None
+    removed = _db().delete_watchlist_pin(pin_id, user_id=user_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Watchlist pin not found")
+    return {"removed": True}
+
+
 @app.post("/api/preferences")
 def add_preference(payload: PreferenceSignal) -> Dict[str, bool]:
     remember_preference(_db(), payload)
     return {"saved": True}
+
+
+@app.get("/api/reviews")
+def list_reviews(
+    rating_key: Optional[str] = None,
+    tmdb_id: Optional[int] = None,
+    media_type: Optional[str] = None,
+    title: Optional[str] = None,
+    min_stars: Optional[int] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    items = get_reviews(
+        _db(),
+        rating_key=rating_key,
+        tmdb_id=tmdb_id,
+        media_type=media_type,
+        title=title,
+        min_stars=min_stars,
+        limit=limit,
+    )
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/reviews")
+def create_review(
+    payload: UserReviewCreate,
+    user=Depends(get_current_user_dep),
+):
+    del user
+    try:
+        saved = save_review(
+            _db(),
+            stars=payload.stars,
+            title=payload.title,
+            media_type=payload.media_type,
+            rating_key=payload.rating_key,
+            tmdb_id=payload.tmdb_id,
+            tvdb_id=payload.tvdb_id,
+            review_text=payload.review_text,
+            review_tags=payload.review_tags,
+            prompted_by=payload.prompted_by,
+            session_id=payload.session_id,
+            lens_id=payload.lens_id,
+            prompt_id=payload.prompt_id,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    settings = _settings()
+    saved = sync_review_rating_to_plex(
+        _db(),
+        settings,
+        saved,
+        replace_plex_rating=payload.replace_plex_rating,
+    )
+    if saved.get("reason") == "plex_rating_conflict":
+        plex_stars = int(saved["plex_stars"])
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "plex_rating_conflict",
+                "plex_stars": plex_stars,
+                "submitted_stars": int(saved["submitted_stars"]),
+                "message": f"Plex has {plex_stars}★ — keep or replace?",
+                "review": saved,
+            },
+        )
+    return UserReview(**saved)
+
+
+@app.get("/api/plex/collections")
+def api_list_plex_collections(
+    media_type: str = "movie",
+    user=Depends(require_role("owner")),
+) -> Dict[str, Any]:
+    del user
+    settings = _settings()
+    config_error = plex_collections_configuration_error(settings)
+    if config_error:
+        raise HTTPException(status_code=400, detail=config_error)
+    section_id = resolve_plex_section(settings, media_type)
+    if not section_id:
+        raise HTTPException(status_code=400, detail=f"Plex {media_type} library section is not configured")
+    client = PlexClient(settings.plex_url, settings.plex_token)
+    items = list_plex_collections(client, section_id)
+    return {
+        "items": [
+            {
+                "rating_key": item.rating_key,
+                "title": item.title,
+                "section_id": item.section_id,
+                "media_type": item.media_type,
+            }
+            for item in items
+        ],
+        "count": len(items),
+    }
+
+
+@app.post("/api/plex/collections/propose")
+def propose_plex_collection(
+    payload: PlexCollectionProposePayload,
+    user=Depends(require_role("owner")),
+) -> Dict[str, Any]:
+    del user
+    settings = _settings()
+    config_error = plex_collections_configuration_error(settings)
+    if config_error:
+        raise HTTPException(status_code=400, detail=config_error)
+    media_type = payload.media_type.strip().lower()
+    if media_type not in {"movie", "show"}:
+        raise HTTPException(status_code=400, detail="media_type must be movie or show")
+    section_id = resolve_plex_section(settings, media_type)
+    if not section_id:
+        raise HTTPException(status_code=400, detail=f"Plex {media_type} library section is not configured")
+    token = uuid.uuid4().hex
+    _db().save_pending_action(
+        token,
+        "create_plex_collection",
+        {
+            "action": "create_plex_collection",
+            "title": payload.title,
+            "media_type": media_type,
+            "section_id": section_id,
+            "rating_keys": list(payload.rating_keys),
+        },
+    )
+    return {"confirmation_token": token}
+
+
+@app.post("/api/plex/collections/{collection_key}/items/propose")
+def propose_plex_collection_items(
+    collection_key: str,
+    payload: PlexCollectionItemsProposePayload,
+    user=Depends(require_role("owner")),
+) -> Dict[str, Any]:
+    del user
+    settings = _settings()
+    config_error = plex_collections_configuration_error(settings)
+    if config_error:
+        raise HTTPException(status_code=400, detail=config_error)
+    media_type = payload.media_type.strip().lower()
+    if media_type not in {"movie", "show"}:
+        raise HTTPException(status_code=400, detail="media_type must be movie or show")
+    section_id = resolve_plex_section(settings, media_type)
+    if not section_id:
+        raise HTTPException(status_code=400, detail=f"Plex {media_type} library section is not configured")
+    if not payload.collection_rating_key and not payload.collection_title:
+        raise HTTPException(
+            status_code=400,
+            detail="collection_rating_key or collection_title is required",
+        )
+    token = uuid.uuid4().hex
+    _db().save_pending_action(
+        token,
+        "add_to_plex_collection",
+        {
+            "action": "add_to_plex_collection",
+            "media_type": media_type,
+            "section_id": section_id,
+            "rating_keys": list(payload.rating_keys),
+            "collection_rating_key": str(payload.collection_rating_key or collection_key or "").strip(),
+            "collection_title": str(payload.collection_title or "").strip(),
+        },
+    )
+    return {"confirmation_token": token}
+
+
+@app.get("/api/reviews/prompts")
+def list_review_prompts(limit: int = 10) -> Dict[str, Any]:
+    db = _db()
+    items = list_pending_prompts(db, limit=limit)
+    mark_prompts_surfaced(db, [str(item["id"]) for item in items])
+    items = list_pending_prompts(db, limit=limit)
+    return {
+        "items": [RatingPrompt(**item) for item in items],
+        "count": len(items),
+    }
+
+
+@app.post("/api/reviews/prompts/{prompt_id}/dismiss", response_model=RatingPrompt)
+def dismiss_review_prompt(prompt_id: str) -> RatingPrompt:
+    try:
+        saved = dismiss_prompt(_db(), prompt_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return RatingPrompt(**saved)

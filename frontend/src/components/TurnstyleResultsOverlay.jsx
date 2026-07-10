@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { groupAddableItems } from "../lib/addActions";
 import ConfirmAllButton from "./ConfirmAllButton";
 import TitleCard from "./TitleCard";
@@ -12,17 +13,26 @@ export default function TurnstyleResultsOverlay({
   onAdd,
   onDismiss,
   onConfirmAllItems,
+  onTogglePin,
+  watchlistLookup,
   actionsDisabled = false,
+  requestPath = "arr",
+  draggableToDock = false,
 }) {
+  const [cinemaMode, setCinemaMode] = useState(false);
   const items = (payload?.items || []).filter(isDisplayableCard);
   if (!items.length) return null;
 
-  const { radarr, sonarr } = groupAddableItems(items);
+  const { radarr, sonarr, seerr } = groupAddableItems(items, { requestPath });
 
   return (
-    <div className="viewport-overlay" data-testid="turnstyle-results-overlay" onClick={onClose}>
+    <div
+      className={`viewport-overlay ${cinemaMode ? "cinema-mode" : ""}`}
+      data-testid="turnstyle-results-overlay"
+      onClick={onClose}
+    >
       <div
-        className="viewport"
+        className={`viewport ${cinemaMode ? "cinema-mode" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-label={payload?.title || "Recommendations"}
@@ -33,12 +43,31 @@ export default function TurnstyleResultsOverlay({
             <p className="eyebrow">Turnstyle view</p>
             <h2>{payload?.title || "Recommendations"}</h2>
           </div>
-          <button type="button" className="ghost" data-testid="close-turnstyle-results" onClick={onClose}>
-            Close
-          </button>
+          <div className="viewport-header-actions">
+            <button
+              type="button"
+              className={`ghost cinema-mode-toggle ${cinemaMode ? "active" : ""}`}
+              data-testid="cinema-mode-toggle"
+              onClick={() => setCinemaMode((value) => !value)}
+              aria-pressed={cinemaMode}
+            >
+              {cinemaMode ? "Exit cinema" : "Cinema mode"}
+            </button>
+            <button type="button" className="ghost" data-testid="close-turnstyle-results" onClick={onClose}>
+              Close
+            </button>
+          </div>
         </header>
-        {(radarr.length >= 2 || sonarr.length >= 2) && onConfirmAllItems ? (
+        {(seerr.length >= 2 || radarr.length >= 2 || sonarr.length >= 2) && onConfirmAllItems ? (
           <div className="bulk-confirm-actions viewport-bulk-actions">
+            {seerr.length >= 2 ? (
+              <ConfirmAllButton
+                count={seerr.length}
+                target="seerr"
+                onClick={() => onConfirmAllItems(seerr, "seerr")}
+                disabled={actionsDisabled}
+              />
+            ) : null}
             {radarr.length >= 2 ? (
               <ConfirmAllButton
                 count={radarr.length}
@@ -62,8 +91,14 @@ export default function TurnstyleResultsOverlay({
             <TitleCard
               key={`${item.media_type}-${item.tmdb_id || item.tvdb_id || item.title}`}
               item={item}
+              requestPath={requestPath}
               onAdd={onAdd}
               onDismiss={onDismiss}
+              onTogglePin={onTogglePin}
+              pinRecord={watchlistLookup?.byItemKey?.get(
+                `${item.media_type}:${item.tmdb_id ?? ""}:${item.tvdb_id ?? ""}`
+              )}
+              draggableToDock={draggableToDock}
             />
           ))}
         </div>

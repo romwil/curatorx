@@ -77,9 +77,9 @@ async function mockTitleCardChat(page: import("@playwright/test").Page) {
 }
 
 async function sendMockChat(page: import("@playwright/test").Page) {
-  await page.getByTestId("command-input").fill("recommend neo-noir films");
+  await page.getByTestId("composer-input").fill("recommend neo-noir films");
   await page.getByTestId("send-button").click();
-  await expect(page.getByTestId("turnstyle-transcript")).toBeVisible();
+  await expect(page.getByTestId("chat-scroll-region")).toBeVisible();
 }
 
 test.describe("Title cards in chat", () => {
@@ -88,10 +88,10 @@ test.describe("Title cards in chat", () => {
     await mockCuratorApis(page);
     await mockTitleCardChat(page);
     await page.goto("/");
-    await page.getByTestId("command-input").waitFor();
+    await page.getByTestId("composer-input").waitFor();
   });
 
-  test("shows proposed title cards with New badge in compact transcript", async ({ page }) => {
+  test("shows proposed title cards with New badge in chat", async ({ page }) => {
     await sendMockChat(page);
 
     await expect(page.getByTestId("chat-message-assistant")).toContainText("Blade Runner");
@@ -110,7 +110,7 @@ test.describe("Title cards in chat", () => {
     await expect(overlay).toContainText("Chinatown");
   });
 
-  test("compact title card Add button is visible without scrolling", async ({ page }) => {
+  test("title card Add button is visible without scrolling", async ({ page }) => {
     await sendMockChat(page);
 
     const addBtn = page.getByTestId("chat-message-assistant").getByTestId("add-radarr-button").first();
@@ -125,7 +125,7 @@ test.describe("Title cards in chat", () => {
     expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
   });
 
-  test("title card Add button is clickable in compact chat", async ({ page }) => {
+  test("title card Add button is clickable in chat", async ({ page }) => {
     await sendMockChat(page);
 
     const chatCard = page.getByTestId("chat-message-assistant").getByTestId("title-card").first();

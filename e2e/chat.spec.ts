@@ -1,116 +1,103 @@
 import { expect, test } from "@playwright/test";
 import { mockChatFailure, mockCuratorApis, resetMockCertifications } from "./fixtures/api-mocks";
 
-test.describe("Chat UI modes", () => {
+test.describe("Chat workspace", () => {
   test.beforeEach(async ({ page }) => {
     resetMockCertifications();
     await mockCuratorApis(page);
     await page.goto("/");
-    await page.getByTestId("command-input").waitFor();
+    await page.getByTestId("composer-input").waitFor();
   });
 
-  test("loads Turnstyle compact view with command input", async ({ page }) => {
-    await expect(page.getByTestId("command-input")).toBeVisible();
-    await expect(page.getByTestId("command-input")).toHaveClass(/font-mono/);
+  test("loads single workspace with composer and chat region", async ({ page }) => {
+    await expect(page.getByTestId("workspace-main")).toBeVisible();
+    await expect(page.getByTestId("chat-scroll-region")).toBeVisible();
+    await expect(page.getByTestId("composer-input")).toBeVisible();
     await expect(page.getByTestId("send-button")).toBeVisible();
-    await expect(page.getByTestId("expand-viewport")).toBeVisible();
-    await expect(page.locator(".turnstyle-compact")).toBeVisible();
+    await expect(page.getByTestId("thread-list")).toBeVisible();
+    await expect(page.getByTestId("expand-viewport")).toHaveCount(0);
+    await expect(page.getByTestId("immersive-viewport")).toHaveCount(0);
   });
 
-  test("shows ambient context prefix in compact mode", async ({ page }) => {
-    await expect(page.locator(".ambient-context-prefix")).toContainText("⧉");
+  test("shows ambient context tag in composer", async ({ page }) => {
+    await expect(page.getByTestId("ambient-context-tag")).toContainText("⧉");
   });
 
-  test("submit chat records user message in immersive view", async ({ page }) => {
-    await page.getByTestId("command-input").fill("Find neo-noir films");
+  test("shows welcome panel on empty thread", async ({ page }) => {
+    await expect(page.getByTestId("welcome-panel")).toBeVisible();
+    await expect(page.getByTestId("welcome-panel")).toContainText("What should we dig into");
+    await expect(page.getByTestId("chat-message-user")).toHaveCount(0);
+  });
+
+  test("submit chat records user and assistant messages", async ({ page }) => {
+    await page.getByTestId("composer-input").fill("Find neo-noir films");
     await page.getByTestId("send-button").click();
     await expect(page.getByTestId("inline-alert-error")).toHaveCount(0);
 
-    await expect(page.getByTestId("turnstyle-transcript")).toBeVisible();
+    await expect(page.getByTestId("chat-scroll-region")).toBeVisible();
     await expect(page.getByTestId("chat-message-assistant")).toContainText("Echo:");
     await expect(page.getByTestId("chat-message-user")).toContainText("Find neo-noir films");
+  });
 
-    await page.getByTestId("expand-viewport").click();
-    await expect(page.getByTestId("chat-message-user")).toContainText("Find neo-noir films");
-    await expect(page.getByTestId("chat-message-assistant")).toContainText("Echo:");
+  test("shows helpful and not helpful buttons on assistant messages", async ({ page }) => {
+    await page.getByTestId("composer-input").fill("Rate this reply");
+    await page.getByTestId("send-button").click();
+    await expect(page.getByTestId("chat-message-assistant")).toBeVisible();
+
+    const assistantMessage = page.getByTestId("chat-message-assistant");
+    const reactions = assistantMessage.getByTestId("message-reactions");
+    await expect(reactions).toBeVisible();
+    await expect(reactions.getByTestId("feedback-helpful")).toBeVisible();
+    await expect(reactions.getByTestId("feedback-not-helpful")).toBeVisible();
+  });
+
+  test("shows typing indicator while waiting for response", async ({ page }) => {
+    await page.route("**/api/chat", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await route.continue();
+    });
+
+    await page.getByTestId("composer-input").fill("Slow response test");
+    await page.getByTestId("send-button").click();
+    await expect(page.getByTestId("typing-indicator")).toBeVisible();
+    await expect(page.getByTestId("typing-indicator")).toContainText("thinking");
   });
 
   test("shows visible error when chat API fails", async ({ page }) => {
     await mockChatFailure(page, "LLM provider unavailable");
     await page.reload();
-    await page.getByTestId("command-input").waitFor();
+    await page.getByTestId("composer-input").waitFor();
 
-    await page.getByTestId("command-input").fill("This should fail");
+    await page.getByTestId("composer-input").fill("This should fail");
     await page.getByTestId("send-button").click();
 
     await expect(page.getByTestId("inline-alert-error")).toBeVisible();
     await expect(page.getByTestId("inline-alert-error")).toContainText("LLM provider unavailable");
   });
 
-  test("expands to immersive viewport from button", async ({ page }) => {
-    await page.getByTestId("expand-viewport").click();
+  test("sidebar rail toggle collapses conversation sidebar", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
 
-    await expect(page.getByTestId("immersive-viewport")).toBeVisible();
-    await expect(page.getByTestId("immersive-sidebar")).toBeVisible();
-    await expect(page.getByTestId("ambient-context")).toBeVisible();
-    await expect(page.getByTestId("sidebar-section-context")).toBeVisible();
-    await expect(page.getByTestId("sidebar-section-integrations")).toBeVisible();
-    await expect(page.getByTestId("sidebar-section-thoughtstream")).toBeVisible();
-    await expect(page.getByTestId("thoughtstream")).toBeVisible();
-    await expect(page.locator(".lens-switcher")).toHaveCount(0);
-    await expect(page.locator(".integration-chips")).toHaveCount(0);
-  });
-
-  test("sidebar rail toggle collapses immersive sidebar", async ({ page }) => {
-    await page.setViewportSize({ width: 1024, height: 800 });
-    await page.getByTestId("expand-viewport").click();
-
-    const sidebar = page.getByTestId("immersive-sidebar");
+    const sidebar = page.getByTestId("workspace-sidebar");
     await expect(sidebar).not.toHaveClass(/sidebar-collapsed/);
 
     await page.getByTestId("sidebar-rail-toggle").click();
     await expect(sidebar).toHaveClass(/sidebar-collapsed/);
   });
 
-  test("integrations section expands on header click", async ({ page }) => {
-    await page.setViewportSize({ width: 1024, height: 800 });
-    await page.getByTestId("expand-viewport").click();
-
-    await expect(page.getByTestId("integration-list")).toHaveCount(0);
-    await page.getByTestId("sidebar-section-integrations").locator("button.sidebar-section-header").click();
-    await expect(page.getByTestId("integration-list")).toBeVisible();
-  });
-
-  test("expands to immersive viewport via /expand command", async ({ page }) => {
-    await page.getByTestId("command-input").fill("/expand");
-    await page.keyboard.press("Enter");
-
-    await expect(page.getByTestId("immersive-viewport")).toBeVisible();
-  });
-
-  test("collapses immersive viewport back to Turnstyle", async ({ page }) => {
-    await page.getByTestId("expand-viewport").click();
-    await expect(page.getByTestId("immersive-viewport")).toBeVisible();
-
-    await page.getByTestId("collapse-viewport").click();
-    await expect(page.getByTestId("command-input")).toBeVisible();
-    await expect(page.getByTestId("immersive-viewport")).toHaveCount(0);
-  });
-
   test("creates and switches between chat threads", async ({ page }) => {
-    await page.getByTestId("expand-viewport").click();
     await expect(page.getByTestId("thread-list")).toBeVisible();
 
-    const composer = page.getByTestId("immersive-composer-input");
+    const composer = page.getByTestId("composer-input");
     await composer.fill("Thread one message");
-    await page.getByTestId("immersive-send-button").click();
+    await page.getByTestId("send-button").click();
     await expect(page.getByTestId("chat-message-user")).toContainText("Thread one message");
 
     await page.getByTestId("new-thread").click();
     await expect(page.getByTestId("chat-message-user")).toHaveCount(0);
 
     await composer.fill("Thread two message");
-    await page.getByTestId("immersive-send-button").click();
+    await page.getByTestId("send-button").click();
     await expect(page.getByTestId("chat-message-user")).toContainText("Thread two message");
 
     const firstThread = page.locator(".thread-item").filter({ hasText: "Thread one message" }).first();

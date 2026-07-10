@@ -227,6 +227,9 @@ def _upsert_episodes_for_show(
                 "last_viewed_at": episode.last_viewed_at,
                 "file_size": episode.file_size,
                 "aired_at": episode.aired_at,
+                "view_offset_ms": episode.view_offset_ms,
+                "duration_ms": episode.duration_ms,
+                "plex_user_rating_stars": episode.user_rating_stars,
             }
         )
         synced += 1

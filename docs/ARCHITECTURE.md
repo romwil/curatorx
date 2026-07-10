@@ -1,6 +1,6 @@
 # CuratorX — Platform Architecture
 
-CuratorX is an **intent-aware curation companion** for Plex libraries. It combines a dual-mode web UI (Turnstyle + Immersive), a tool-using LLM agent, RAG over your indexed library, **curation lens isolation**, **dynamic persona tuning**, and confirmation-gated Radarr/Sonarr actions.
+CuratorX is an **intent-aware curation companion** for Plex libraries. It combines a single-workspace chat UI, a tool-using LLM agent, RAG over your indexed library, **curation lens isolation**, **dynamic persona tuning**, personal **reviews** with optional Plex rating sync, **Plex webhooks** for near-completion rating prompts, and confirmation-gated Radarr/Sonarr actions.
 
 It is a **separate product** from [Reclaimspace](https://github.com/romwil/reclaimspace): Reclaimspace reclaims disk space by quarantining duplicate Plex files; CuratorX helps you discover, add, watch, and purge titles based on taste and usage within explicit cognitive boundaries.
 
@@ -12,13 +12,13 @@ It is a **separate product** from [Reclaimspace](https://github.com/romwil/recla
 |------|---------------------------|
 | **Intent-aware curation** | Lenses sandbox taste; persona sliders shape agent behavior |
 | **Anti-monolith taste** | `lens_id` on chat, telemetry, and taste profiles prevents context contamination |
-| **Chat-first interaction** | Turnstyle for fast intents; Immersive for deep sessions |
+| **Chat-first interaction** | Single chat workspace with welcome panel, watchlist, and status dock |
 | **Informed recommendations** | RAG embeddings + TMDB discovery grounded in library ownership |
 | **Safe automation** | Radarr/Sonarr writes require explicit confirmation tokens |
 | **Self-hosted, BYOP LLM** | OpenAI-compatible, Anthropic, or Ollama |
 | **Homelab friendly** | Single Docker container, SQLite, Unraid template |
 
-Non-goals for Phase 1: multi-user auth, cloud SaaS, automatic file deletion without confirmation, and generic streaming-service recommendations.
+Non-goals for Phase 1: cloud SaaS, automatic file deletion without confirmation, and generic streaming-service recommendations. Multi-user auth, Seerr, and Plex collections are **optional** (off by default); see [CONFIGURATION.md](CONFIGURATION.md#feature-flags-optional-off-by-default).
 
 ---
 
@@ -71,10 +71,11 @@ flowchart TB
 
     subgraph curatorx [CuratorX]
         UI[Vite React SPA]
-        Turnstyle[Turnstyle widget]
-        Immersive[Immersive viewport]
+        Chat[Chat workspace]
         API[FastAPI backend]
         Agent[Curator agent + tools]
+        Reviews[Reviews + Plex sync]
+        Webhooks[Plex webhooks]
         Jobs[Job manager + sync scheduler]
         DB[(SQLite curatorx.db)]
         Settings[settings.json]
@@ -91,12 +92,12 @@ flowchart TB
         Embed[Embedding API optional]
     end
 
-    User --> Turnstyle
-    User --> Immersive
-    Turnstyle --> UI
-    Immersive --> UI
+    User --> Chat
+    Chat --> UI
     UI --> API
     API --> Agent
+    API --> Reviews
+    Webhooks --> API
     API --> Jobs
     Agent --> DB
     Agent --> LLM
@@ -124,12 +125,12 @@ The application runs as a **single process** (Uvicorn + FastAPI). The React fron
 ```mermaid
 flowchart LR
     subgraph frontend [Frontend - Vite React]
-        App[App.jsx view state]
-        TurnstyleV[TurnstyleViewport]
-        Chat[ChatThread lens-bound]
+        App[App.jsx routes]
+        ChatThread[ChatThread lens-bound]
         Cards[TitleCard]
         Config[ConfigPage persona sliders]
         Detail[TitleDetailPage]
+        ReviewsUI[ReviewPromptCard]
     end
 
     subgraph backend [Backend - FastAPI]
@@ -174,9 +175,9 @@ flowchart LR
 
 ### Frontend (Vite / React)
 
-- **Dual UI** — Turnstyle command lane ↔ Immersive sidebar layout (CSS transitions).
+- **Single workspace** — chat thread, welcome panel, watchlist sidebar, keyboard shortcuts.
 - **Lens switcher** — updates active `lens_id`, theme accents, and chat scope.
-- **ChatThread** — renders blocks: `text`, `title_cards`, `action_prompt`.
+- **ChatThread** — renders blocks: `text`, `title_cards`, `action_prompt`, review prompts.
 - **ConfigPage** — setup wizard, persona sliders, live service validation.
 
 See [WEB_UI.md](WEB_UI.md) and [DESIGN.md](DESIGN.md).
@@ -186,8 +187,10 @@ See [WEB_UI.md](WEB_UI.md) and [DESIGN.md](DESIGN.md).
 - REST + SSE under `/api/*`.
 - **Lens API** — `/api/lenses`, `/api/lenses/active`.
 - **Persona API** — `/api/persona`, `/api/system-config`.
+- **Reviews API** — `/api/reviews` with optional Plex rating sync and conflict handling.
+- **Webhooks** — `POST /api/webhooks/plex` for near-completion rating prompts (optional shared secret).
 - **JobManager** — background library sync with progress polling.
-- **CuratorAgent** — accepts `lens_id`; builds persona-aware system prompt.
+- **CuratorAgent** — accepts `lens_id`; builds persona-aware system prompt; tool list respects feature flags.
 
 ### Library and RAG
 
@@ -281,10 +284,13 @@ See [DOCKER.md](DOCKER.md) for Mac Colima, Unraid, and Compose details.
 
 | Topic | Behavior |
 |-------|----------|
-| Authentication | None by default; use trusted LAN or reverse proxy |
-| Destructive actions | Confirmation tokens for all *arr writes |
+| Authentication | **None by default** — single implicit owner; use trusted LAN or reverse proxy. Optional multi-user auth (`features.multi_user_enabled`) adds Plex/OIDC/local login |
+| Feature gates | `GET /api/features` exposes enabled flags; auth UI, Seerr, and Plex collection tools stay hidden until opted in |
+| Webhooks | Optional `webhook_secret` / `CURATORX_WEBHOOK_SECRET`; validates `X-CuratorX-Webhook-Secret` when set |
+| Destructive actions | Confirmation tokens for all *arr writes; owner role gates apply when multi-user is on |
 | Secrets | Masked on API read; env overrides file |
 | Lens isolation | Chat and taste scoped by `lens_id`; no cross-lens history leakage in API |
+| Message feedback | Helpful/not-helpful on assistant replies trains preferences; scoped per user when multi-user is on |
 
 ---
 
@@ -294,7 +300,9 @@ See [DOCKER.md](DOCKER.md) for Mac Colima, Unraid, and Compose details.
 |-----------|--------|
 | Curation lenses | **Implemented** — CRUD, active lens, chat filter |
 | Persona sliders | **Implemented** — DB-backed, hot-reload prompt |
-| Dual UI | **Implemented** — Turnstyle command lane + Immersive viewport |
+| Dual UI | **Removed** — single chat workspace (see [WEB_UI.md](WEB_UI.md)) |
+| Reviews + Plex sync | **Implemented** — personal stars, conflict detection, webhook prompts |
+| Plex webhooks | **Implemented** — near-completion rating queue; optional auth secret |
 | Agent blueprints | Schema present; scheduler wiring **Future** |
 | Interaction telemetry | Schema present; ingestion **Future** |
 | True LLM SSE streaming | **Future** |

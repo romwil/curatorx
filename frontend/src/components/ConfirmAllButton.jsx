@@ -5,9 +5,11 @@ export default function ConfirmAllButton({ count, target, onClick, disabled = fa
   const label =
     resolvedVariant === "tokens"
       ? `Confirm all ${count} adds`
-      : resolvedVariant === "sonarr"
-        ? `Confirm all ${count} to Sonarr`
-        : `Confirm all ${count} to Radarr`;
+      : resolvedVariant === "seerr"
+        ? `Confirm all ${count} in Seerr`
+        : resolvedVariant === "sonarr"
+          ? `Confirm all ${count} to Sonarr`
+          : `Confirm all ${count} to Radarr`;
 
   return (
     <button

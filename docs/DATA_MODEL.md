@@ -37,6 +37,8 @@ Canonical Plex index enriched during sync.
 | `poster_url` / `backdrop_url` | TEXT | Art URLs |
 | `view_count` | INTEGER | Plex plays |
 | `last_viewed_at` | INTEGER | Unix timestamp |
+| `view_offset_ms` | INTEGER | Plex partial-watch offset (milliseconds) |
+| `duration_ms` | INTEGER | Plex media duration (milliseconds) |
 | `file_size` | INTEGER | Bytes on disk |
 | `in_radarr` / `in_sonarr` | INTEGER | 0/1 queue flags |
 | `updated_at` | REAL | Last upsert |
@@ -83,6 +85,59 @@ Taste signals for agent context and purge scoring.
 | **`lens_id`** | TEXT | **Lens filter for history queries** (default `general`) |
 
 Chat history API and agent context load messages filtered by `lens_id` so lenses remain isolated within a session.
+
+#### `message_feedback`
+
+Helpful / not-helpful reactions on assistant messages (curator training signals).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | Feedback row UUID |
+| `message_id` | TEXT FK | References `chat_messages.id` |
+| `session_id` | TEXT FK | References `chat_sessions.id` |
+| `user_id` | TEXT FK nullable | References `users.id`; bootstrap owner when multi-user is off |
+| `feedback_type` | TEXT | `helpful` or `not_helpful` |
+| `excerpt` | TEXT | Truncated assistant message text sent to preference training |
+| `created_at` | REAL | Unix timestamp |
+
+Unique per `(message_id, user_id)`. POST feedback also writes a `positive` or `negative` row to `preference_facts` via `remember_preference`.
+
+#### `watchlist_pins`
+
+Personal shelf of titles pinned from chat title cards.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | Pin UUID |
+| `user_id` | TEXT FK nullable | References `users.id`; NULL when multi-user is off |
+| `tmdb_id` | INTEGER | Movie TMDB id (optional) |
+| `tvdb_id` | INTEGER | Show TVDB id (optional) |
+| `media_type` | TEXT | `movie` or `show` |
+| `title` | TEXT | Display title |
+| `created_at` | REAL | Unix timestamp |
+
+Unique per `(user_id, media_type, tmdb_id, tvdb_id)`.
+
+#### `users`
+
+Household accounts (schema present from Phase 0; login enforced only when `features.multi_user_enabled` is true).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | CuratorX user id (`bootstrap-owner` for single-user installs) |
+| `display_name` | TEXT | Shown in UI |
+| `email` | TEXT | Optional |
+| `role` | TEXT | `owner`, `member`, or `guest` |
+| `plex_user_id` | TEXT UNIQUE | Plex account link |
+| `plex_token_enc` | TEXT | Optional encrypted Plex token (Seerr bridge) |
+| `seerr_user_id` | INTEGER | Cached Seerr user id |
+| `seerr_permissions` | INTEGER | Cached Seerr permission bitmask |
+| `oidc_sub` | TEXT UNIQUE | OIDC subject |
+| `avatar_url` | TEXT | Optional |
+| `created_at` | REAL | |
+| `last_login_at` | REAL | |
+
+On first run with multi-user disabled, a bootstrap **owner** row is inserted automatically.
 
 #### `pending_actions`
 
@@ -181,6 +236,42 @@ Seeded on init: **`general`** lens.
 | `instructions_json` | TEXT | Serialized agent instructions |
 | `is_enabled` | INTEGER | 0/1 |
 | `last_run_status` / `last_run_timestamp` | | Job telemetry |
+
+#### `user_title_reviews`
+
+Personal 1–5 star ratings and optional free-text notes for titles you have watched. Separate from message helpful/not-helpful reactions.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | Review UUID |
+| `rating_key` | TEXT | Plex rating key when known |
+| `tmdb_id` / `tvdb_id` | INTEGER | External IDs for lookup |
+| `media_type` | TEXT | `movie` or `show` |
+| `title` | TEXT | Display title |
+| `stars` | INTEGER | 1–5 |
+| `review_text` | TEXT | Optional short review |
+| `review_tags` | TEXT | JSON array of taste tags |
+| `prompted_by` | TEXT | `user`, `near_complete`, `slash_rate`, `curator_suggestion` |
+| `session_id` | TEXT | Chat thread when captured in UI |
+| `lens_id` | TEXT | Active lens |
+| `plex_rating_synced` | INTEGER | Phase 5 Plex write-back flag |
+| `created_at` / `updated_at` | REAL | Unix timestamps |
+
+#### `rating_prompt_queue`
+
+Proactive near-completion prompts (≥85% watched) surfaced in chat after library sync.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | TEXT PK | Prompt UUID |
+| `rating_key` | TEXT UNIQUE | Plex item or episode key |
+| `media_type` | TEXT | `movie` or `show` |
+| `title` | TEXT | Prompt headline |
+| `completion_pct` | REAL | Detected watch progress |
+| `detected_at` | REAL | When queued |
+| `prompted_at` | REAL | When the prompt was shown in chat |
+| `dismissed_at` | REAL | Skip — 30-day cooldown before re-prompt |
+| `review_id` | TEXT | Linked `user_title_reviews.id` after save |
 
 ---
 

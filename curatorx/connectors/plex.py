@@ -6,7 +6,27 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-from curatorx.connectors.http import merge_plex_provider_ids, optional_int, request_xml
+from curatorx.connectors.http import merge_plex_provider_ids, optional_int, request_empty, request_xml
+
+STARS_TO_PLEX_RATING = {1: 2, 2: 4, 3: 6, 4: 8, 5: 10}
+PLEX_RATING_TO_STARS = {rating: stars for stars, rating in STARS_TO_PLEX_RATING.items()}
+PLEX_LIBRARY_IDENTIFIER = "com.plexapp.plugins.library"
+
+
+def stars_to_plex_rating(stars: int) -> int:
+    if stars not in STARS_TO_PLEX_RATING:
+        raise ValueError("stars must be between 1 and 5")
+    return STARS_TO_PLEX_RATING[stars]
+
+
+def plex_rating_to_stars(plex_rating: Optional[int]) -> Optional[int]:
+    if plex_rating is None or int(plex_rating) <= 0:
+        return None
+    rating = int(plex_rating)
+    if rating in PLEX_RATING_TO_STARS:
+        return PLEX_RATING_TO_STARS[rating]
+    closest = min(PLEX_RATING_TO_STARS.keys(), key=lambda value: abs(value - rating))
+    return PLEX_RATING_TO_STARS[closest]
 
 
 @dataclass
@@ -31,6 +51,7 @@ class PlexLibraryItem:
     cast: List[str] = field(default_factory=list)
     content_rating: str = ""
     duration_ms: Optional[int] = None
+    view_offset_ms: Optional[int] = None
     view_count: int = 0
     added_at: Optional[int] = None
     last_viewed_at: Optional[int] = None
@@ -41,6 +62,7 @@ class PlexLibraryItem:
     season_count: Optional[int] = None
     leaf_count: Optional[int] = None
     viewed_leaf_count: Optional[int] = None
+    user_rating_stars: Optional[int] = None
 
 
 @dataclass
@@ -59,10 +81,13 @@ class PlexEpisode:
     season_number: Optional[int] = None
     episode_number: Optional[int] = None
     runtime_minutes: Optional[int] = None
+    view_offset_ms: Optional[int] = None
+    duration_ms: Optional[int] = None
     view_count: int = 0
     last_viewed_at: Optional[int] = None
     file_size: int = 0
     aired_at: str = ""
+    user_rating_stars: Optional[int] = None
 
 
 class PlexClient:
@@ -80,6 +105,7 @@ class PlexClient:
         self.movie_section = movie_section
         self.tv_section = tv_section
         self.timeout = timeout
+        self._machine_identifier: Optional[str] = None
 
     def list_sections(self) -> List[PlexSection]:
         root = self._request_xml("/library/sections")
@@ -159,6 +185,34 @@ class PlexClient:
             raise ValueError("season_rating_key is required")
         root = self._request_xml(f"/library/metadata/{key}/children")
         return self._parse_episode_elements(self._container_children(root, "Video"))
+
+    def machine_identifier(self) -> str:
+        if self._machine_identifier:
+            return self._machine_identifier
+        root = self._request_xml("/")
+        container = root if root.tag == "MediaContainer" else root.find("MediaContainer")
+        if container is None:
+            raise RuntimeError("Could not read Plex server identity")
+        machine_id = str(container.attrib.get("machineIdentifier") or "").strip()
+        if not machine_id:
+            raise RuntimeError("Plex server did not return machineIdentifier")
+        self._machine_identifier = machine_id
+        return machine_id
+
+    def set_user_rating(self, rating_key: str, stars: int) -> None:
+        key = str(rating_key or "").strip()
+        if not key:
+            raise ValueError("rating_key is required")
+        rating = stars_to_plex_rating(stars)
+        query = urllib.parse.urlencode(
+            {
+                "identifier": PLEX_LIBRARY_IDENTIFIER,
+                "key": key,
+                "rating": str(rating),
+            }
+        )
+        url = f"{self.base_url}/:/rate?{query}&X-Plex-Token={urllib.parse.quote(self.token)}"
+        request_empty(url, method="PUT", timeout=self.timeout)
 
     def thumb_url(self, path: str) -> str:
         if not path:
@@ -242,6 +296,7 @@ class PlexClient:
             cast=[c for c in cast if c],
             content_rating=str(element.attrib.get("contentRating") or ""),
             duration_ms=optional_int(element.attrib.get("duration")),
+            view_offset_ms=optional_int(element.attrib.get("viewOffset")),
             view_count=int(element.attrib.get("viewCount") or 0),
             added_at=optional_int(element.attrib.get("addedAt")),
             last_viewed_at=optional_int(element.attrib.get("lastViewedAt")),
@@ -252,6 +307,7 @@ class PlexClient:
             season_count=optional_int(element.attrib.get("childCount")) if media_type == "show" else None,
             leaf_count=optional_int(element.attrib.get("leafCount")) if media_type == "show" else None,
             viewed_leaf_count=optional_int(element.attrib.get("viewedLeafCount")) if media_type == "show" else None,
+            user_rating_stars=plex_rating_to_stars(optional_int(element.attrib.get("userRating"))),
         )
 
     def _container_children(self, root, tag: str):
@@ -276,10 +332,15 @@ class PlexClient:
                     season_number=optional_int(element.attrib.get("parentIndex")),
                     episode_number=optional_int(element.attrib.get("index")),
                     runtime_minutes=runtime_minutes,
+                    view_offset_ms=optional_int(element.attrib.get("viewOffset")),
+                    duration_ms=duration_ms,
                     view_count=int(element.attrib.get("viewCount") or 0),
                     last_viewed_at=optional_int(element.attrib.get("lastViewedAt")),
                     file_size=file_size,
                     aired_at=aired,
+                    user_rating_stars=plex_rating_to_stars(
+                        optional_int(element.attrib.get("userRating"))
+                    ),
                 )
             )
         return episodes

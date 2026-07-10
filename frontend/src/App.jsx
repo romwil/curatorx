@@ -1,43 +1,90 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   api,
+  addWatchlistPin,
   confirmAction,
   createThread,
+  dismissReviewPrompt,
   formatApiError,
   getActiveContext,
+  getEngagementStreak,
+  getFeatures,
+  getThreadFeedback,
   getThreadMessages,
+  getTypingPhrases,
   listJobs,
+  listReviewPrompts,
+  listReviews,
   listThreads,
+  listWatchlist,
   proposeAction,
+  removeWatchlistPin,
   resolveAgentPulse,
+  saveReview,
   sendChat,
   sessionId,
   setActiveSession,
+  submitMessageFeedback,
 } from "./api/client";
-import { alreadyInArrMessage, isAlreadyInArr } from "./lib/addActions.js";
-import AddActionBanner from "./components/AddActionBanner";
+import { alreadyInArrMessage, buildProposeActionBody, isAlreadyInArr, requestPathFromFeatures, serviceLabelForTarget } from "./lib/addActions.js";
+import { blendAmbientAccent } from "./lib/ambientAccent.js";
+import { executeSlashCommand, parseSlashCommand } from "./lib/slashCommands.js";
+import {
+  createKonamiTracker,
+  easterEggAlreadyFired,
+  easterEggResponse,
+  isReversedCuratorName,
+  markEasterEggFired,
+  resolveDockDropTarget,
+} from "./lib/easterEggs.js";
+import { buildWatchlistLookup } from "./lib/watchlistKeys.js";
 import ChatThread from "./components/ChatThread";
 import InlineAlert from "./components/InlineAlert";
-import IntegrationStatus from "./components/IntegrationStatus";
-import SidebarSection from "./components/SidebarSection";
-import Thoughtstream from "./components/Thoughtstream";
+import KeyboardHelpModal from "./components/KeyboardHelpModal";
+import NewReplyChip from "./components/NewReplyChip";
+import StatusDock from "./components/StatusDock";
 import ThreadList from "./components/ThreadList";
 import TurnstyleResultsOverlay from "./components/TurnstyleResultsOverlay";
-import TurnstyleViewport from "./components/TurnstyleViewport";
-import VisualFingerprint from "./components/VisualFingerprint";
+import TypingIndicator from "./components/TypingIndicator";
+import WelcomePanel from "./components/WelcomePanel";
+import UserMenu, { useAuthGate } from "./components/UserMenu";
+import { reviewPromptBlock } from "./components/ReviewPromptCard";
+import useChatScroll from "./hooks/useChatScroll";
+import useKeyboardShortcuts from "./hooks/useKeyboardShortcuts";
 
 const SIDEBAR_RAIL_KEY = "curatorx.sidebar.rail";
-const MEDIUM_BREAKPOINT = "(max-width: 1100px)";
 const ADD_FEEDBACK_DISMISS_MS = 5000;
+const PERFECT_PICK_ACK =
+  "\n\n*(You're on a roll with these picks — I'll keep that momentum going.)*";
+
+function pickRandomPhrase(phrases, fallback) {
+  if (!phrases?.length) return fallback;
+  return phrases[Math.floor(Math.random() * phrases.length)];
+}
+
+function isNightOwlHour() {
+  return new Date().getHours() >= 23;
+}
+
+function appendPerfectPickAck(message) {
+  if (!message?.blocks?.length) return message;
+  const blocks = message.blocks.map((block, index) => {
+    if (index === 0 && block.type === "text") {
+      return { ...block, content: `${block.content}${PERFECT_PICK_ACK}` };
+    }
+    return block;
+  });
+  return { ...message, blocks };
+}
 
 export default function App() {
-  const [viewMode, setViewMode] = useState("compact");
+  const { authReady, multiUserEnabled } = useAuthGate();
   const [messages, setMessages] = useState([]);
+  const [messageFeedback, setMessageFeedback] = useState({});
   const [threads, setThreads] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(() => sessionId());
   const [threadsReady, setThreadsReady] = useState(false);
-  const [showCompactThreads, setShowCompactThreads] = useState(false);
   const [turnstyleResults, setTurnstyleResults] = useState(null);
   const [pendingAdd, setPendingAdd] = useState(null);
   const [pendingBulk, setPendingBulk] = useState(null);
@@ -52,7 +99,23 @@ export default function App() {
   const [setup, setSetup] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [persona, setPersona] = useState(null);
+  const [features, setFeatures] = useState(null);
   const [activeContext, setActiveContext] = useState(null);
+  const [keyboardHelpOpen, setKeyboardHelpOpen] = useState(false);
+  const [watchlistPins, setWatchlistPins] = useState([]);
+  const [watchlistOpen, setWatchlistOpen] = useState(false);
+  const [sessionStreak, setSessionStreak] = useState(0);
+  const [reviewPrompts, setReviewPrompts] = useState([]);
+  const [reviewLookup, setReviewLookup] = useState({});
+  const [typingPhrases, setTypingPhrases] = useState([]);
+  const [typingLabel, setTypingLabel] = useState("");
+  const [composerPlaceholder, setComposerPlaceholder] = useState("");
+  const [nightOwl, setNightOwl] = useState(isNightOwlHour);
+  const helpfulCountRef = useRef(0);
+  const perfectPickPendingRef = useRef(false);
+  const jobsRunningRef = useRef(false);
+  const composerRef = useRef(null);
+  const konamiTrackerRef = useRef(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
       return sessionStorage.getItem(SIDEBAR_RAIL_KEY) === "true";
@@ -60,12 +123,52 @@ export default function App() {
       return false;
     }
   });
-  const [isMediumViewport, setIsMediumViewport] = useState(() =>
-    typeof window !== "undefined" ? window.matchMedia(MEDIUM_BREAKPOINT).matches : false
-  );
+
+  const { scrollRef, showNewReplyChip, scrollToBottom } = useChatScroll({
+    messages,
+    loading,
+    sessionId: activeSessionId,
+  });
+
+  const refreshReviewData = useCallback(async () => {
+    try {
+      const [reviewsData, promptsData] = await Promise.all([listReviews({ limit: 200 }), listReviewPrompts(5)]);
+      const lookup = {};
+      for (const review of reviewsData.items || []) {
+        if (review.rating_key) {
+          lookup[review.rating_key] = review.stars;
+        }
+        if (review.tmdb_id) {
+          lookup[`${review.media_type}:${review.tmdb_id}`] = review.stars;
+        }
+      }
+      setReviewLookup(lookup);
+      setReviewPrompts(promptsData.items || []);
+    } catch (error) {
+      console.error(error);
+    }
+  }, []);
 
   const refreshJobs = useCallback(() => {
     listJobs().then(setJobs).catch(console.error);
+  }, []);
+
+  const refreshWatchlist = useCallback(() => {
+    listWatchlist()
+      .then((data) => setWatchlistPins(data.items || []))
+      .catch(console.error);
+  }, []);
+
+  const refreshStreak = useCallback(() => {
+    getEngagementStreak()
+      .then((data) => setSessionStreak(data.session_count_30d || 0))
+      .catch(console.error);
+  }, []);
+
+  const refreshTypingPhrases = useCallback(() => {
+    getTypingPhrases()
+      .then((data) => setTypingPhrases(data.phrases || []))
+      .catch(console.error);
   }, []);
 
   const refreshThreads = useCallback(async () => {
@@ -79,25 +182,47 @@ export default function App() {
     }
   }, []);
 
+  const loadThreadFeedback = useCallback(async (session) => {
+    try {
+      const data = await getThreadFeedback(session);
+      const next = {};
+      for (const item of data.items || []) {
+        if (item.message_id && item.feedback) {
+          next[item.message_id] = item.feedback;
+        }
+      }
+      setMessageFeedback(next);
+    } catch (error) {
+      if (!error.message?.includes("Thread not found")) {
+        console.error(error);
+      }
+      setMessageFeedback({});
+    }
+  }, []);
+
   const loadThreadMessages = useCallback(async (session) => {
     try {
       const data = await getThreadMessages(session);
       setMessages(data.messages || []);
       setChatError("");
+      await loadThreadFeedback(session);
       return true;
     } catch (error) {
       if (error.message?.includes("Thread not found")) {
         setMessages([]);
+        setMessageFeedback({});
         return false;
       }
       console.error(error);
       return false;
     }
-  }, []);
+  }, [loadThreadFeedback]);
 
   const switchThread = useCallback(
     async (session) => {
       if (!session || session === activeSessionId) return;
+      helpfulCountRef.current = 0;
+      perfectPickPendingRef.current = false;
       setActiveSession(session);
       setActiveSessionId(session);
       setChatError("");
@@ -117,21 +242,68 @@ export default function App() {
       setActiveSession(nextId);
       setActiveSessionId(nextId);
       setMessages([]);
+      setMessageFeedback({});
       setChatError("");
-      setShowCompactThreads(false);
       await refreshThreads();
     } catch (error) {
       console.error(error);
     }
   }, [refreshThreads]);
 
-  useEffect(() => {
-    const mediaQuery = window.matchMedia(MEDIUM_BREAKPOINT);
-    const syncViewport = (event) => setIsMediumViewport(event.matches);
-    syncViewport(mediaQuery);
-    mediaQuery.addEventListener("change", syncViewport);
-    return () => mediaQuery.removeEventListener("change", syncViewport);
-  }, []);
+  useKeyboardShortcuts({
+    composerRef,
+    onNewThread: handleCreateThread,
+    onCloseOverlay: () => setTurnstyleResults(null),
+    onShowHelp: () => setKeyboardHelpOpen(true),
+    overlayOpen: Boolean(turnstyleResults),
+  });
+
+  const handleMessageFeedbackChange = useCallback(
+    async (messageId, feedback) => {
+      const previous = messageFeedback[messageId] ?? null;
+      if (feedback === previous) return;
+
+      if (!feedback) {
+        setMessageFeedback((current) => {
+          const next = { ...current };
+          delete next[messageId];
+          return next;
+        });
+        try {
+          await submitMessageFeedback(messageId, activeSessionId, null);
+        } catch (error) {
+          if (previous) {
+            setMessageFeedback((current) => ({ ...current, [messageId]: previous }));
+          }
+          console.error(error);
+        }
+        return;
+      }
+
+      setMessageFeedback((current) => ({ ...current, [messageId]: feedback }));
+      if (feedback === "helpful") {
+        helpfulCountRef.current += 1;
+        if (helpfulCountRef.current >= 5) {
+          perfectPickPendingRef.current = true;
+        }
+      }
+      try {
+        await submitMessageFeedback(messageId, activeSessionId, feedback);
+      } catch (error) {
+        setMessageFeedback((current) => {
+          const next = { ...current };
+          if (previous) {
+            next[messageId] = previous;
+          } else {
+            delete next[messageId];
+          }
+          return next;
+        });
+        console.error(error);
+      }
+    },
+    [activeSessionId, messageFeedback]
+  );
 
   function toggleSidebarRail() {
     setSidebarCollapsed((collapsed) => {
@@ -181,14 +353,58 @@ export default function App() {
       api("/setup/status").then(setSetup),
       api("/library/stats").then(setStats),
       api("/persona").then(setPersona).catch(console.error),
+      getFeatures().then(setFeatures).catch(console.error),
+      refreshReviewData(),
       getActiveContext()
         .then(setActiveContext)
         .catch(() => setActiveContext({ context_hash: "general", inferred_label: "General Exploration" })),
     ]).catch(console.error);
     refreshJobs();
+    refreshWatchlist();
+    refreshStreak();
+    refreshTypingPhrases();
     const interval = setInterval(refreshJobs, 5000);
+    const nightInterval = setInterval(() => setNightOwl(isNightOwlHour()), 60_000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(nightInterval);
+    };
+  }, [refreshJobs, refreshReviewData, refreshStreak, refreshTypingPhrases, refreshWatchlist]);
+
+  useEffect(() => {
+    const running = jobs.some((job) => job.status === "running" || job.status === "queued");
+    if (jobsRunningRef.current && !running) {
+      refreshReviewData();
+    }
+    jobsRunningRef.current = running;
+  }, [jobs, refreshReviewData]);
+
+  useEffect(() => {
+    if (!loading) return;
+    const fallback = `${persona?.curator_name || "Curator"} is thinking`;
+    setTypingLabel(pickRandomPhrase(typingPhrases, fallback));
+  }, [loading, persona?.curator_name, typingPhrases]);
+
+  useEffect(() => {
+    refreshTypingPhrases();
+  }, [persona?.persona_preset_id, persona?.curator_name, refreshTypingPhrases]);
+
+  const personaUi = persona?.persona_ui;
+  const composerPlaceholders =
+    personaUi?.composer_placeholders?.length
+      ? personaUi.composer_placeholders
+      : ["Describe what you're hunting for…"];
+
+  useEffect(() => {
+    if (!composerPlaceholders.length) return undefined;
+    setComposerPlaceholder(composerPlaceholders[0]);
+    let index = 0;
+    const interval = setInterval(() => {
+      index = (index + 1) % composerPlaceholders.length;
+      setComposerPlaceholder(composerPlaceholders[index]);
+    }, 8000);
     return () => clearInterval(interval);
-  }, [refreshJobs]);
+  }, [composerPlaceholders]);
 
   useEffect(() => {
     if (!addFeedback) return undefined;
@@ -201,7 +417,15 @@ export default function App() {
   }
 
   function appendChatError(reason) {
-    const message = `Curator couldn't respond: ${reason}`;
+    const snark = persona?.val_dipl_snark ?? 0.5;
+    let message;
+    if (snark >= 0.66) {
+      message = `Well, that didn't work — ${reason}`;
+    } else if (snark <= 0.33) {
+      message = `Sorry, I couldn't respond just now: ${reason}`;
+    } else {
+      message = `Curator couldn't respond: ${reason}`;
+    }
     setChatError(message);
     setMessages((prev) => [
       ...prev,
@@ -224,6 +448,45 @@ export default function App() {
     };
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
+
+    const curatorName = persona?.curator_name || "Curator";
+    if (!easterEggAlreadyFired() && isReversedCuratorName(text, curatorName)) {
+      markEasterEggFired();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          blocks: [{ type: "text", content: easterEggResponse("reversed_name", curatorName) }],
+        },
+      ]);
+      setLoading(false);
+      return;
+    }
+
+    const slash = parseSlashCommand(text);
+    if (slash) {
+      try {
+        const assistantMessage = await executeSlashCommand(slash, {
+          api,
+          getFeatures,
+          curatorName: persona?.curator_name || "Curator",
+        });
+        setMessages((prev) => [...prev, assistantMessage]);
+        if (slash.command === "sync" && !features?.features?.multi_user_enabled) {
+          refreshJobs();
+        }
+        if (slash.command === "stats") {
+          api("/library/stats").then(setStats).catch(console.error);
+        }
+      } catch (error) {
+        appendChatError(formatApiError(error));
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
     try {
       const result = await sendChat(text, "general", { sessionId: activeSessionId });
       if (!result?.message?.blocks?.length) {
@@ -232,7 +495,13 @@ export default function App() {
         );
         return;
       }
-      setMessages((prev) => [...prev, result.message]);
+      let assistantMessage = result.message;
+      if (perfectPickPendingRef.current) {
+        assistantMessage = appendPerfectPickAck(assistantMessage);
+        perfectPickPendingRef.current = false;
+        helpfulCountRef.current = 0;
+      }
+      setMessages((prev) => [...prev, assistantMessage]);
       setPendingTokens(Array.isArray(result.pending_tokens) ? result.pending_tokens : []);
       if (Array.isArray(result.pending_tokens) && result.pending_tokens.length >= 2) {
         setPendingBulk(null);
@@ -288,9 +557,11 @@ export default function App() {
     setPendingAdd(null);
   }
 
+  const requestPath = requestPathFromFeatures(features);
+
   async function executeBulkAdd(items, target) {
-    const service = target === "sonarr" ? "Sonarr" : "Radarr";
-    const action = target === "sonarr" ? "add_sonarr" : "add_radarr";
+    const service = serviceLabelForTarget(target);
+    const action = target === "sonarr" ? "add_sonarr" : target === "seerr" ? "request_seerr" : "add_radarr";
     let successCount = 0;
     const failures = [];
 
@@ -300,10 +571,7 @@ export default function App() {
     for (let index = 0; index < items.length; index += 1) {
       const item = items[index];
       setAddProgress({ current: index + 1, total: items.length, title: item.title });
-      const body =
-        target === "sonarr"
-          ? { action, tvdb_id: item.tvdb_id, title: item.title }
-          : { action, tmdb_id: item.tmdb_id, title: item.title };
+      const body = buildProposeActionBody(item, target);
       try {
         const proposal = await proposeAction(body);
         if (isAlreadyInArr(proposal)) {
@@ -328,7 +596,10 @@ export default function App() {
     if (successCount === items.length) {
       setAddFeedback({
         type: "success",
-        message: `Added ${successCount} title${successCount === 1 ? "" : "s"} to ${service}.`,
+        message:
+          target === "seerr"
+            ? `Requested ${successCount} title${successCount === 1 ? "" : "s"} in Seerr.`
+            : `Added ${successCount} title${successCount === 1 ? "" : "s"} to ${service}.`,
       });
       return;
     }
@@ -425,12 +696,8 @@ export default function App() {
 
     const { item, target } = pendingAdd;
     const label = item.title || "this title";
-    const service = target === "sonarr" ? "Sonarr" : "Radarr";
-    const action = target === "sonarr" ? "add_sonarr" : "add_radarr";
-    const body =
-      target === "sonarr"
-        ? { action, tvdb_id: item.tvdb_id, title: item.title }
-        : { action, tmdb_id: item.tmdb_id, title: item.title };
+    const service = serviceLabelForTarget(target);
+    const body = buildProposeActionBody(item, target);
 
     setAddInProgress(true);
     try {
@@ -450,7 +717,13 @@ export default function App() {
           message: alreadyInArrMessage(confirm, { label, service }),
         });
       } else {
-        setAddFeedback({ type: "success", message: `Added "${label}" to ${service}.` });
+        setAddFeedback({
+          type: "success",
+          message:
+            target === "seerr"
+              ? `Requested "${label}" in Seerr.`
+              : `Added "${label}" to ${service}.`,
+        });
       }
       setPendingAdd(null);
     } catch (error) {
@@ -473,256 +746,254 @@ export default function App() {
     });
   }
 
-  async function syncLibrary() {
-    const job = await api("/library/sync", { method: "POST" });
-    refreshJobs();
-    alert(`Library sync started (${job.id})`);
+  async function handleToggleWatchlistPin(item, pinRecord) {
+    try {
+      if (pinRecord?.id) {
+        await removeWatchlistPin(pinRecord.id);
+      } else {
+        await addWatchlistPin({
+          tmdb_id: item.tmdb_id,
+          tvdb_id: item.tvdb_id,
+          media_type: item.media_type,
+          title: item.title || "Unknown title",
+        });
+      }
+      refreshWatchlist();
+    } catch (error) {
+      console.error(error);
+    }
+  }
+
+  async function handleReviewSave({ prompt, stars, review_text: reviewText, session_id: reviewSessionId, replace_plex_rating: replacePlexRating }) {
+    const slashRate = String(prompt.id || "").startsWith("slash-rate-");
+    await saveReview({
+      stars,
+      title: prompt.title,
+      media_type: prompt.media_type,
+      rating_key: prompt.rating_key,
+      review_text: reviewText,
+      prompted_by: slashRate ? "slash_rate" : "near_complete",
+      session_id: reviewSessionId || activeSessionId,
+      prompt_id: slashRate ? undefined : prompt.id,
+      replace_plex_rating: Boolean(replacePlexRating),
+    });
+    if (!slashRate) {
+      setReviewPrompts((current) => current.filter((entry) => entry.id !== prompt.id));
+    }
+    refreshReviewData();
+  }
+
+  async function handleReviewDismiss(prompt) {
+    if (!String(prompt.id || "").startsWith("slash-rate-")) {
+      await dismissReviewPrompt(prompt.id);
+      setReviewPrompts((current) => current.filter((entry) => entry.id !== prompt.id));
+    }
+  }
+
+  async function handleReviewConflictResolved() {
+    refreshReviewData();
+  }
+
+  function handleDockDrop(item) {
+    const target = resolveDockDropTarget(item, {
+      radarrConnected: Boolean(setup?.checks?.radarr?.ok),
+      sonarrConnected: Boolean(setup?.checks?.sonarr?.ok),
+    });
+    if (!target) return;
+    handleAdd(item, target);
   }
 
   const agentPulse = resolveAgentPulse(jobs);
   const curatorName = persona?.curator_name || "Curator";
+  const presetTagline = personaUi?.preset_tagline || "";
+  const radarrConnected = Boolean(setup?.checks?.radarr?.ok);
+  const sonarrConnected = Boolean(setup?.checks?.sonarr?.ok);
+  const dockDropEnabled =
+    requestPath !== "seerr" && (radarrConnected || sonarrConnected);
+  const watchlistLookup = buildWatchlistLookup(watchlistPins);
   const contextLabel = activeContext?.inferred_label || "Exploring…";
-  const activeThread = threads.find((thread) => thread.id === activeSessionId);
-  const activeThreadTitle = activeThread?.thread_title || "New conversation";
+  const ambientAccent = blendAmbientAccent(
+    activeContext?.context_hash,
+    personaUi?.accent_hue,
+  );
+  const showWelcomePanel = threadsReady && messages.length === 0;
+  const reviewPromptMessages = reviewPrompts.map((prompt) => ({
+    id: `review-prompt-${prompt.id}`,
+    role: "assistant",
+    blocks: [reviewPromptBlock(prompt)],
+  }));
+  const displayMessages = [...messages, ...reviewPromptMessages];
+
+  if (!authReady) {
+    return (
+      <div className="app-root workspace app-loading" data-testid="app-auth-loading">
+        <p className="login-lede">Loading…</p>
+      </div>
+    );
+  }
 
   return (
-    <div className={`app-root ${viewMode}`}>
-      {viewMode === "compact" ? (
-        <div className="turnstyle-shell">
-          <header className="turnstyle-topbar">
-            <div>
-              <p className="eyebrow">{curatorName}</p>
-              <h1>CuratorX</h1>
-            </div>
-            <div className="topbar-actions">
-              <span className={`agent-pulse ${agentPulse}`} title={`Agent ${agentPulse}`} />
-              {stats ? (
-                <span className="stat-chip">
-                  {stats.total} indexed
-                </span>
-              ) : null}
-              <Link to="/config" className="btn-link ghost">
-                Config
-              </Link>
-            </div>
-          </header>
-
-          {setup && !setup.onboarding_complete ? (
-            <div className="banner" data-testid="setup-banner">
-              Finish setup in <Link to="/config">Settings</Link> to connect Plex, TMDB, and your LLM provider.
-            </div>
+    <div
+      className="app-root workspace"
+      style={{ "--ambient-accent": ambientAccent }}
+    >
+      <header className={`app-topbar ${nightOwl ? "night-owl" : ""}`}>
+        <div className="app-topbar-brand">
+          <div className="app-topbar-titles">
+            <p
+              className="eyebrow app-topbar-eyebrow"
+              title={presetTagline || undefined}
+              data-testid="curator-name-eyebrow"
+            >
+              {curatorName}
+            </p>
+            <h1>CuratorX</h1>
+          </div>
+          <span className={`agent-pulse ${agentPulse}`} title={`Agent ${agentPulse}`} data-testid="agent-pulse" />
+        </div>
+        <div className="app-topbar-actions">
+          {stats ? (
+            <span className="stat-chip" data-testid="library-stats-chip">
+              {stats.movies} movies · {stats.shows} shows
+            </span>
           ) : null}
-
-          <div className="turnstyle-thread-indicator">
+          {sessionStreak >= 3 ? (
+            <span className="stat-chip streak-chip" data-testid="curator-streak-chip" title="Conversations in the last 30 days">
+              {sessionStreak} chats this month
+            </span>
+          ) : null}
+          {watchlistPins.length ? (
             <button
               type="button"
-              className="thread-indicator-btn"
-              data-testid="thread-indicator"
-              onClick={() => setShowCompactThreads((open) => !open)}
+              className="stat-chip watchlist-chip"
+              data-testid="watchlist-topbar-chip"
+              onClick={() => setWatchlistOpen((open) => !open)}
             >
-              <span className="thread-indicator-label">{activeThreadTitle}</span>
-              <span className="thread-indicator-hint">{showCompactThreads ? "Hide threads" : "Switch thread"}</span>
+              ★ {watchlistPins.length} pinned
+            </button>
+          ) : null}
+          <Link to="/config" className="app-topbar-link">
+            Config
+          </Link>
+          {multiUserEnabled ? <UserMenu /> : null}
+        </div>
+      </header>
+
+      {setup && !setup.onboarding_complete ? (
+        <div className="banner workspace-banner" data-testid="setup-banner">
+          Finish setup in <Link to="/config">Settings</Link> to connect Plex, TMDB, and your LLM provider.
+        </div>
+      ) : null}
+
+      <div className="workspace-body">
+        <aside
+          className={`workspace-sidebar ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
+          data-testid="workspace-sidebar"
+        >
+          <div className="workspace-sidebar-top">
+            <p className="eyebrow workspace-sidebar-eyebrow">Conversations</p>
+            <button
+              type="button"
+              className="workspace-sidebar-toggle ghost"
+              data-testid="sidebar-rail-toggle"
+              onClick={toggleSidebarRail}
+              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+              title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              {sidebarCollapsed ? "»" : "«"}
             </button>
           </div>
+          <div className="workspace-sidebar-scroll">
+            <ThreadList
+              threads={threads}
+              activeSessionId={activeSessionId}
+              onSelect={switchThread}
+              onCreate={handleCreateThread}
+              hideHeader
+            />
+          </div>
+        </aside>
 
-          {showCompactThreads ? (
-            <div className="turnstyle-thread-panel">
-              <ThreadList
-                threads={threads}
-                activeSessionId={activeSessionId}
-                onSelect={switchThread}
-                onCreate={handleCreateThread}
-                compact
+        <main className="workspace-main" data-testid="workspace-main">
+          <div className="chat-scroll-region" data-testid="chat-scroll-region" ref={scrollRef}>
+            {showWelcomePanel ? (
+              <WelcomePanel
+                curatorName={curatorName}
+                greeting={personaUi?.welcome_greeting}
+                starters={personaUi?.welcome_starters}
+                onStarterSelect={sendMessage}
               />
-            </div>
-          ) : null}
-
-          <TurnstyleViewport
-            contextLabel={contextLabel}
-            threadTitle={activeThreadTitle}
-            input={input}
-            onInputChange={setInput}
-            onSubmit={() => sendMessage(input)}
-            onExpand={() => setViewMode("immersive")}
-            loading={loading || !threadsReady}
-            jobs={jobs}
-            chatError={chatError}
-            messages={messages}
-            onAdd={handleAdd}
-            onDismiss={handleDismiss}
-            onOpenViewport={setTurnstyleResults}
-            onConfirmAllItems={handleConfirmAllItems}
-            onConfirmAllTokens={handleConfirmAllTokens}
-            pendingTokenCount={pendingTokens.length}
-            actionsDisabled={addInProgress}
-          />
-        </div>
-      ) : (
-        <div className="immersive-shell" data-testid="immersive-viewport">
-          <aside
-            className={`immersive-sidebar ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
-            data-testid="immersive-sidebar"
-          >
-            <div className="sidebar-top">
-              <div className="sidebar-brand">
-                <p className="eyebrow">{curatorName}</p>
-                <h2>CuratorX</h2>
-                <span className={`agent-pulse ${agentPulse}`} title={`Agent ${agentPulse}`} />
-              </div>
-              <button
-                type="button"
-                className="sidebar-rail-toggle ghost"
-                data-testid="sidebar-rail-toggle"
-                onClick={toggleSidebarRail}
-                aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar to icons"}
-                title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-              >
-                {sidebarCollapsed ? "»" : "«"}
-              </button>
-            </div>
-
-            <div className="sidebar-scroll">
-              <SidebarSection
-                sectionId="conversations"
-                title="Conversations"
-                icon="💬"
-                alwaysVisible
-                sidebarCollapsed={sidebarCollapsed}
-              >
-                <ThreadList
-                  threads={threads}
-                  activeSessionId={activeSessionId}
-                  onSelect={switchThread}
-                  onCreate={handleCreateThread}
-                  hideHeader
-                />
-              </SidebarSection>
-
-              <SidebarSection
-                sectionId="context"
-                title="Active context"
-                icon="⧉"
-                alwaysVisible
-                sidebarCollapsed={sidebarCollapsed}
-              >
-                <div className="ambient-context-indicator ambient-context-compact" data-testid="ambient-context">
-                  <span className="ambient-context-label">{contextLabel}</span>
-                  <span className="ambient-context-hint">Inferred from conversation</span>
-                </div>
-              </SidebarSection>
-
-              <SidebarSection
-                sectionId="integrations"
-                title="Integrations"
-                icon="⚡"
-                defaultCollapsed={isMediumViewport}
-                sidebarCollapsed={sidebarCollapsed}
-              >
-                <IntegrationStatus checks={setup?.checks} />
-              </SidebarSection>
-
-              <SidebarSection
-                sectionId="thoughtstream"
-                title="Thoughtstream"
-                icon="↻"
-                defaultCollapsed={isMediumViewport}
-                sidebarCollapsed={sidebarCollapsed}
-              >
-                <Thoughtstream jobs={jobs} compact hideHeader />
-              </SidebarSection>
-            </div>
-
-            <div className="sidebar-footer">
-              <div className="sidebar-footer-callout">
-                <div className="sidebar-actions">
-                  <button
-                    type="button"
-                    className="sidebar-action-btn sidebar-action-btn--ghost"
-                    data-testid="collapse-viewport"
-                    onClick={() => setViewMode("compact")}
-                  >
-                    <span className="sidebar-action-icon" aria-hidden="true">
-                      ⊟
-                    </span>
-                    <span className="sidebar-action-label">Collapse</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="sidebar-action-btn sidebar-action-btn--primary"
-                    onClick={syncLibrary}
-                  >
-                    <span className="sidebar-action-icon" aria-hidden="true">
-                      ↻
-                    </span>
-                    <span className="sidebar-action-label">Sync library</span>
-                  </button>
-                  <Link to="/config" className="sidebar-action-btn sidebar-action-btn--ghost">
-                    <span className="sidebar-action-icon" aria-hidden="true">
-                      ⚙
-                    </span>
-                    <span className="sidebar-action-label">Configuration</span>
-                  </Link>
-                </div>
-
-                {stats ? (
-                  <p className="sidebar-stats">
-                    {stats.total} titles · {stats.movies} movies · {stats.shows} shows
-                  </p>
-                ) : null}
-              </div>
-            </div>
-          </aside>
-
-          <main className="immersive-main">
-            <div className="immersive-chat">
-              <div className="immersive-chat-header">
-                <p className="eyebrow">Conversation</p>
-                <h3 data-testid="active-thread-title">{activeThreadTitle}</h3>
-              </div>
-              <ChatThread
-                messages={messages}
-                chatError={chatError}
-                onAdd={handleAdd}
-                onDismiss={handleDismiss}
-                onOpenViewport={setTurnstyleResults}
-                onConfirmAllItems={handleConfirmAllItems}
-                onConfirmAllTokens={handleConfirmAllTokens}
-                pendingTokenCount={pendingTokens.length}
-                actionsDisabled={addInProgress}
-              />
-              <form
-                className="composer immersive-composer"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  sendMessage(input);
-                }}
-              >
-                <div className="ambient-context-tag">
-                  ⧉ {contextLabel}
-                </div>
-                <InlineAlert type="error" message={chatError} />
-                <textarea
-                  data-testid="immersive-composer-input"
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  placeholder="Continue the conversation…"
-                  rows={2}
-                  disabled={loading || !threadsReady}
-                />
-                <button type="submit" data-testid="immersive-send-button" disabled={loading || !threadsReady}>
-                  {loading ? "Thinking…" : "Send"}
-                </button>
-              </form>
-            </div>
-
-            {!isMediumViewport ? (
-              <div className="immersive-fingerprint" data-testid="immersive-fingerprint">
-                <VisualFingerprint messages={messages} onAdd={handleAdd} onDismiss={handleDismiss} />
-              </div>
             ) : null}
-          </main>
-        </div>
-      )}
+            <ChatThread
+              messages={displayMessages}
+              sessionId={activeSessionId}
+              curatorName={curatorName}
+              reviewPromptTemplates={personaUi?.review_prompt_templates}
+              reviewLookup={reviewLookup}
+              messageFeedback={messageFeedback}
+              onFeedbackChange={handleMessageFeedbackChange}
+              onReviewSave={handleReviewSave}
+              onReviewDismiss={handleReviewDismiss}
+              onAdd={handleAdd}
+              onDismiss={handleDismiss}
+              onOpenViewport={setTurnstyleResults}
+              onConfirmAllItems={handleConfirmAllItems}
+              onConfirmAllTokens={handleConfirmAllTokens}
+              pendingTokenCount={pendingTokens.length}
+              actionsDisabled={addInProgress}
+              onTogglePin={handleToggleWatchlistPin}
+              watchlistLookup={watchlistLookup}
+              requestPath={requestPath}
+              showErrors={false}
+              draggableToDock={dockDropEnabled}
+              onReviewConflictResolved={handleReviewConflictResolved}
+            />
+            {loading ? <TypingIndicator label={typingLabel || `${curatorName} is thinking`} /> : null}
+            <NewReplyChip visible={showNewReplyChip} onClick={() => scrollToBottom("smooth")} />
+          </div>
+
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              sendMessage(input);
+            }}
+          >
+            <span className="ambient-context-tag" data-testid="ambient-context-tag">
+              ⧉ {contextLabel}
+            </span>
+            <InlineAlert type="error" message={chatError} />
+            <textarea
+              ref={composerRef}
+              data-testid="composer-input"
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (!konamiTrackerRef.current) {
+                  konamiTrackerRef.current = createKonamiTracker((kind) => {
+                    const name = persona?.curator_name || "Curator";
+                    setMessages((prev) => [
+                      ...prev,
+                      {
+                        id: crypto.randomUUID(),
+                        role: "assistant",
+                        blocks: [{ type: "text", content: easterEggResponse(kind, name) }],
+                      },
+                    ]);
+                  });
+                }
+                konamiTrackerRef.current(event);
+              }}
+              placeholder={composerPlaceholder || "Describe what you're hunting for…"}
+              rows={2}
+              disabled={loading || !threadsReady}
+            />
+            <button type="submit" data-testid="send-button" disabled={loading || !threadsReady || !input.trim()}>
+              {loading ? "Thinking…" : "Send"}
+            </button>
+          </form>
+        </main>
+      </div>
 
       {turnstyleResults ? (
         <TurnstyleResultsOverlay
@@ -731,27 +1002,36 @@ export default function App() {
           onAdd={handleAdd}
           onDismiss={handleDismiss}
           onConfirmAllItems={handleConfirmAllItems}
+          onTogglePin={handleToggleWatchlistPin}
+          watchlistLookup={watchlistLookup}
           actionsDisabled={addInProgress}
+          requestPath={requestPath}
+          draggableToDock={dockDropEnabled}
         />
       ) : null}
 
-      <div className="add-action-layer">
-        <AddActionBanner
-          pendingAdd={pendingAdd}
-          pendingBulk={pendingBulk}
-          pendingTokens={pendingTokens.length >= 2 ? pendingTokens : null}
-          inProgress={addInProgress}
-          progress={addProgress}
-          onConfirm={confirmActiveAction}
-          onCancel={cancelActiveAction}
-        />
-        <InlineAlert
-          type={addFeedback?.type}
-          message={addFeedback?.message}
-          testId="add-action-feedback"
-          onDismiss={dismissAddFeedback}
-        />
-      </div>
+      <KeyboardHelpModal
+        open={keyboardHelpOpen}
+        onClose={() => setKeyboardHelpOpen(false)}
+        plexCollectionsEnabled={Boolean(features?.features?.plex_collections_enabled)}
+      />
+
+      <StatusDock
+        jobs={jobs}
+        jobStatusPhrases={personaUi?.job_status_phrases}
+        pendingAdd={pendingAdd}
+        pendingBulk={pendingBulk}
+        pendingTokens={pendingTokens.length >= 2 ? pendingTokens : null}
+        addInProgress={addInProgress}
+        addProgress={addProgress}
+        addFeedback={addFeedback}
+        onConfirm={confirmActiveAction}
+        onCancel={cancelActiveAction}
+        onDismissFeedback={dismissAddFeedback}
+        onDropTitle={dockDropEnabled ? handleDockDrop : undefined}
+        radarrConnected={radarrConnected}
+        sonarrConnected={sonarrConnected}
+      />
     </div>
   );
 }

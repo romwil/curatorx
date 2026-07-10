@@ -18,6 +18,7 @@ from curatorx.library.embeddings import rebuild_embeddings
 from curatorx.library.episodes import sync_tv_episodes
 from curatorx.library.facets import rebuild_library_facets, rebuild_library_fts
 from curatorx.library.query import refresh_library_overview_cache
+from curatorx.reviews.store import scan_for_rating_prompts
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,9 @@ def _row_from_plex_item(
         "season_count": item.season_count,
         "leaf_count": item.leaf_count,
         "viewed_leaf_count": item.viewed_leaf_count,
+        "view_offset_ms": item.view_offset_ms,
+        "duration_ms": item.duration_ms,
+        "plex_user_rating_stars": item.user_rating_stars,
     }
 
 
@@ -355,6 +359,8 @@ async def sync_library(
     embedded = await rebuild_embeddings(db, settings)
     logger.info("Embeddings rebuilt count=%s", embedded)
     refresh_library_overview_cache(db)
+    rating_prompts = scan_for_rating_prompts(db, settings)
+    logger.info("Rating prompts queued count=%s", rating_prompts)
     db.set_sync_state(
         "last_sync",
         json.dumps(
@@ -364,6 +370,7 @@ async def sync_library(
                 "facets": facet_count,
                 "fts": fts_count,
                 "episodes": episode_stats,
+                "rating_prompts": rating_prompts,
                 "timestamp": time.time(),
             }
         ),
@@ -375,4 +382,5 @@ async def sync_library(
         "facets": facet_count,
         "fts": fts_count,
         "episodes": episode_stats,
+        "rating_prompts": rating_prompts,
     }

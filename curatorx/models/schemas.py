@@ -26,7 +26,11 @@ class TitleCard(BaseModel):
     in_radarr: bool = False
     in_sonarr: bool = False
     recommendation_reason: str = ""
+    facet_matches: List[str] = Field(default_factory=list)
     runtime_minutes: Optional[int] = None
+    user_stars: Optional[int] = None
+    total_episode_count: Optional[int] = None
+    unwatched_episode_count: Optional[int] = None
 
 
 class TitleDetail(TitleCard):
@@ -117,6 +121,24 @@ class PersonaPresetSummary(BaseModel):
     val_pass_auto: float
     identity_blurb: str = ""
     behavioral_anchor: str = ""
+    typing_phrases: List[str] = Field(default_factory=list)
+    composer_placeholders: List[str] = Field(default_factory=list)
+    welcome_greeting: str = ""
+    welcome_starters: List[str] = Field(default_factory=list)
+    review_prompt_templates: Dict[str, str] = Field(default_factory=dict)
+    accent_hue: str = ""
+
+
+class PersonaUiCopy(BaseModel):
+    typing_phrases: List[str] = Field(default_factory=list)
+    composer_placeholders: List[str] = Field(default_factory=list)
+    welcome_greeting: str = ""
+    welcome_starters: List[str] = Field(default_factory=list)
+    review_prompt_templates: Dict[str, str] = Field(default_factory=dict)
+    accent_hue: str = ""
+    job_status_phrases: List[str] = Field(default_factory=list)
+    preset_tagline: str = ""
+    preset_name: str = ""
 
 
 class PersonaMetrics(BaseModel):
@@ -131,6 +153,7 @@ class PersonaMetrics(BaseModel):
     persona_mode: str = "sliders"
     behavioral_prompt: str = ""
     assembled_prompt: str = ""
+    persona_ui: Optional["PersonaUiCopy"] = None
     last_modified: Optional[str] = None
 
 
@@ -161,9 +184,88 @@ class SystemConfigUpdate(BaseModel):
     values: Dict[str, str] = Field(default_factory=dict)
 
 
+class MessageFeedbackRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    feedback: Optional[Literal["helpful", "not_helpful"]] = None
+
+
 class LensTasteEntry(BaseModel):
     lens_id: str
     cluster_tag: str
     weight: float = 1.0
     explicit_lock: bool = False
     last_updated: Optional[str] = None
+
+
+class UserReviewCreate(BaseModel):
+    rating_key: Optional[str] = None
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_type: MediaType
+    title: str = Field(..., min_length=1)
+    stars: int = Field(..., ge=1, le=5)
+    review_text: str = ""
+    review_tags: List[str] = Field(default_factory=list)
+    prompted_by: str = "user"
+    session_id: Optional[str] = None
+    lens_id: Optional[str] = None
+    prompt_id: Optional[str] = None
+    replace_plex_rating: bool = False
+
+
+class UserReview(BaseModel):
+    id: str
+    rating_key: Optional[str] = None
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_type: MediaType
+    title: str
+    stars: int
+    review_text: str = ""
+    review_tags: List[str] = Field(default_factory=list)
+    prompted_by: str = "user"
+    session_id: Optional[str] = None
+    lens_id: Optional[str] = None
+    plex_rating_synced: bool = False
+    plex_synced_at: Optional[float] = None
+    created_at: float
+    updated_at: float
+
+
+class RatingPrompt(BaseModel):
+    id: str
+    rating_key: str
+    media_type: MediaType
+    title: str
+    completion_pct: float
+    detected_at: float
+    prompted_at: Optional[float] = None
+    dismissed_at: Optional[float] = None
+    review_id: Optional[str] = None
+
+
+class WatchlistPin(BaseModel):
+    id: str
+    user_id: Optional[str] = None
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_type: MediaType
+    title: str
+    created_at: float
+
+
+class WatchlistCreate(BaseModel):
+    tmdb_id: Optional[int] = None
+    tvdb_id: Optional[int] = None
+    media_type: MediaType
+    title: str = Field(..., min_length=1)
+
+
+class WatchlistListResponse(BaseModel):
+    items: List[WatchlistPin] = Field(default_factory=list)
+    count: int = 0
+
+
+class EngagementStreakResponse(BaseModel):
+    session_count_30d: int = 0
+    streak_visible: bool = False

@@ -28,6 +28,7 @@ type MockMessage = {
 
 const mockThreads = new Map<string, MockThread>();
 const mockMessages = new Map<string, MockMessage[]>();
+const mockFeedback = new Map<string, Map<string, "helpful" | "not_helpful">>();
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
@@ -55,6 +56,7 @@ export function resetMockCertifications() {
   certifiedServices.clear();
   mockThreads.clear();
   mockMessages.clear();
+  mockFeedback.clear();
 }
 
 function certificationEntry(certified: boolean) {
@@ -74,6 +76,36 @@ export async function mockCuratorApis(page: Page) {
     const request = route.request();
     const url = new URL(request.url());
     const method = request.method();
+
+    if (method === "GET" && url.pathname.endsWith("/feedback")) {
+      const parts = url.pathname.split("/");
+      const sessionId = parts[parts.length - 2];
+      const thread = mockThreads.get(sessionId);
+      if (!thread) {
+        await route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "Thread not found" }),
+        });
+        return;
+      }
+      const feedbackMap = mockFeedback.get(sessionId) || new Map();
+      const items = [...feedbackMap.entries()].map(([messageId, feedback]) => ({
+        id: `feedback-${messageId}`,
+        message_id: messageId,
+        session_id: sessionId,
+        user_id: null,
+        feedback,
+        excerpt: "",
+        created_at: nowSeconds(),
+      }));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ session_id: sessionId, items }),
+      });
+      return;
+    }
 
     if (method === "GET" && url.pathname.endsWith("/messages")) {
       const parts = url.pathname.split("/");
@@ -179,6 +211,48 @@ export async function mockCuratorApis(page: Page) {
       body: JSON.stringify({
         session_id: sessionId,
         message: assistantMessage,
+      }),
+    });
+  });
+
+  await page.route("**/api/chat/messages/*/feedback", async (route: Route) => {
+    const request = route.request();
+    if (request.method() !== "POST") {
+      await route.continue();
+      return;
+    }
+
+    const parts = new URL(request.url()).pathname.split("/");
+    const messageId = parts[parts.length - 2];
+    let sessionId = "";
+    let feedback: "helpful" | "not_helpful" = "helpful";
+    try {
+      const body = request.postDataJSON() as { session_id?: string; feedback?: "helpful" | "not_helpful" };
+      sessionId = body.session_id || "";
+      feedback = body.feedback || feedback;
+    } catch {
+      // ignore malformed bodies in tests
+    }
+
+    if (!mockFeedback.has(sessionId)) {
+      mockFeedback.set(sessionId, new Map());
+    }
+    mockFeedback.get(sessionId)!.set(messageId, feedback);
+
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        saved: true,
+        feedback: {
+          id: `feedback-${messageId}`,
+          message_id: messageId,
+          session_id: sessionId,
+          user_id: null,
+          feedback,
+          excerpt: "",
+          created_at: nowSeconds(),
+        },
       }),
     });
   });
@@ -290,6 +364,78 @@ export async function mockCuratorApis(page: Page) {
     });
   });
 
+  await page.route("**/api/features", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        features: { multi_user_enabled: false, seerr_enabled: false, plex_collections_enabled: false },
+        auth: {
+          mode: "disabled",
+          plex_login_enabled: true,
+          oidc_enabled: false,
+          local_login_enabled: false,
+        },
+        seerr: { link_on_login: true, require_linked_user_for_requests: false },
+      }),
+    });
+  });
+
+  await page.route("**/api/watchlist**", async (route: Route) => {
+    const request = route.request();
+    const method = request.method();
+    if (method === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], count: 0 }),
+      });
+      return;
+    }
+    if (method === "POST") {
+      const body = request.postDataJSON() as { title?: string; media_type?: string; tmdb_id?: number };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: "mock-pin-1",
+          user_id: null,
+          title: body.title || "Mock title",
+          media_type: body.media_type || "movie",
+          tmdb_id: body.tmdb_id ?? null,
+          tvdb_id: null,
+          created_at: nowSeconds(),
+        }),
+      });
+      return;
+    }
+    if (method === "DELETE") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ removed: true }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.route("**/api/engagement/streak", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ session_count_30d: 1, streak_visible: false }),
+    });
+  });
+
+  await page.route("**/api/persona/typing-phrases", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ phrases: ["Curator is thinking…", "Curator is weighing the options…"] }),
+    });
+  });
+
   await page.route("**/api/library/tv/progress**", async (route: Route) => {
     await route.fulfill({
       status: 200,
@@ -362,6 +508,154 @@ export async function mockServiceFailure(page: Page, service: string, message = 
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({ ok: false, message }),
+    });
+  });
+}
+
+type FeatureFlags = {
+  multi_user_enabled?: boolean;
+  seerr_enabled?: boolean;
+  plex_collections_enabled?: boolean;
+};
+
+export async function mockFeatures(page: Page, features: FeatureFlags = {}) {
+  await page.route("**/api/features", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        features: {
+          multi_user_enabled: false,
+          seerr_enabled: false,
+          plex_collections_enabled: false,
+          ...features,
+        },
+        auth: {
+          mode: features.multi_user_enabled ? "plex" : "disabled",
+          plex_login_enabled: true,
+          oidc_enabled: false,
+          local_login_enabled: false,
+        },
+        seerr: { link_on_login: true, require_linked_user_for_requests: false },
+      }),
+    });
+  });
+}
+
+export async function mockSetupStatus(
+  page: Page,
+  {
+    radarrOk = false,
+    sonarrOk = false,
+    onboardingComplete = true,
+  }: { radarrOk?: boolean; sonarrOk?: boolean; onboardingComplete?: boolean } = {},
+) {
+  await page.route("**/api/setup/status", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        onboarding_complete: onboardingComplete,
+        ready_to_curate: true,
+        checks: {
+          plex: { ok: true, message: "Configured" },
+          radarr: { ok: radarrOk, message: radarrOk ? "Configured" : "Optional for movie adds." },
+          sonarr: { ok: sonarrOk, message: sonarrOk ? "Configured" : "Optional for TV adds." },
+          tmdb: { ok: true, message: "Configured" },
+          llm: { ok: true, message: "Configured" },
+        },
+      }),
+    });
+  });
+}
+
+export async function mockAuthUnauthenticated(page: Page) {
+  await page.route("**/api/auth/me", async (route: Route) => {
+    await route.fulfill({
+      status: 401,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Not authenticated" }),
+    });
+  });
+}
+
+export async function mockAuthUser(page: Page, user = { id: "user-1", display_name: "Test User", role: "owner" }) {
+  await page.route("**/api/auth/me", async (route: Route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ user }),
+    });
+  });
+}
+
+export async function mockPlexLogin(page: Page, user = { id: "user-1", display_name: "Test User", role: "owner" }) {
+  let authenticated = false;
+  await page.route("**/api/auth/plex", async (route: Route) => {
+    authenticated = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ user }),
+    });
+  });
+  await page.route("**/api/auth/me", async (route: Route) => {
+    if (!authenticated) {
+      await route.fulfill({
+        status: 401,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Not authenticated" }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ user }),
+    });
+  });
+}
+
+export async function mockReviewConflictChat(page: Page) {
+  await page.route("**/api/chat", async (route: Route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    let sessionId = crypto.randomUUID().replace(/-/g, "");
+    try {
+      const body = route.request().postDataJSON() as { session_id?: string };
+      sessionId = body.session_id || sessionId;
+    } catch {
+      // ignore
+    }
+    const assistantMessage = {
+      id: "assistant-conflict",
+      role: "assistant",
+      blocks: [
+        { type: "text", content: "Saved your review locally. Plex has a different rating — choose below." },
+        {
+          type: "plex_rating_conflict",
+          payload: {
+            review: {
+              title: "Inception",
+              media_type: "movie",
+              stars: 5,
+              rating_key: "rk-1",
+              tmdb_id: 27205,
+            },
+            plex_stars: 3,
+            submitted_stars: 5,
+          },
+        },
+      ],
+      created_at: Math.floor(Date.now() / 1000),
+      lens_id: "general",
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ session_id: sessionId, message: assistantMessage }),
     });
   });
 }
