@@ -15,7 +15,7 @@ No. **1.0 is a single workspace**: sidebar conversations + full-width chat + sta
 | Tag | When |
 |-----|------|
 | `romwil/curatorx:1.0` | Everyday Unraid / Compose |
-| `romwil/curatorx:1.0.1` | Pin an exact release |
+| `romwil/curatorx:1.0.2` | Pin an exact release |
 | `romwil/curatorx:latest` | Newest stable |
 
 Images are multi-arch (**amd64 + arm64**). See [wiki/Installation.md](wiki/Installation.md).

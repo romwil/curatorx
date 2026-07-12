@@ -16,7 +16,6 @@ from typing import Dict, List, Literal, Optional
 
 from curatorx.config_store import Settings, load_merged_settings
 from curatorx.library.db import Database
-from curatorx.library.facets import ensure_library_facet_index
 from curatorx.library.query import refresh_library_overview_cache
 from curatorx.library.sync import sync_library
 from curatorx.logging_config import configure_logging
@@ -29,6 +28,10 @@ JobStatus = Literal["queued", "running", "completed", "failed"]
 INTERRUPTED_BY_RESTART = "Interrupted by server restart — start sync again"
 RECENT_JOB_LIMIT = 50
 JOBS_STATE_FILENAME = "jobs_state.json"
+# Cap durable job state reads so a runaway/corrupt file cannot stall startup.
+JOBS_STATE_MAX_BYTES = 5 * 1024 * 1024
+# Give FastAPI time to finish binding HTTP before the first scheduled sync.
+SCHEDULER_INITIAL_DELAY_SECONDS = 30
 
 _manager: Optional["JobManager"] = None
 _lock = threading.Lock()
@@ -130,15 +133,19 @@ class JobManager:
     def __init__(self, data_dir: Path) -> None:
         configure_logging()
         self.data_dir = data_dir
+        logger.info("JobManager: opening database…")
         self.db = Database(_resolve_db_path(data_dir))
-        ensure_library_facet_index(self.db)
+        logger.info("JobManager: database ready")
+        # Facet rebuild can take minutes on large libraries (per-row SQLite writes) —
+        # never run it here; lifespan defers warm-up to a background thread.
         self._jobs_path = data_dir / JOBS_STATE_FILENAME
         self._jobs: Dict[str, Job] = {}
         self._lock = threading.Lock()
         self._progress_log_at: Dict[str, float] = {}
         self._progress_log_phase: Dict[str, str] = {}
+        logger.info("JobManager: loading durable jobs…")
         self._load_persisted_jobs()
-        logger.info("JobManager initialized data_dir=%s", data_dir)
+        logger.info("JobManager initialized data_dir=%s jobs=%s", data_dir, len(self._jobs))
 
     def list_jobs(self) -> List[Job]:
         with self._lock:
@@ -160,40 +167,60 @@ class JobManager:
         return job
 
     def _load_persisted_jobs(self) -> None:
-        """Load recent jobs from disk; mark interrupted running/queued jobs as failed."""
-        raw_jobs = self._read_jobs_file()
-        loaded: Dict[str, Job] = {}
-        interrupted = 0
-        for entry in raw_jobs:
-            if not isinstance(entry, dict) or not entry.get("id"):
-                continue
-            job = _job_from_persist_dict(entry)
-            if not job.id:
-                continue
-            if job.status in ("queued", "running"):
-                job.status = "failed"
-                job.finished_at = time.time()
-                job.error = INTERRUPTED_BY_RESTART
-                if job.progress.phase not in ("completed", "done"):
-                    job.progress.message = INTERRUPTED_BY_RESTART
-                interrupted += 1
-            loaded[job.id] = job
+        """Load recent jobs from disk; mark interrupted running/queued jobs as failed.
 
-        # Keep newest N by created_at
-        ordered = sorted(loaded.values(), key=lambda j: j.created_at, reverse=True)
-        self._jobs = {job.id: job for job in ordered[:RECENT_JOB_LIMIT]}
-        if interrupted:
-            logger.warning(
-                "Marked %s interrupted job(s) as failed after restart",
-                interrupted,
-            )
-        if self._jobs or self._jobs_path.exists():
-            self._persist_locked()
+        Never raises — corrupt / oversized / unreadable state must not block startup.
+        """
+        try:
+            raw_jobs = self._read_jobs_file()
+            loaded: Dict[str, Job] = {}
+            interrupted = 0
+            for entry in raw_jobs:
+                if not isinstance(entry, dict) or not entry.get("id"):
+                    continue
+                try:
+                    job = _job_from_persist_dict(entry)
+                except (TypeError, ValueError, KeyError) as error:
+                    logger.warning("Skipping corrupt job entry: %s", error)
+                    continue
+                if not job.id:
+                    continue
+                if job.status in ("queued", "running"):
+                    job.status = "failed"
+                    job.finished_at = time.time()
+                    job.error = INTERRUPTED_BY_RESTART
+                    if job.progress.phase not in ("completed", "done"):
+                        job.progress.message = INTERRUPTED_BY_RESTART
+                    interrupted += 1
+                loaded[job.id] = job
+
+            # Keep newest N by created_at
+            ordered = sorted(loaded.values(), key=lambda j: j.created_at, reverse=True)
+            self._jobs = {job.id: job for job in ordered[:RECENT_JOB_LIMIT]}
+            if interrupted:
+                logger.warning(
+                    "Marked %s interrupted job(s) as failed after restart",
+                    interrupted,
+                )
+            if self._jobs or self._jobs_path.exists():
+                self._persist_locked()
+        except Exception as error:  # noqa: BLE001
+            logger.exception("Durable jobs load failed; starting with empty job list: %s", error)
+            self._jobs = {}
 
     def _read_jobs_file(self) -> List[object]:
         if not self._jobs_path.exists():
             return []
         try:
+            size = self._jobs_path.stat().st_size
+            if size > JOBS_STATE_MAX_BYTES:
+                logger.warning(
+                    "Skipping oversized jobs state %s (%s bytes > %s); starting empty",
+                    self._jobs_path,
+                    size,
+                    JOBS_STATE_MAX_BYTES,
+                )
+                return []
             payload = json.loads(self._jobs_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             logger.warning("Could not load jobs state from %s: %s", self._jobs_path, error)
@@ -327,6 +354,8 @@ class SyncScheduler:
         self._stop.set()
 
     def _loop(self) -> None:
+        # Defer first tick so HTTP can come up before any optional Plex sync.
+        self._stop.wait(timeout=SCHEDULER_INITIAL_DELAY_SECONDS)
         while not self._stop.is_set():
             try:
                 settings = load_merged_settings(self.data_dir)

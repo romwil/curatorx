@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from fastapi.testclient import TestClient
 
 from curatorx.web.jobs import (
     INTERRUPTED_BY_RESTART,
@@ -123,6 +129,52 @@ class DurableJobsTests(unittest.TestCase):
         self.assertEqual(entry["progress"]["total"], 100)
         self.assertIn("Scanning", entry["progress"]["message"])
 
+    def test_init_does_not_call_facet_index(self) -> None:
+        """Regression: facet rebuild must not block JobManager / FastAPI startup."""
+        import curatorx.web.jobs as jobs_mod
+
+        self.assertFalse(
+            hasattr(jobs_mod, "ensure_library_facet_index"),
+            "JobManager must not import ensure_library_facet_index (blocks startup)",
+        )
+        with patch("curatorx.library.facets.ensure_library_facet_index") as ensure_facets:
+            manager = JobManager(self.data_dir)
+        self.assertIsNotNone(manager.db)
+        ensure_facets.assert_not_called()
+
+    def test_init_survives_corrupt_and_oversized_jobs_state(self) -> None:
+        path = self.data_dir / JOBS_STATE_FILENAME
+        path.write_text("{not-json", encoding="utf-8")
+        manager = JobManager(self.data_dir)
+        self.assertEqual(manager.list_jobs(), [])
+
+        reset_job_manager_for_tests()
+        # Oversized file should be skipped without hanging startup.
+        path.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
+        manager = JobManager(self.data_dir)
+        self.assertEqual(manager.list_jobs(), [])
+
+    def test_init_survives_garbage_job_entries(self) -> None:
+        self._write_jobs_file(
+            [
+                {"id": "bad", "status": "completed", "created_at": "not-a-float"},
+                {
+                    "id": "ok1",
+                    "job_type": "library_sync",
+                    "status": "completed",
+                    "created_at": 1.0,
+                    "summary": {},
+                    "progress": {"phase": "completed", "current": 1, "total": 1, "message": "Done"},
+                    "error": None,
+                },
+            ]
+        )
+        # created_at="not-a-float" raises in float(); load must continue with valid entries.
+        manager = JobManager(self.data_dir)
+        ids = {job.id for job in manager.list_jobs()}
+        self.assertIn("ok1", ids)
+        self.assertNotIn("bad", ids)
+
     def test_api_shape_includes_progress_fields(self) -> None:
         job = Job(
             id="shape1",
@@ -138,6 +190,52 @@ class DurableJobsTests(unittest.TestCase):
         self.assertIn("label", payload["progress"])
         self.assertIn("message", payload["progress"])
         self.assertEqual(payload["progress"]["phase"], "tv")
+
+
+class StartupLifespanTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_job_manager_for_tests()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        os.environ["DATA_DIR"] = self._tmpdir.name
+        os.environ["CURATORX_SKIP_DOTENV"] = "1"
+        os.environ["LLM_PROVIDER"] = "ollama"
+
+    def tearDown(self) -> None:
+        reset_job_manager_for_tests()
+        import curatorx.web.jobs as jobs
+
+        jobs._scheduler = None
+        os.environ.pop("CURATORX_SKIP_DOTENV", None)
+        os.environ.pop("LLM_PROVIDER", None)
+        self._tmpdir.cleanup()
+
+    def test_lifespan_completes_even_if_facet_warmup_blocks(self) -> None:
+        """Facet warm-up must run in a background thread, not block HTTP bind."""
+        release = threading.Event()
+
+        def blocking_ensure(_db: object) -> int:
+            release.wait(timeout=30)
+            return 0
+
+        import curatorx.web.app as app_mod
+        import curatorx.web.jobs as jobs_mod
+
+        jobs_mod._manager = None
+        jobs_mod._scheduler = None
+        importlib.reload(app_mod)
+
+        fake_scheduler = MagicMock()
+        with patch.object(app_mod, "ensure_library_facet_index", side_effect=blocking_ensure):
+            with patch.object(app_mod, "get_sync_scheduler", return_value=fake_scheduler):
+                started = time.monotonic()
+                with TestClient(app_mod.app) as client:
+                    resp = client.get("/api/health")
+                    elapsed = time.monotonic() - started
+                    self.assertEqual(resp.status_code, 200)
+                    self.assertLess(elapsed, 5.0, "startup blocked waiting on facet warm-up")
+                release.set()
+        fake_scheduler.start.assert_called()
+        fake_scheduler.stop.assert_called()
 
 
 if __name__ == "__main__":

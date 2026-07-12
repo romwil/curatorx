@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.2] — 2026-07-12
+
+Hotfix: Unraid containers hung after the startup log and never finished FastAPI lifespan / never served HTTP.
+
+### Fixed
+- Deferred library facet index warm-up to a background thread so large libraries cannot block startup
+- Hardened durable `jobs_state.json` load (corrupt / oversized / bad entries no longer stall JobManager init)
+- Delayed the first scheduled library sync tick until after HTTP can bind
+- Added step-by-step INFO startup logs for Unraid log diagnosis
+
 All notable changes to CuratorX are documented in this file.
 
 ## [1.0.1] — 2026-07-12

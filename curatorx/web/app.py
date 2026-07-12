@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -157,9 +158,34 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logger.info("CuratorX startup (version %s, data_dir=%s)", __version__, DATA_DIR)
+
+    logger.info("Startup: initializing job manager…")
     manager = get_job_manager()
-    manager.db.ensure_seed_data()
-    ensure_library_facet_index(manager.db)
+    logger.info("Startup: job manager ready")
+
+    logger.info("Startup: ensuring seed data…")
+    try:
+        manager.db.ensure_seed_data()
+        logger.info("Startup: seed data done")
+    except Exception:  # noqa: BLE001
+        logger.exception("Startup: seed data failed (continuing)")
+
+    def _warm_library_facets() -> None:
+        try:
+            logger.info("Startup: background library facet index check…")
+            rebuilt = ensure_library_facet_index(manager.db)
+            logger.info("Startup: library facet index check done (rebuilt=%s)", rebuilt)
+        except Exception:  # noqa: BLE001
+            logger.exception("Startup: library facet index warm-up failed (non-fatal)")
+
+    # Facet rebuild can block for a long time on large libraries — never await it here.
+    threading.Thread(
+        target=_warm_library_facets,
+        daemon=True,
+        name="library-facet-warmup",
+    ).start()
+
+    logger.info("Startup: starting sync scheduler…")
     get_sync_scheduler().start()
     logger.info("Job manager and sync scheduler ready")
     yield
