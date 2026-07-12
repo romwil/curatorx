@@ -1,7 +1,9 @@
 # Product Requirement Document (PRD)
 
+> **Historical design notes.** CuratorX **1.0** ships a single chat workspace (see [WEB_UI.md](WEB_UI.md) and [wiki/Home.md](wiki/Home.md)). This PRD retains earlier Phase / ambient-intent language for context; prefer the wiki and README for operator docs.
+
 **Project CuratorX: Ambient Intent Derivation & Zero-Touch UI**  
-**Version 3.0 (Phase 3 Core Architecture)**
+**Version 3.0 (design archive)**
 
 ## 1. Product Vision & Behavioral Shift
 

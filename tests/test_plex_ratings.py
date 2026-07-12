@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from curatorx.config_store import FeatureFlags, Settings, save_settings
+from curatorx.connectors.http import optional_int
 from curatorx.connectors.plex import PlexClient, PlexEpisode, PlexLibraryItem, plex_rating_to_stars, stars_to_plex_rating
 from curatorx.library.db import Database
 from curatorx.library.episodes import _upsert_episodes_for_show
@@ -24,6 +25,15 @@ from curatorx.reviews.plex_sync import (
     sync_review_rating_to_plex,
 )
 from curatorx.reviews.store import save_review
+
+
+class OptionalIntTests(unittest.TestCase):
+    def test_optional_int_accepts_float_like_strings(self) -> None:
+        self.assertEqual(optional_int("9.0"), 9)
+        self.assertEqual(optional_int("8"), 8)
+        self.assertEqual(optional_int("0"), 0)
+        self.assertIsNone(optional_int(None))
+        self.assertIsNone(optional_int(""))
 
 
 class PlexRatingMappingTests(unittest.TestCase):
@@ -71,6 +81,23 @@ class PlexClientRatingTests(unittest.TestCase):
         item = client._parse_video(element, "movie")
         self.assertEqual(item.user_rating_stars, 4)
 
+    def test_parse_video_accepts_float_user_rating(self) -> None:
+        """Real Plex XML often emits userRating as a float string like '9.0'."""
+        import xml.etree.ElementTree as ET
+
+        client = PlexClient("http://plex.test:32400", "token")
+        element = ET.fromstring(
+            '<Video ratingKey="42" title="Arrival" type="movie" userRating="9.0" />'
+        )
+        item = client._parse_video(element, "movie")
+        # 9.0 coerces to 9, then snaps to closest even Plex scale value (8 → 4★).
+        self.assertEqual(item.user_rating_stars, 4)
+
+        element_ten = ET.fromstring(
+            '<Video ratingKey="43" title="Dune" type="movie" userRating="10.0" />'
+        )
+        self.assertEqual(client._parse_video(element_ten, "movie").user_rating_stars, 5)
+
     def test_parse_episode_reads_user_rating(self) -> None:
         import xml.etree.ElementTree as ET
 
@@ -81,6 +108,18 @@ class PlexClientRatingTests(unittest.TestCase):
         episodes = client._parse_episode_elements([element])
         self.assertEqual(len(episodes), 1)
         self.assertEqual(episodes[0].user_rating_stars, 3)
+
+    def test_parse_episode_accepts_float_user_rating(self) -> None:
+        import xml.etree.ElementTree as ET
+
+        client = PlexClient("http://plex.test:32400", "token")
+        element = ET.fromstring(
+            '<Video ratingKey="99" title="Pilot" type="episode" userRating="8.0" '
+            'parentIndex="1" index="1" />'
+        )
+        episodes = client._parse_episode_elements([element])
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(episodes[0].user_rating_stars, 4)
 
     def test_episode_rating_stored_on_library_episodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

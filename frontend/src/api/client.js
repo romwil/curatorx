@@ -1,3 +1,5 @@
+import { createId } from "../lib/id.js";
+
 const API = "/api";
 const SESSION_KEY = "curatorx_session";
 const ACTIVE_LENS_KEY = "curatorx_active_lens";
@@ -49,7 +51,7 @@ export async function api(path, options = {}) {
 export function sessionId() {
   let value = localStorage.getItem(SESSION_KEY);
   if (!value) {
-    value = crypto.randomUUID().replace(/-/g, "");
+    value = createId({ compact: true });
     localStorage.setItem(SESSION_KEY, value);
   }
   return value;

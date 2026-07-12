@@ -45,4 +45,11 @@ test.describe("Config maintenance dashboard", () => {
     await expect(page.getByTestId("persona-preset-grid")).toBeVisible();
     await expect(page.getByTestId("advanced-toggle")).toBeVisible();
   });
+
+  test("library sync card is present without phase numbering", async ({ page }) => {
+    await expect(page.getByTestId("library-sync-card")).toBeVisible();
+    await expect(page.getByTestId("library-sync-button")).toBeVisible();
+    await expect(page.getByTestId("library-sync-card")).toContainText("Library sync");
+    await expect(page.locator("body")).not.toContainText("(Phase 8)");
+  });
 });

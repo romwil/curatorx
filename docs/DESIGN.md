@@ -1,6 +1,6 @@
 # CuratorX — Design Document
 
-Product principles, dual UI modes, lens isolation UX, agent behavior, and API design for CuratorX Phase 1. Items marked **Future** are planned but not fully shipped.
+Product principles, single-workspace UX, lens isolation, agent behavior, and API design for CuratorX **1.0**. Items marked **Future** are planned but not fully shipped.
 
 ---
 
@@ -10,7 +10,7 @@ Product principles, dual UI modes, lens isolation UX, agent behavior, and API de
 
 2. **Chat-first** — The curator conversation is the primary loop. Settings, sync, and title detail support the chat.
 
-3. **Telescope, don't navigate** — **Turnstyle** handles quick intents; **Immersive** expands for deep work. Same SPA, smooth CSS transitions.
+3. **One workspace** — Full-width chat with a conversation sidebar and status dock. Optional overlay expands large title-card result sets.
 
 4. **Explain the “why”** — Every title card carries a `recommendation_reason`.
 
@@ -24,40 +24,24 @@ Product principles, dual UI modes, lens isolation UX, agent behavior, and API de
 
 ---
 
-## Dual UI: Turnstyle vs Immersive
+## Single workspace layout
 
-CuratorX serves both modes from one React application (`frontend/src/App.jsx`).
+CuratorX serves one React application (`frontend/src/App.jsx`):
 
-### Turnstyle widget state
-
-Designed for **zero-friction intent entry**:
-
-| Element | Behavior |
-|---------|----------|
-| **Command lane** | Centered borderless input, `font-mono`, auto-focus on load |
-| **Lens prefix** | Persistent active lens indicator, e.g. `⧉ [General] > _` |
-| **Thoughtstream feed** | Vertical activity log (sync, jobs) max ~320px, internal scroll |
-| **Expansion triggers** | Hotkey, `/expand` token, or viewport card click |
-
-Turnstyle is the default entry point for homelab users who want “ask one thing and go.”
-
-### Immersive viewport state
-
-Designed for **deep analytical curation**:
-
-| Region | Width | Contents |
-|--------|-------|----------|
-| **Sidebar** | 240px fixed | Lens switcher, integration status, settings, job pulse (`.agent-pulse`) |
-| **Chat sandbox** | ~45% | Message thread **filtered by active `lens_id`** |
-| **Visual array** | ~55% | Title card clusters by trope, genre, or fingerprint |
+| Region | Contents |
+|--------|----------|
+| **Top bar** | Brand, agent pulse, library counts, Config link, optional avatar menu |
+| **Sidebar** | Conversation list + New thread |
+| **Chat column** | Thread, ambient context tag, title cards, composer |
+| **Status dock** | Live job progress, *arr confirmations, drag-to-add target |
+| **Results overlay** | Optional horizontal expand for large card sets (“Cinema mode”) |
 
 ### Visual state tokens
 
 | Token | Meaning |
 |-------|---------|
-| `.lens-active` | Active lens — theme accent shift for at-a-glance context verification |
-| `.explicit-lock` | Taste cluster locked against telemetry drift |
-| `.agent-pulse` | Background job state: idle / running / error |
+| `.agent-pulse` | Background job / agent state: idle / running / error |
+| Ambient tint | Subtle background shift from conversation context + persona accent |
 
 ---
 
@@ -65,16 +49,18 @@ Designed for **deep analytical curation**:
 
 ### User mental model
 
-A **lens** is a taste sandbox — like separate playlists for “comfort rewatch” vs “director study.” Switching lenses changes:
+A **lens** is a taste sandbox — like separate playlists for “comfort rewatch” vs “director study.” Switching lenses (API / advanced config) changes:
 
 - Which chat messages appear in history
 - Which taste weights apply (`lens_taste_profile`)
 - Which telemetry bucket receives future events (**Future** full ingestion)
 
+Ambient context inference complements lenses for everyday chat; legacy lens CRUD remains available for power users.
+
 ### Default and custom lenses
 
 - **`general`** — seeded at install; default active lens.
-- **Custom lenses** — created in Settings or `POST /api/lenses` with URL-safe `lens_id`.
+- **Custom lenses** — created via `POST /api/lenses` with URL-safe `lens_id`.
 
 ### Cross-contamination firewall
 
@@ -110,6 +96,8 @@ Configured in **Settings** (`/config`) and stored in `curator_persona_metrics`:
 
 **Curator name** updates greetings, page title, and LLM system prompt via `build_system_prompt()` — no container restart required.
 
+Presets (Classic Curator, Blunt Archivist, …) set welcome copy, composer hints, and accent; live sync progress in the status dock always takes priority over persona job-status flavor text.
+
 ---
 
 ## User journeys
@@ -119,123 +107,66 @@ Configured in **Settings** (`/config`) and stored in `curator_persona_metrics`:
 ```mermaid
 flowchart TD
     Start[Open :8788] --> Config[/config]
-    Config --> Plex[Test Plex sections]
-    Config --> Persona[Name curator + sliders]
-    Config --> LLM[Configure BYOP or Ollama]
-    Config --> Save[Save settings]
-    Save --> Chat[Chat /]
-    Chat --> Lens[Confirm active lens]
+    Config --> Identity[Name curator]
+    Config --> Infra[Verify Plex *arr LLM]
+    Config --> Map[Map movie/TV libraries]
+    Map --> Chat[Chat /]
     Chat --> Sync[Sync library]
     Sync --> Ready[Curate]
 ```
 
-### Genre exploration (lens-scoped)
+### Genre exploration
 
-1. User selects **Director Studies** lens (or stays on `general`).
+1. User chats in the workspace (ambient context or active `lens_id`).
 2. Sends: "Explore neo-noir based on what I love."
-3. Agent calls `explore_genre` / `search_library` with lens-aware preference context.
-4. Cards appear inline; user expands via Turnstyle viewport or Immersive array.
+3. Agent calls `explore_genre` / `search_library` with preference context.
+4. Cards appear inline; user may expand the results overlay for large sets.
 5. Dismissals record preference signals; adds go through confirmation flow.
 
 ### Gap finding, watch tonight, purge
 
-Same tool flows as Phase 0 — see agent catalog below. Purge remains advisory; *arr remove requires confirmation.
+Purge remains advisory; *arr remove requires confirmation. See agent catalog below.
 
 ---
 
 ## UI design system
 
-Dark **cinematic dashboard** in `frontend/src/styles.css`:
+Dark **cinematic** styling in `frontend/src/styles.css`:
 
-| Token | Value | Usage |
-|-------|-------|-------|
-| `--bg` | `#0b0d12` | Page background |
-| `--surface` | `#141925` | Cards, panels |
-| `--accent` | `#6ea8ff` | Links, buttons |
-| `--radius` | `16px` | Containers |
+- Top bar + sidebar + chat column as one composition
+- Title cards with poster, reason text, and optional “Why this?”
+- Status dock anchored bottom-left of the chat column
 
-Typography: **Inter** with system fallback; Turnstyle command lane uses monospace.
+Typography and accent colors follow persona presets where configured; avoid treating persona flavor as operational status.
 
 ---
 
-## Message block schema
+## Agent tools (1.0)
 
-Defined in `curatorx/models/schemas.py`.
+Core tools include library search, genre exploration, gap analysis, watch-tonight, purge candidates, preference recording, Radarr/Sonarr propose/confirm, reviews, and optional Plex collections (when enabled).
 
-| `type` | Fields | Purpose |
-|--------|--------|---------|
-| `text` | `content` | Prose reply |
-| `title_cards` | `items: TitleCard[]` | Inline posters |
-| `action_prompt` | `action`, `payload` | UI actions (`open_viewport`) |
-
-Assistant messages may include **`lens_id`** at the message level for client state sync.
+Keyword routing still applies when no LLM provider is configured — same heuristics as earlier releases.
 
 ---
 
-## Agent tool catalog
+## API surface (highlights)
 
-Registered in `curatorx/agent/tools.py`. System prompt includes persona metrics and lens-scoped `preference_context()`.
+| Area | Endpoints |
+|------|-----------|
+| Chat | `POST /api/chat`, `GET /api/chat/stream` |
+| Library | `POST /api/library/sync`, `GET /api/jobs`, stats/health/purge |
+| Setup | wizard, certifications, settings, service tests |
+| Persona / lenses | `GET/PUT /api/persona`, `GET /api/lenses` |
+| Actions | propose / confirm pending tokens |
+| Optional auth | `/api/auth/*`, `/api/users/*` when multi-user enabled |
 
-| Tool | Purpose |
-|------|---------|
-| `search_library` | Semantic + keyword search over owned titles |
-| `find_collection_gaps` | TMDB discover minus owned IDs |
-| `recommend_hidden_gems` | High-rated TMDB titles not owned |
-| `suggest_purge_candidates` | Large, unwatched, low-taste items |
-| `remember_preference` | Save explicit taste fact |
-| `add_to_radarr` / `add_to_sonarr` | Return confirmation token |
-| `remove_from_arr` | Return confirmation token |
-| `get_title_detail` | Deep dive on one title |
-| `explore_genre` | Genre browse with optional missing titles |
-| `what_to_watch_tonight` | Low view-count or mood search |
-| `analyze_watch_patterns` | Library habit stats |
-
-### Fallback agent (no LLM)
-
-Keyword routing to tools when no provider is configured — same heuristics as Phase 0.
-
----
-
-## BYOP LLM providers
-
-Implemented in `curatorx/agent/providers/__init__.py`:
-
-| Provider | Protocol |
-|----------|----------|
-| `openai_compatible` | OpenAI-compatible chat completions |
-| `ollama` | Same protocol; default `localhost:11434` |
-| `anthropic` | Anthropic Messages API |
-
-Embeddings: OpenAI-compatible or deterministic hash fallback.
-
----
-
-## Confirmation token pattern
-
-Unchanged: propose → token (600s TTL) → confirm → execute. See [ARCHITECTURE.md](ARCHITECTURE.md).
-
----
-
-## API surface (Phase 1 additions)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/lenses` | List lenses |
-| GET | `/api/lenses/active` | Active lens |
-| PUT | `/api/lenses/active` | Set active lens |
-| POST | `/api/lenses` | Create lens |
-| PUT | `/api/lenses/{lens_id}` | Update lens |
-| GET | `/api/persona` | Persona metrics |
-| PUT | `/api/persona` | Update persona |
-| GET | `/api/system-config` | Config key-values |
-| PUT | `/api/system-config` | Update config |
-
-Chat endpoints accept optional **`lens_id`**. Full list in [WEB_UI.md](WEB_UI.md).
+Full route tables: [WEB_UI.md](WEB_UI.md).
 
 ---
 
 ## Related documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — system context and data flows
-- [DATA_MODEL.md](DATA_MODEL.md) — schema reference
-- [curatorx_prd.md](curatorx_prd.md) — source PRD
+- [WEB_UI.md](WEB_UI.md) — workspace layout and chat features
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system context
+- [wiki/Home.md](wiki/Home.md) — operator wiki
+- [FAQ.md](FAQ.md) — common questions

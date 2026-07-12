@@ -2,7 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](docs/DOCKER.md)
+[![Docker Hub](https://img.shields.io/badge/docker-romwil%2Fcuratorx-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/romwil/curatorx)
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](CHANGELOG.md)
 
 **An intent-aware curation companion for self-hosted Plex libraries.**
 
@@ -16,13 +17,12 @@ CuratorX turns your homelab from a passive download queue into a context-aware c
 
 - [Why CuratorX](#why-curatorx)
 - [Features](#features)
-- [Homelab stack](#homelab-stack)
 - [Quick start](#quick-start)
-- [Curation lenses](#curation-lenses)
-- [Persona tuning](#persona-tuning)
-- [Dual UI modes](#dual-ui-modes)
-- [Screenshots](#screenshots)
-- [Documentation](#documentation)
+- [Docker Hub / Unraid](#docker-hub--unraid)
+- [Configuration](#configuration)
+- [Optional: multi-user & Seerr](#optional-multi-user--seerr)
+- [Documentation & wiki](#documentation--wiki)
+- [Testing](#testing)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -32,7 +32,7 @@ CuratorX turns your homelab from a passive download queue into a context-aware c
 
 | Typical recommender | CuratorX |
 |---------------------|----------|
-| One global taste profile | **Lens isolation** — separate contexts (General, Director Studies, 70s Exploitation, …) |
+| One global taste profile | **Lens isolation** — separate contexts (General, Director Studies, …) |
 | “Top 10 on Netflix” vibes | **Library-grounded RAG** — answers from what you own and watch |
 | Opaque scores | **Explainable cards** — every title carries a `recommendation_reason` |
 | Auto-grab everything | **Confirmation-gated *arr** — Radarr/Sonarr writes need explicit approval |
@@ -44,65 +44,32 @@ CuratorX complements disk tools like [Reclaimspace](https://github.com/romwil/re
 
 ## Features
 
-- **Chat-first curator** — natural-language discovery, gap analysis, purge advice, and “what to watch tonight”
-- **Curation lenses** — hard algorithmic walls between taste contexts; chat history and telemetry scoped by `lens_id`
-- **Dynamic persona** — name your curator and tune tone sliders (bro↔professorial, diplomatic↔snarky, passive↔autonomous)
-- **Dual UI** — compact **Turnstyle** command lane for fast intent entry; **Immersive** viewport for deep browsing
+- **Single chat workspace** — full-width conversation with sidebar threads, welcome panel, and status dock
+- **Chat-first curator** — discovery, gap analysis, purge advice, and “what to watch tonight”
+- **Curation lenses** — hard walls between taste contexts; chat history and telemetry scoped by `lens_id`
+- **Dynamic persona** — name your curator and tune tone sliders
 - **RAG over Plex** — semantic search with embeddings over your indexed library
-- **Metadata enrichment** — TMDB, TVDB, Fanart.tv, optional Tautulli watch stats
+- **Durable library sync** — background jobs with live phase / count / `%` progress; state survives container restarts
 - **Safe automation** — short-lived confirmation tokens for all Radarr/Sonarr mutations
 - **Unraid-ready** — single Docker container, SQLite persistence, Community Applications template
 
 ---
 
-## Homelab stack
-
-```mermaid
-flowchart TB
-    subgraph browser [Browser]
-        Turnstyle[Turnstyle widget]
-        Immersive[Immersive viewport]
-    end
-
-    subgraph curatorx [CuratorX container :8788]
-        API[FastAPI backend]
-        Agent[Curator agent + tools]
-        Jobs[Sync scheduler]
-        DB[(SQLite curatorx.db)]
-    end
-
-    subgraph homelab [LAN services]
-        Plex[Plex Media Server]
-        Radarr[Radarr]
-        Sonarr[Sonarr]
-        TMDB[TMDB API]
-        Tautulli[Tautulli optional]
-        Ollama[Ollama optional]
-    end
-
-    Turnstyle --> API
-    Immersive --> API
-    API --> Agent
-    API --> Jobs
-    Agent --> DB
-    Agent --> Ollama
-    Jobs --> Plex
-    Jobs --> Radarr
-    Jobs --> Sonarr
-    Agent --> TMDB
-    Jobs --> TMDB
-    Jobs --> Tautulli
-    Agent --> Radarr
-    Agent --> Sonarr
-```
-
-See [Architecture](docs/ARCHITECTURE.md) for component diagrams, data flows, and security model.
-
----
-
 ## Quick start
 
-### Docker (recommended)
+### Docker Hub (recommended)
+
+```bash
+docker pull romwil/curatorx:1.0
+docker run -d --name curatorx \
+  -p 8788:8788 \
+  -v /path/to/curatorx/config:/config \
+  romwil/curatorx:1.0
+```
+
+Open **http://localhost:8788** and complete the setup wizard.
+
+### Docker Compose
 
 ```bash
 git clone https://github.com/romwil/curatorx.git
@@ -110,8 +77,6 @@ cd curatorx
 cp .env.example .env
 docker compose up -d --build
 ```
-
-Open **http://localhost:8788** and complete the setup wizard.
 
 ### Local development
 
@@ -123,93 +88,98 @@ cd frontend && npm install && npm run build && cd ..
 DATA_DIR=./config python -m curatorx.web
 ```
 
-Open **http://localhost:8788**.
+---
+
+## Docker Hub / Unraid
+
+Published multi-arch images (**amd64 + arm64**):
+
+| Tag | Use |
+|-----|-----|
+| [`romwil/curatorx:1.0.0`](https://hub.docker.com/r/romwil/curatorx) | Pin an exact release |
+| [`romwil/curatorx:1.0`](https://hub.docker.com/r/romwil/curatorx) | Track the 1.0 line |
+| [`romwil/curatorx:latest`](https://hub.docker.com/r/romwil/curatorx) | Newest stable |
+
+**Unraid:** install from Community Applications using the template (`templates/curatorx.xml` / `unraid/curatorx.xml`), or add the container manually:
+
+| Setting | Value |
+|---------|-------|
+| Repository | `romwil/curatorx:1.0` |
+| Port | `8788` |
+| Config path | `/mnt/user/appdata/curatorx/config` → `/config` |
+
+Full steps: [Wiki → Unraid](docs/wiki/Unraid.md) · [Docker guide](docs/DOCKER.md)
 
 ---
 
-## Curation lenses
+## Configuration
 
-Every chat session, taste vector, and telemetry event carries a **`lens_id`**. The default lens is `general`.
+Settings live in `{DATA_DIR}/settings.json` (Docker: `/config/settings.json`). Environment variables from `.env` seed first-run values.
 
-Lenses prevent **context contamination**: watch history and chat under a casual lens cannot drift recommendations in a curated study lens unless you explicitly bridge them.
+Minimum to be useful: **Plex URL + token**, **movie/TV library sections**, **TMDB API key**, and an **LLM provider**. Radarr/Sonarr unlock add/remove after confirmation.
 
-```bash
-# API examples (after setup)
-curl http://localhost:8788/api/lenses
-curl http://localhost:8788/api/lenses/active
-curl -X PUT http://localhost:8788/api/lenses/active -H 'Content-Type: application/json' -d '{"lens_id":"general"}'
-```
-
-Create custom lenses from Settings or `POST /api/lenses`. Full schema in [Data model](docs/DATA_MODEL.md).
+See [CONFIGURATION.md](docs/CONFIGURATION.md) and [Wiki → Configuration](docs/wiki/Configuration.md).
 
 ---
 
-## Persona tuning
+## Optional: multi-user & Seerr
 
-CuratorX hot-reloads your companion’s identity without redeploying:
+CuratorX ships as a **single-owner** app with no login screen. Household features are opt-in:
 
-| Slider | Range | Effect |
-|--------|-------|--------|
-| Vocabulary density | Bro (0.0) → Professorial (1.0) | Word choice and depth |
-| Interaction friction | Diplomatic (0.0) → Snarky (1.0) | Tone and pushback |
-| Automation autonomy | Passive (0.0) → Autonomous (1.0) | How eagerly it proposes *arr actions |
-
-Set curator name and sliders in **Settings** (`/config`) or via `GET/PUT /api/persona`.
-
----
-
-## Dual UI modes
-
-| Mode | Purpose | Key UX |
+| Flag | Default | Effect |
 |------|---------|--------|
-| **Turnstyle** | Fast intent entry | Monospace command lane, lens prefix (`⧉ [General] > _`), thoughtstream feed |
-| **Immersive** | Deep curation | Sidebar lens switcher, lens-scoped chat, visual title clusters |
+| `features.multi_user_enabled` | `false` | Plex sign-in gate; owner vs member roles |
+| `features.seerr_enabled` | `false` | Seerr discovery / request path for members |
 
-Toggle with expansion hotkey, `/expand`, or viewport card click. Details in [Design](docs/DESIGN.md) and [Web UI](docs/WEB_UI.md).
+OIDC and local username/password auth are **not** implemented in 1.0 — use Plex login when multi-user is on.
 
----
-
-## Screenshots
-
-> Placeholders — replace with captures from your install.
-
-| Turnstyle widget | Immersive viewport |
-|------------------|-------------------|
-| _Screenshot: compact command lane with lens prefix_ | _Screenshot: sidebar + chat + title card grid_ |
-
-| Setup wizard | Title detail |
-|--------------|--------------|
-| _Screenshot: persona sliders and service validation_ | _Screenshot: backdrop hero with purge note_ |
+Details: [Wiki → Multi-User](docs/wiki/Multi-User.md) · [Wiki → Seerr](docs/wiki/Seerr.md)
 
 ---
 
-## Documentation
+## Documentation & wiki
 
 | Doc | Description |
 |-----|-------------|
-| [Product PRD](docs/curatorx_prd.md) | Vision, lens framework, persona, dual UI spec |
-| [Architecture](docs/ARCHITECTURE.md) | System context, data flows, deployment |
-| [Design](docs/DESIGN.md) | Principles, UX, agent tools, API surface |
-| [Data model](docs/DATA_MODEL.md) | SQLite schema, lenses, persona tables |
-| [Configuration](docs/CONFIGURATION.md) | Environment variables and settings |
+| **[Wiki home](docs/wiki/Home.md)** | In-repo wiki index |
+| [FAQ](docs/FAQ.md) | Common questions |
 | [Onboarding](docs/ONBOARDING.md) | First-run checklist |
+| [Web UI](docs/WEB_UI.md) | Workspace layout and routes |
+| [Architecture](docs/ARCHITECTURE.md) | System context and data flows |
+| [Design](docs/DESIGN.md) | UX principles and agent tools |
+| [Data model](docs/DATA_MODEL.md) | SQLite schema |
+| [Configuration](docs/CONFIGURATION.md) | Env vars and settings |
 | [Docker / Unraid](docs/DOCKER.md) | Container deployment |
-| [Web UI](docs/WEB_UI.md) | Routes and API highlights |
-| [Testing](docs/TESTING.md) | Unit tests, Playwright E2E, CI |
+| [Testing](docs/TESTING.md) | Unit, Playwright, CA checklist |
+| [Changelog](CHANGELOG.md) | Release notes |
+
+---
+
+## Testing
+
+```bash
+# Backend
+.venv/bin/python -m unittest discover -s tests -v
+
+# Frontend unit
+cd frontend && npm run test:unit
+
+# Mocked Playwright (no live Plex/LLM required)
+npm run test:e2e
+```
+
+CA-focused suites and live optional gates: [TESTING.md](docs/TESTING.md).
 
 ---
 
 ## Contributing
 
-Contributions welcome — especially lens presets, agent blueprints, connector hardening, and UI polish.
-
 1. Fork [romwil/curatorx](https://github.com/romwil/curatorx)
 2. Create a feature branch: `git checkout -b feat/your-idea`
-3. Install dev deps: `pip install -e ".[web]"` and `cd frontend && npm install`
-4. Run tests: `python -m unittest discover -s tests -v`
-5. Open a PR with a clear description and test plan
+3. Install: `pip install -e ".[web]"` and `cd frontend && npm install`
+4. Run the unit suites above, then open a PR with a clear description and test plan
 
-Phase 1 ships the `curatorx` package, default `general` lens, persona API, and dual UI (Turnstyle + Immersive). Open [issues](https://github.com/romwil/curatorx/issues) for lens presets, agent blueprints, and connector hardening.
+Open [issues](https://github.com/romwil/curatorx/issues) for lens presets, agent blueprints, and connector ideas.
 
 ---
 

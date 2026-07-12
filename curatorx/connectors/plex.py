@@ -123,9 +123,19 @@ class PlexClient:
             )
         return sections
 
-    def movie_items(self) -> List[PlexLibraryItem]:
+    def movie_items(
+        self,
+        page_size: int = 500,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> List[PlexLibraryItem]:
         section_key = self.movie_section or self._find_section_key("movie")
-        return self._fetch_items(section_key, media_type="movie", plex_type=1)
+        return self._fetch_items_paged(
+            section_key,
+            media_type="movie",
+            plex_type=1,
+            page_size=page_size,
+            progress_callback=progress_callback,
+        )
 
     def show_items(
         self,
@@ -263,7 +273,14 @@ class PlexClient:
             start += len(elements)
             if progress_callback:
                 total = total_size if total_size is not None else start
-                progress_callback(start, max(total, 1), "scanning_plex")
+                kind = "movies" if media_type == "movie" else "shows"
+                if total_size and start < total_size:
+                    message = f"Scanning {kind}… {start} of ~{total_size}"
+                elif total_size and start >= total_size:
+                    message = f"Found {start} {kind}"
+                else:
+                    message = f"Found {start} {kind} so far"
+                progress_callback(start, max(total, 1), message)
             if len(elements) < page_size:
                 break
         return items

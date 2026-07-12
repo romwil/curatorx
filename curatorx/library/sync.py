@@ -19,10 +19,45 @@ from curatorx.library.episodes import sync_tv_episodes
 from curatorx.library.facets import rebuild_library_facets, rebuild_library_fts
 from curatorx.library.query import refresh_library_overview_cache
 from curatorx.reviews.store import scan_for_rating_prompts
+from curatorx.web.job_progress import format_count_message
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Optional[Callable[[str, int, int, str], None]]
+
+
+class _PhaseClock:
+    """INFO-level phase start/end timing without spam."""
+
+    def __init__(self) -> None:
+        self._name: Optional[str] = None
+        self._started: Optional[float] = None
+
+    def begin(self, name: str) -> None:
+        self.finish()
+        self._name = name
+        self._started = time.time()
+        logger.info("Library sync: starting %s", name)
+
+    def finish(self, *, extra: str = "") -> None:
+        if not self._name or self._started is None:
+            return
+        elapsed = time.time() - self._started
+        suffix = f" — {extra}" if extra else ""
+        logger.info("Library sync: finished %s in %.1fs%s", self._name, elapsed, suffix)
+        self._name = None
+        self._started = None
+
+
+def _emit(
+    progress: ProgressCallback,
+    phase: str,
+    current: int,
+    total: int,
+    message: str,
+) -> None:
+    if progress:
+        progress(phase, current, total, message)
 
 
 def _runtime_minutes_from_ms(duration_ms: Optional[int]) -> Optional[int]:
@@ -239,7 +274,10 @@ async def sync_library(
     if not settings.plex_url or not settings.plex_token:
         raise RuntimeError("Plex is not configured")
 
+    clock = _PhaseClock()
     logger.info("Library sync starting")
+    clock.begin("preparing")
+    _emit(progress, "preparing", 0, 1, "Connecting to Plex…")
 
     plex = PlexClient(
         settings.plex_url,
@@ -253,33 +291,60 @@ async def sync_library(
     radarr_tmdb: set[int] = set()
     sonarr_tvdb: set[int] = set()
     if settings.radarr_url and settings.radarr_api_key:
-        logger.debug("Fetching Radarr movie index")
+        _emit(progress, "preparing", 0, 1, "Loading Radarr index…")
         radarr_tmdb = {m.tmdb_id for m in RadarrClient(settings.radarr_url, settings.radarr_api_key).movies()}
-        logger.debug("Radarr index loaded count=%s", len(radarr_tmdb))
+        logger.info("Library sync: Radarr index loaded (%s movies)", len(radarr_tmdb))
     if settings.sonarr_url and settings.sonarr_api_key:
-        logger.debug("Fetching Sonarr series index")
+        _emit(progress, "preparing", 0, 1, "Loading Sonarr index…")
         sonarr_tvdb = {s.tvdb_id for s in SonarrClient(settings.sonarr_url, settings.sonarr_api_key).series_list()}
-        logger.debug("Sonarr index loaded count=%s", len(sonarr_tvdb))
+        logger.info("Library sync: Sonarr index loaded (%s shows)", len(sonarr_tvdb))
 
-    if progress:
-        progress("movies", 0, 1, "Fetching Plex movies")
-    movies = plex.movie_items()
-    logger.info("Plex movies fetched count=%s", len(movies))
-    if progress:
-        progress("movies", 1, 1, f"Indexed {len(movies)} movies")
+    _emit(progress, "preparing", 1, 1, "Ready to scan Plex")
+    clock.finish()
+
+    page_size = max(50, int(settings.tv_page_size or 500))
+
+    clock.begin("scanning movies")
+    _emit(progress, "movies", 0, 1, "Scanning Plex movies…")
+
+    def movie_progress(current: int, total: int, message: str) -> None:
+        _emit(progress, "movies", current, total, message)
+
+    movies = plex.movie_items(page_size=page_size, progress_callback=movie_progress)
+    _emit(
+        progress,
+        "movies",
+        max(len(movies), 1),
+        max(len(movies), 1),
+        format_count_message("Scanning movies", len(movies), len(movies), unit="movies", done=True),
+    )
+    clock.finish(extra=f"{len(movies)} movies")
+
+    clock.begin("scanning TV")
+    _emit(progress, "tv", 0, 1, "Scanning Plex TV shows…")
 
     def tv_progress(current: int, total: int, message: str) -> None:
-        if progress:
-            progress("tv", current, total, message)
+        _emit(progress, "tv", current, total, message)
 
-    if progress:
-        progress("tv", 0, 1, "Fetching Plex TV shows")
-    shows = plex.show_items(page_size=settings.tv_page_size, progress_callback=tv_progress)
-    logger.info("Plex TV shows fetched count=%s", len(shows))
+    shows = plex.show_items(page_size=page_size, progress_callback=tv_progress)
+    _emit(
+        progress,
+        "tv",
+        max(len(shows), 1),
+        max(len(shows), 1),
+        format_count_message("Scanning shows", len(shows), len(shows), unit="shows", done=True),
+    )
+    clock.finish(extra=f"{len(shows)} shows")
+
+    plex_items = movies + shows
+    enrich_total = max(len(plex_items), 1)
+    clock.begin("enriching metadata")
+    _emit(progress, "enriching", 0, enrich_total, "Enriching metadata…")
 
     count = 0
     skipped_no_rating_key = 0
-    for item in movies + shows:
+    last_enrich_log = 0.0
+    for index, item in enumerate(plex_items, start=1):
         rating_key = str(item.rating_key or "").strip()
         if not rating_key:
             skipped_no_rating_key += 1
@@ -288,15 +353,29 @@ async def sync_library(
                 item.title,
                 item.media_type,
             )
-            continue
-        in_radarr = bool(item.tmdb_id and int(item.tmdb_id) in radarr_tmdb)
-        in_sonarr = bool(item.tvdb_id and int(item.tvdb_id) in sonarr_tvdb)
-        row = _row_from_plex_item(item, plex, tmdb, fanart, in_radarr=in_radarr, in_sonarr=in_sonarr)
-        row["rating_key"] = rating_key
-        db.upsert_library_item(row)
-        count += 1
+        else:
+            in_radarr = bool(item.tmdb_id and int(item.tmdb_id) in radarr_tmdb)
+            in_sonarr = bool(item.tvdb_id and int(item.tvdb_id) in sonarr_tvdb)
+            row = _row_from_plex_item(item, plex, tmdb, fanart, in_radarr=in_radarr, in_sonarr=in_sonarr)
+            row["rating_key"] = rating_key
+            db.upsert_library_item(row)
+            count += 1
 
-    logger.info("Library items upserted count=%s", count)
+        now = time.time()
+        should_emit = index == 1 or index == enrich_total or index % 25 == 0 or (now - last_enrich_log) >= 3.0
+        if should_emit:
+            unit = "titles"
+            message = format_count_message("Enriching metadata", index, enrich_total, unit=unit)
+            _emit(progress, "enriching", index, enrich_total, message)
+            if now - last_enrich_log >= 3.0 or index == enrich_total:
+                logger.info(
+                    "Library sync: enriching metadata — %s of %s titles",
+                    index,
+                    enrich_total,
+                )
+                last_enrich_log = now
+
+    clock.finish(extra=f"{count} titles saved")
     with db.connect() as conn:
         items_with_tmdb = conn.execute(
             "SELECT COUNT(*) AS cnt FROM library_items WHERE tmdb_id IS NOT NULL"
@@ -335,37 +414,39 @@ async def sync_library(
             skipped_no_rating_key,
         )
 
-    if progress:
-        progress("facets", 0, 1, "Building facet index")
+    clock.begin("building indexes")
+    _emit(progress, "indexing", 0, 2, "Building search facets…")
     facet_count = rebuild_library_facets(db)
-    logger.debug("Facet index rebuilt count=%s", facet_count)
-
-    if progress:
-        progress("fts", 0, 1, "Building full-text index")
+    _emit(progress, "indexing", 1, 2, "Building search index…")
     fts_count = rebuild_library_fts(db)
-    logger.debug("FTS index rebuilt count=%s", fts_count)
+    _emit(progress, "indexing", 2, 2, "Search indexes ready")
+    clock.finish(extra=f"facets={facet_count} fts={fts_count}")
 
-    if progress:
-        progress("episodes", 0, 1, "Syncing TV episodes")
+    clock.begin("syncing episodes")
+    _emit(progress, "episodes", 0, 1, "Syncing TV episodes…")
     episode_stats = sync_tv_episodes(db, plex, progress=progress, plex_shows=shows)
-    logger.info(
-        "TV episodes synced shows=%s episodes=%s",
-        episode_stats.get("shows_synced"),
-        episode_stats.get("episodes_synced"),
+    clock.finish(
+        extra=(
+            f"shows={episode_stats.get('shows_synced')} "
+            f"episodes={episode_stats.get('episodes_synced')}"
+        )
     )
 
-    if progress:
-        progress("embeddings", 0, 1, "Building embeddings")
+    clock.begin("finishing")
+    _emit(progress, "finishing", 0, 1, "Building recommendations…")
     embedded = await rebuild_embeddings(db, settings)
-    logger.info("Embeddings rebuilt count=%s", embedded)
     refresh_library_overview_cache(db)
     rating_prompts = scan_for_rating_prompts(db, settings)
-    logger.info("Rating prompts queued count=%s", rating_prompts)
+    _emit(progress, "finishing", 1, 1, "Wrapping up…")
+    clock.finish(extra=f"embeddings={embedded} rating_prompts={rating_prompts}")
+
     db.set_sync_state(
         "last_sync",
         json.dumps(
             {
                 "items": count,
+                "movies": len(movies),
+                "shows": len(shows),
                 "embeddings": embedded,
                 "facets": facet_count,
                 "fts": fts_count,
@@ -376,8 +457,16 @@ async def sync_library(
         ),
     )
 
+    logger.info(
+        "Library sync complete — %s movies, %s shows, %s titles indexed",
+        len(movies),
+        len(shows),
+        count,
+    )
     return {
         "items_synced": count,
+        "movies": len(movies),
+        "shows": len(shows),
         "embeddings": embedded,
         "facets": facet_count,
         "fts": fts_count,

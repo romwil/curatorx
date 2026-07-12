@@ -3,11 +3,15 @@ import test from "node:test";
 
 import {
   SLASH_COMMANDS,
+  executeSlashCommand,
+  formatCollectionsDeniedMessage,
+  formatCollectionsDisabledMessage,
   formatCollectionsMessage,
   formatHelpMessage,
   formatPurgeMessage,
   formatStatsMessage,
   formatSyncDeniedMessage,
+  formatSyncStartedMessage,
   parseSlashCommand,
 } from "./slashCommands.js";
 
@@ -76,4 +80,88 @@ test("formatCollectionsMessage lists Plex collections", () => {
   );
   assert.match(text, /Neo-Noir/);
   assert.match(text, /Prestige TV/);
+});
+
+test("formatStatsMessage handles zeros and missing stats", () => {
+  assert.match(formatStatsMessage({ movies: 0, shows: 0, total: 0, last_sync: null }), /Movies: \*\*0\*\*/);
+  assert.match(formatStatsMessage(null), /not available yet/);
+});
+
+test("formatSyncStartedMessage is friendly without job ids", () => {
+  const text = formatSyncStartedMessage({ id: "abc123" });
+  assert.match(text, /Library sync queued/i);
+  assert.match(text, /status dock/i);
+  assert.doesNotMatch(text, /abc123/);
+  assert.doesNotMatch(text, /Job `/);
+});
+
+test("formatCollectionsDisabledMessage and denied message guide the user", () => {
+  assert.match(formatCollectionsDisabledMessage(), /disabled/i);
+  assert.match(formatCollectionsDeniedMessage(), /owner/i);
+});
+
+test("parseSlashCommand handles bare slash and unknown casing", () => {
+  assert.deepEqual(parseSlashCommand("/"), { command: "", args: "", raw: "/" });
+  assert.equal(parseSlashCommand("/HELP").command, "help");
+});
+
+test("executeSlashCommand help and unknown command", async () => {
+  const help = await executeSlashCommand(
+    { command: "help", args: "", raw: "/help" },
+    { curatorName: "Flemming", getFeatures: async () => ({ features: {} }) },
+  );
+  assert.equal(help.role, "assistant");
+  assert.match(help.blocks[0].content, /Flemming slash commands/);
+
+  const unknown = await executeSlashCommand(
+    { command: "wat", args: "", raw: "/wat" },
+    { curatorName: "Flemming" },
+  );
+  assert.match(unknown.blocks[0].content, /Unknown command/);
+});
+
+test("executeSlashCommand stats and sync paths", async () => {
+  const calls = [];
+  const api = async (path, options) => {
+    calls.push({ path, options });
+    if (path === "/library/stats") {
+      return { movies: 0, shows: 0, total: 0, last_sync: null };
+    }
+    if (path === "/library/sync") {
+      return { id: "job-9", status: "queued" };
+    }
+    throw new Error(`unexpected ${path}`);
+  };
+
+  const stats = await executeSlashCommand(
+    { command: "stats", args: "", raw: "/stats" },
+    { api, curatorName: "Flemming" },
+  );
+  assert.match(stats.blocks[0].content, /Movies: \*\*0\*\*/);
+
+  const syncDenied = await executeSlashCommand(
+    { command: "sync", args: "", raw: "/sync" },
+    {
+      api,
+      getFeatures: async () => ({ features: { multi_user_enabled: true } }),
+    },
+  );
+  assert.match(syncDenied.blocks[0].content, /owner-only/i);
+
+  const syncOk = await executeSlashCommand(
+    { command: "sync", args: "", raw: "/sync" },
+    {
+      api,
+      getFeatures: async () => ({ features: { multi_user_enabled: false } }),
+    },
+  );
+  assert.match(syncOk.blocks[0].content, /Library sync queued/i);
+  assert.doesNotMatch(syncOk.blocks[0].content, /job-9/);
+  assert.equal(calls.some((c) => c.path === "/library/sync" && c.options?.method === "POST"), true);
+});
+
+test("SLASH_COMMANDS includes core novice commands", () => {
+  for (const name of ["help", "stats", "sync", "rate", "purge"]) {
+    assert.equal(SLASH_COMMANDS.includes(name), true);
+  }
 });

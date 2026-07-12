@@ -57,9 +57,11 @@ On first visit to **Settings** (`/config`), uncertified services with configured
 
 ## Index your library
 
-1. Click **Sync library** on the chat page (or `POST /api/library/sync`).
-2. Wait for the background job to finish — Plex metadata, TMDB enrichment, and embeddings are rebuilt.
-3. Confirm stats via `GET /api/library/stats`.
+1. Open **Config** and click **Sync library** on the maintenance dashboard (or type `/sync` in chat when multi-user is off).
+2. Watch progress in the **status dock** (phase, counts, percent) — or on the Config library sync card.
+3. Confirm stats via `GET /api/library/stats` or the top-bar movie/show counts.
+
+Job state is durable across container restarts; an interrupted sync is marked failed so you can start again cleanly.
 
 ---
 
@@ -81,7 +83,7 @@ Try these prompts:
 - "Which large files have never been watched?"
 - "Explore neo-noir with me based on what I already love."
 
-Use **Turnstyle** mode for quick one-liners; expand to **Immersive** for longer sessions with the full card grid.
+Use the **single chat workspace** for everyday curation. Expand large title-card sets with the results overlay when needed.
 
 ---
 
@@ -89,4 +91,6 @@ Use **Turnstyle** mode for quick one-liners; expand to **Immersive** for longer 
 
 - [CONFIGURATION.md](CONFIGURATION.md) — settings reference
 - [WEB_UI.md](WEB_UI.md) — routes and chat features
-- [curatorx_prd.md](curatorx_prd.md) — product vision (v3.0)
+- [wiki/Home.md](wiki/Home.md) — operator wiki
+- [FAQ.md](FAQ.md) — common questions
+- [curatorx_prd.md](curatorx_prd.md) — product vision (historical PRD)

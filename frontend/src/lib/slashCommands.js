@@ -1,3 +1,5 @@
+import { createId } from "./id.js";
+
 function reviewPromptBlock(prompt) {
   return {
     type: "review_prompt",
@@ -66,12 +68,11 @@ export function formatSyncDeniedMessage() {
   ].join("\n");
 }
 
-export function formatSyncStartedMessage(job) {
-  const jobId = job?.id || job?.job_id || "queued";
+export function formatSyncStartedMessage(_job) {
   return [
-    "**Library sync started**",
+    "**Library sync queued**",
     "",
-    `Job \`${jobId}\` is queued. Watch progress in the status dock (bottom-left).`,
+    "Watch progress in the status dock (bottom-left).",
   ].join("\n");
 }
 
@@ -139,7 +140,7 @@ export function formatCollectionsDeniedMessage() {
 
 function assistantBlock(content, blocks = null) {
   return {
-    id: crypto.randomUUID(),
+    id: createId(),
     role: "assistant",
     blocks: blocks || [{ type: "text", content }],
   };

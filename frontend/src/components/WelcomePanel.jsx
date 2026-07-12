@@ -19,7 +19,9 @@ export default function WelcomePanel({
   return (
     <section className="welcome-panel" data-testid="welcome-panel" aria-label="Welcome">
       <p className="welcome-panel-greeting">{resolvedGreeting}</p>
-      <p className="welcome-panel-hint">Try a starter prompt or type `/help` for slash commands.</p>
+      <p className="welcome-panel-hint">
+    Try a starter prompt, or type `/help` for slash commands. Sync your Plex library from Config when you are ready.
+  </p>
       <div className="welcome-panel-starters">
         {resolvedStarters.map((prompt) => (
           <button

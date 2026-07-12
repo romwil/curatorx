@@ -7,6 +7,12 @@ RUN npm run build
 
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="CuratorX" \
+      org.opencontainers.image.description="Chat-first Plex collection curator for self-hosted homelabs" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.source="https://github.com/romwil/curatorx" \
+      org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 RUN apt-get update \

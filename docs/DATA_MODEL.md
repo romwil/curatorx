@@ -10,6 +10,7 @@ Reference for persistent storage: SQLite tables, settings fields, and Pydantic s
 |------|--------|----------|
 | `{DATA_DIR}/curatorx.db` | SQLite 3 | Library, embeddings, chat (lens-scoped), persona, lenses, preferences |
 | `{DATA_DIR}/settings.json` | JSON | Connection settings and secrets |
+| `{DATA_DIR}/jobs_state.json` | JSON | Durable background job history (library sync) |
 
 Default `DATA_DIR`: `/config` in Docker, `./config` in local dev.
 
@@ -17,7 +18,7 @@ Default `DATA_DIR`: `/config` in Docker, `./config` in local dev.
 
 ## SQLite schema
 
-### Core library (Phase 1)
+### Core library
 
 #### `library_items`
 
@@ -120,7 +121,7 @@ Unique per `(user_id, media_type, tmdb_id, tvdb_id)`.
 
 #### `users`
 
-Household accounts (schema present from Phase 0; login enforced only when `features.multi_user_enabled` is true).
+Household accounts (schema present; login enforced only when `features.multi_user_enabled` is true).
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -156,7 +157,7 @@ Key-value job metadata (e.g. `last_sync` JSON with item/embedding counts).
 
 ---
 
-### PRD cognitive tables (Phase 1)
+### PRD cognitive tables
 
 From [curatorx_prd.md](curatorx_prd.md):
 
@@ -254,7 +255,7 @@ Personal 1–5 star ratings and optional free-text notes for titles you have wat
 | `prompted_by` | TEXT | `user`, `near_complete`, `slash_rate`, `curator_suggestion` |
 | `session_id` | TEXT | Chat thread when captured in UI |
 | `lens_id` | TEXT | Active lens |
-| `plex_rating_synced` | INTEGER | Phase 5 Plex write-back flag |
+| `plex_rating_synced` | INTEGER | Plex write-back flag |
 | `created_at` / `updated_at` | REAL | Unix timestamps |
 
 #### `rating_prompt_queue`

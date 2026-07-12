@@ -79,14 +79,14 @@ Default values (also in `config/settings.example.json`):
 | `features.multi_user_enabled` | `false` | Requires sign-in; enforces owner vs member roles; per-user chat and reviews |
 | `features.seerr_enabled` | `false` | Activates Seerr connector for household discovery and requests |
 | `auth.mode` | `disabled` | Set to `plex`, `oidc`, or `local` when multi-user is on |
-| `seerr.link_on_login` | `true` | After Plex login, bridge identity to Seerr (Phase 8) |
+| `seerr.link_on_login` | `true` | After Plex login, bridge identity to Seerr |
 | `seerr.require_linked_user_for_requests` | `false` | Block Seerr requests until the user is linked |
 
 **For most installs:** leave everything at the defaults. CuratorX behaves exactly as before — one implicit owner, no login, no Seerr calls.
 
 **To enable multi-user or Seerr later:** open **Config → Multi-user auth** and **Config → Seerr** (or edit `{DATA_DIR}/settings.json`), set `features.multi_user_enabled` to `true`, choose `auth.mode` (`plex` for token login), and save. For Seerr, set `features.seerr_enabled` to `true`, add your Seerr URL and API key, and test the connection. The frontend reads `GET /api/features` to show or hide login, Seerr request buttons, and user-management UI.
 
-### Multi-user Plex login (Phase 8)
+### Multi-user Plex login
 
 When `features.multi_user_enabled` is `true`, CuratorX requires sign-in before using the chat UI.
 
@@ -182,7 +182,7 @@ Seerr (Overseerr / Jellyseerr) lets household **members** request movies and sho
 
 ---
 
-## Plex review sync (Phase 5)
+## Plex review sync
 
 CuratorX can mirror your **personal 1–5 star reviews** back to Plex so they appear as Plex user ratings on movies and shows you own.
 

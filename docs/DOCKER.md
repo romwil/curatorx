@@ -103,7 +103,7 @@ Install from the Community Applications template (`templates/curatorx.xml` or `u
 |---------|-------|
 | **Port** | 8788 |
 | **Config path** | `/mnt/user/appdata/curatorx/config` → `/config` |
-| **Image** | Build from repo `Dockerfile` or published image when available |
+| **Image** | `romwil/curatorx:1.0` (also `:1.0.0`, `:latest`) — multi-arch amd64+arm64 |
 
 ### Ollama on the Unraid host
 
@@ -124,6 +124,7 @@ Or use the host LAN IP if `host.docker.internal` is unavailable.
 |------|----------|
 | `/config/settings.json` | Connection settings, LLM config, onboarding flags |
 | `/config/curatorx.db` | Library index, embeddings, chat (with `lens_id`), persona, lenses |
+| `/config/jobs_state.json` | Durable background job history (library sync) |
 
 Back up the entire `/config` directory before upgrades.
 
@@ -139,5 +140,8 @@ Back up the entire `/config` directory before upgrades.
 
 ## Related documentation
 
+- [wiki/Unraid.md](wiki/Unraid.md) — Unraid CA install
+- [wiki/Installation.md](wiki/Installation.md) — Docker Hub tags
 - [ONBOARDING.md](ONBOARDING.md) — first-run wizard
 - [ARCHITECTURE.md](ARCHITECTURE.md) — deployment diagram
+- [FAQ.md](FAQ.md) — common questions

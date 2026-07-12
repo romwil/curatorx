@@ -24,6 +24,10 @@ import {
   updateUserRole,
 } from "../api/client";
 import PersonaSection from "../components/PersonaSection";
+import {
+  formatLastSyncRelative,
+  formatSyncJobDetails,
+} from "../lib/jobProgress.js";
 
 const SECRET_FIELDS = [
   "plex_token",
@@ -461,7 +465,9 @@ export default function ConfigPage() {
     }
 
     pollSyncJobs();
-    const interval = setInterval(pollSyncJobs, 5000);
+    // Poll at a fixed 2s while Config is open. Do not depend on syncingLibrary —
+    // setSyncingLibrary inside this effect would re-run it and stack intervals.
+    const interval = setInterval(pollSyncJobs, 2000);
     return () => {
       cancelled = true;
       clearInterval(interval);
@@ -1077,7 +1083,7 @@ export default function ConfigPage() {
       syncWasRunningRef.current = job.status === "running" || job.status === "queued";
       setActionFeedback("library-sync", {
         type: "success",
-        message: `Library sync started (${job.id}).`,
+        message: "Library sync started. Progress appears below.",
       });
     } catch (error) {
       setSyncingLibrary(false);
@@ -1088,33 +1094,8 @@ export default function ConfigPage() {
     }
   }
 
-  function formatSyncJobStatus(job) {
-    if (!job) return null;
-    if (job.status === "failed") {
-      return job.error ? `Sync failed: ${job.error}` : "Sync failed.";
-    }
-    if (job.status === "completed") {
-      return "Last sync completed.";
-    }
-    const progress = job.progress || {};
-    const message = progress.message || job.status;
-    const percent = progress.percent;
-    if (typeof percent === "number" && percent > 0) {
-      return `${message} (${percent}%)`;
-    }
-    return message;
-  }
-
   function formatLastSync(lastSync) {
-    if (!lastSync) return "Never";
-    try {
-      const parsed = typeof lastSync === "string" ? JSON.parse(lastSync) : lastSync;
-      const timestamp = parsed?.finished_at || parsed?.started_at || parsed?.updated_at;
-      if (!timestamp) return "Unknown";
-      return new Date(Number(timestamp) * 1000).toLocaleString();
-    } catch {
-      return String(lastSync);
-    }
+    return formatLastSyncRelative(lastSync);
   }
 
   async function handleExportTrainingCorpus() {
@@ -1163,23 +1144,75 @@ export default function ConfigPage() {
 
         <section className="config-section" data-testid="library-sync-card">
           <h2>Library sync</h2>
-          <p>Pull the latest movies and shows from Plex into CuratorX.</p>
+          <p>
+            Pull the latest movies and shows from Plex into CuratorX. First sync can take a few minutes
+            while titles are scanned and enriched.
+          </p>
           <div className="config-actions">
             <button type="button" data-testid="library-sync-button" onClick={handleLibrarySync} disabled={syncingLibrary}>
-              {syncingLibrary ? "Starting sync…" : "Sync library"}
+              {syncingLibrary ? "Syncing…" : "Sync library"}
             </button>
           </div>
+          {(() => {
+            const details = formatSyncJobDetails(activeSyncJob, libraryStats);
+            if (!details) return null;
+            if (details.state === "running" || syncingLibrary) {
+              const live = details.state === "running" ? details : formatSyncJobDetails(
+                { ...(activeSyncJob || {}), status: "running", progress: activeSyncJob?.progress || { phase: "preparing", message: "Starting…" } },
+                libraryStats,
+              );
+              return (
+                <div className="library-sync-progress" data-testid="library-sync-job-status">
+                  <p className="library-sync-progress-headline">
+                    <strong>{live.headline}</strong>
+                    {typeof live.percent === "number" ? ` · ${live.percent}%` : ""}
+                  </p>
+                  <p className="library-sync-progress-detail status status-secondary">
+                    {live.detail}
+                    {live.countHint && !String(live.detail || "").includes(String(activeSyncJob?.progress?.current ?? ""))
+                      ? ` · ${live.countHint}`
+                      : ""}
+                  </p>
+                  {typeof live.percent === "number" ? (
+                    <div
+                      className="library-sync-progress-bar"
+                      role="progressbar"
+                      aria-valuenow={live.percent}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      <span className="library-sync-progress-fill" style={{ width: `${live.percent}%` }} />
+                    </div>
+                  ) : null}
+                </div>
+              );
+            }
+            if (details.state === "failed") {
+              return (
+                <p className="status status-error" data-testid="library-sync-job-status">
+                  Sync failed: {details.detail}
+                </p>
+              );
+            }
+            if (details.state === "completed" && trackedSyncJobIdRef.current === activeSyncJob?.id) {
+              return (
+                <p className="status" data-testid="library-sync-job-status">
+                  {details.headline}
+                </p>
+              );
+            }
+            return null;
+          })()}
           {libraryStats ? (
             <p className="status status-secondary" data-testid="library-sync-stats">
               {libraryStats.movies} movies · {libraryStats.shows} shows
-              {libraryStats.last_sync ? ` · Last sync ${formatLastSync(libraryStats.last_sync)}` : ""}
+              {libraryStats.last_sync ? ` · Last synced ${formatLastSync(libraryStats.last_sync)}` : " · Never synced"}
             </p>
-          ) : null}
-          {activeSyncJob && (syncingLibrary || activeSyncJob.status === "failed") ? (
-            <p className="status" data-testid="library-sync-job-status">
-              {formatSyncJobStatus(activeSyncJob)}
+          ) : (
+            <p className="status status-secondary" data-testid="library-sync-stats">
+              No library indexed yet — run Sync library after Plex is connected.
             </p>
-          ) : null}
+          )}
           <InlineAlert
             type={actionAlert?.area === "library-sync" ? actionAlert.type : null}
             message={actionAlert?.area === "library-sync" ? actionAlert.message : null}
@@ -1609,7 +1642,7 @@ export default function ConfigPage() {
                       }).catch((error) => setActionFeedback("seerr", "error", error.message));
                     }}
                   />
-                  <span>Link Plex users to Seerr on login (Phase 8)</span>
+                  <span>Link Plex users to Seerr on login</span>
                 </label>
                 <label className="config-toggle" data-testid="seerr-require-linked-user">
                   <input

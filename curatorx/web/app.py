@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 import asyncio
@@ -150,8 +151,23 @@ from curatorx.logging_config import configure_logging
 
 configure_logging()
 
-app = FastAPI(title="CuratorX", version=__version__)
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    logger.info("CuratorX startup (version %s, data_dir=%s)", __version__, DATA_DIR)
+    manager = get_job_manager()
+    manager.db.ensure_seed_data()
+    ensure_library_facet_index(manager.db)
+    get_sync_scheduler().start()
+    logger.info("Job manager and sync scheduler ready")
+    yield
+    get_sync_scheduler().stop()
+    logger.info("CuratorX shutdown complete")
+
+
+app = FastAPI(title="CuratorX", version=__version__, lifespan=lifespan)
 
 
 def _row_to_lens(row: Any) -> Lens:
@@ -206,16 +222,6 @@ def _resolve_lens_id(lens_id: Optional[str]) -> str:
     if not db.get_lens(resolved):
         raise HTTPException(status_code=404, detail=f"Unknown lens_id: {resolved}")
     return resolved
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    logger.info("CuratorX startup (version %s, data_dir=%s)", __version__, DATA_DIR)
-    manager = get_job_manager()
-    manager.db.ensure_seed_data()
-    ensure_library_facet_index(manager.db)
-    get_sync_scheduler().start()
-    logger.info("Job manager and sync scheduler ready")
 
 
 if FRONTEND_DIST.exists():

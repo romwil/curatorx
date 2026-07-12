@@ -110,9 +110,17 @@ def request_xml(
 
 
 def optional_int(value: Optional[str]) -> Optional[int]:
+    """Parse an optional integer from a string.
+
+    Plex attributes such as ``userRating`` are often float-like (``"9.0"``).
+    Coerce via float first so those values do not raise during library sync.
+    """
     if value is None or value == "":
         return None
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        return int(float(value))
 
 
 def _provider_id_from_guid(guid: str, marker: str, key: str, result: dict[str, str]) -> None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "curatorx"
-version = "0.1.0"
+version = "1.0.0"
 description = "Agentic Plex collection curator with BYOP LLM, RAG, and Radarr/Sonarr integration."
 readme = "README.md"
 license = { text = "MIT" }
@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 authors = [{ name = "romwil" }]
 keywords = ["plex", "radarr", "sonarr", "media", "curator", "ai", "unraid"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",

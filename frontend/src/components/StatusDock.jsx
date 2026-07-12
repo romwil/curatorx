@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { relativeTime } from "../api/client";
+import { TITLE_CARD_DRAG_MIME, readTitleCardDragData, statusDockDropHint } from "../lib/easterEggs.js";
+import { formatSyncJobStatus, friendlyProgressMessage } from "../lib/jobProgress.js";
 import { isSyncChimeMuted, playSyncChime, setSyncChimeMuted } from "../lib/syncChime";
-import { readTitleCardDragData, statusDockDropHint } from "../lib/easterEggs.js";
 import AddActionBanner from "./AddActionBanner";
 import InlineAlert from "./InlineAlert";
 
@@ -14,26 +15,31 @@ function jobIcon(job) {
   return JOB_ICONS[job.job_type] || JOB_ICONS.default;
 }
 
+function personaFlavor(job, jobStatusPhrases = []) {
+  if (!jobStatusPhrases.length) return "";
+  const phraseIndex = Math.abs(Number(job.id?.length || 0)) % jobStatusPhrases.length;
+  return jobStatusPhrases[phraseIndex] || "";
+}
+
 function jobLabel(job, jobStatusPhrases = []) {
-  const progressMessage = job.progress?.message;
-  let message = progressMessage || job.job_type.replace(/_/g, " ");
-  if (
-    job.job_type === "library_sync" &&
-    (job.status === "running" || job.status === "queued") &&
-    jobStatusPhrases.length
-  ) {
-    const phraseIndex = Math.abs(Number(job.id?.length || 0)) % jobStatusPhrases.length;
-    message = jobStatusPhrases[phraseIndex];
+  // Live phase / count / % always wins over persona flavor while a job is active.
+  if (job.status === "running" || job.status === "queued") {
+    const live = formatSyncJobStatus(job);
+    const flavor = personaFlavor(job, jobStatusPhrases);
+    if (live && flavor && !live.toLowerCase().includes(flavor.toLowerCase())) {
+      return `${live} · ${flavor}`;
+    }
+    return live || "Library sync…";
   }
-  const status =
-    job.status === "running"
-      ? "Running"
-      : job.status === "queued"
-        ? "Queued"
-        : job.status === "failed"
-          ? "Failed"
-          : "Done";
-  return `${status}: ${message}`;
+
+  const progress = job.progress || {};
+  const progressMessage = friendlyProgressMessage(
+    progress.message,
+    progress.phase,
+    job.job_type,
+  );
+  const status = job.status === "failed" ? "Failed" : "Done";
+  return `${status}: ${progressMessage}`;
 }
 
 function AddProgress({ progress }) {
@@ -55,6 +61,12 @@ function AddProgress({ progress }) {
   );
 }
 
+function isTitleCardDrag(event) {
+  const types = event?.dataTransfer?.types;
+  if (!types) return false;
+  return Array.from(types).includes(TITLE_CARD_DRAG_MIME);
+}
+
 export default function StatusDock({
   jobs = [],
   jobStatusPhrases = [],
@@ -73,7 +85,10 @@ export default function StatusDock({
 }) {
   const [chimeMuted, setChimeMuted] = useState(() => isSyncChimeMuted());
   const [dropActive, setDropActive] = useState(false);
+  const [cardDragging, setCardDragging] = useState(false);
   const jobStatusRef = useRef(new Map());
+
+  const dropEnabled = Boolean(onDropTitle && (radarrConnected || sonarrConnected));
 
   useEffect(() => {
     for (const job of jobs) {
@@ -82,7 +97,7 @@ export default function StatusDock({
         job.job_type === "library_sync" &&
         previous &&
         (previous === "running" || previous === "queued") &&
-        job.status === "done"
+        (job.status === "completed" || job.status === "done")
       ) {
         playSyncChime();
       }
@@ -90,15 +105,39 @@ export default function StatusDock({
     }
   }, [jobs]);
 
+  useEffect(() => {
+    if (!dropEnabled) {
+      setCardDragging(false);
+      setDropActive(false);
+      return undefined;
+    }
+
+    function onDragStart(event) {
+      if (isTitleCardDrag(event)) setCardDragging(true);
+    }
+    function onDragEnd() {
+      setCardDragging(false);
+      setDropActive(false);
+    }
+
+    document.addEventListener("dragstart", onDragStart, true);
+    document.addEventListener("dragend", onDragEnd, true);
+    return () => {
+      document.removeEventListener("dragstart", onDragStart, true);
+      document.removeEventListener("dragend", onDragEnd, true);
+    };
+  }, [dropEnabled]);
+
   const hasPendingAction = Boolean(pendingAdd || pendingBulk || pendingTokens?.length);
   const activeJobs = jobs.filter((job) => job.status === "running" || job.status === "queued");
   const hasJobs = activeJobs.length > 0;
   const hasFeedback = Boolean(addFeedback?.message);
   const showAddBanner = hasPendingAction && !addInProgress;
-  const showDropHint = Boolean(onDropTitle && (radarrConnected || sonarrConnected));
+  const showDropHint = dropEnabled && (cardDragging || dropActive);
+  const hasContent = hasJobs || showAddBanner || addInProgress || hasFeedback;
   const dropHint = statusDockDropHint({ radarrConnected, sonarrConnected });
 
-  if (!hasJobs && !showAddBanner && !addInProgress && !hasFeedback && !showDropHint) {
+  if (!hasContent && !showDropHint) {
     return null;
   }
 
@@ -110,33 +149,35 @@ export default function StatusDock({
 
   return (
     <div
-      className={`status-dock ${dropActive ? "drop-active" : ""}`}
+      className={`status-dock ${dropActive || showDropHint ? "drop-ready" : ""} ${dropActive ? "drop-active" : ""}`}
       data-testid="status-dock"
       onDragOver={
-        showDropHint
+        dropEnabled
           ? (event) => {
               event.preventDefault();
               setDropActive(true);
             }
           : undefined
       }
-      onDragLeave={showDropHint ? () => setDropActive(false) : undefined}
+      onDragLeave={
+        dropEnabled
+          ? () => {
+              setDropActive(false);
+            }
+          : undefined
+      }
       onDrop={
-        showDropHint
+        dropEnabled
           ? (event) => {
               event.preventDefault();
               setDropActive(false);
+              setCardDragging(false);
               const item = readTitleCardDragData(event);
               if (item) onDropTitle?.(item);
             }
           : undefined
       }
     >
-      {showDropHint ? (
-        <p className="status-dock-drop-hint" data-testid="status-dock-drop-hint">
-          {dropHint}
-        </p>
-      ) : null}
       {hasJobs ? (
         <div className="status-dock-jobs" data-testid="status-dock-jobs">
           {activeJobs.slice(0, 4).map((job) => (
@@ -145,6 +186,11 @@ export default function StatusDock({
               <div className="status-dock-job-body">
                 <span className="status-dock-job-label">{jobLabel(job, jobStatusPhrases)}</span>
                 <span className="status-dock-job-time">{relativeTime(job.created_at)}</span>
+                {showDropHint ? (
+                  <span className="status-dock-drop-hint status-dock-drop-hint-inline" data-testid="status-dock-drop-hint">
+                    {dropHint}
+                  </span>
+                ) : null}
               </div>
             </div>
           ))}
@@ -182,6 +228,14 @@ export default function StatusDock({
           testId="add-action-feedback"
           onDismiss={onDismissFeedback}
         />
+      ) : null}
+
+      {showDropHint && !hasJobs ? (
+        <div className="status-dock-drop-target" data-testid="status-dock-drop-target">
+          <p className="status-dock-drop-hint" data-testid="status-dock-drop-hint">
+            {dropHint}
+          </p>
+        </div>
       ) : null}
     </div>
   );

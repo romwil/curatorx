@@ -18,7 +18,7 @@ It is a **separate product** from [Reclaimspace](https://github.com/romwil/recla
 | **Self-hosted, BYOP LLM** | OpenAI-compatible, Anthropic, or Ollama |
 | **Homelab friendly** | Single Docker container, SQLite, Unraid template |
 
-Non-goals for Phase 1: cloud SaaS, automatic file deletion without confirmation, and generic streaming-service recommendations. Multi-user auth, Seerr, and Plex collections are **optional** (off by default); see [CONFIGURATION.md](CONFIGURATION.md#feature-flags-optional-off-by-default).
+Non-goals for 1.0: cloud SaaS, automatic file deletion without confirmation, generic streaming-service recommendations, OIDC/local password auth. Multi-user auth, Seerr, and Plex collections are **optional** (off by default); see [CONFIGURATION.md](CONFIGURATION.md#feature-flags-optional-off-by-default).
 
 ---
 
@@ -227,7 +227,7 @@ sequenceDiagram
 
 ### Library sync
 
-Same as Phase 0: `POST /api/library/sync` → JobManager → Plex/Radarr/Sonarr/TMDB → embeddings. See prior sync sequence in git history or run sync and inspect `/api/jobs`.
+`POST /api/library/sync` → JobManager → Plex/Radarr/Sonarr/TMDB → embeddings. Jobs persist under `DATA_DIR/jobs_state.json`; inspect `GET /api/jobs` for phase / percent / message. Interrupted runs after restart are marked failed with a recovery message.
 
 ### Add-to-Radarr confirmation
 
@@ -241,7 +241,7 @@ Two-phase: propose token → user confirm → execute. TTL 600 seconds.
 |-------|--------|-----------|
 | Runtime | Python 3.10+ | Async-friendly, homelab standard |
 | Web | FastAPI + Uvicorn | Typed routes, SSE |
-| Frontend | Vite + React | SPA dual UI without SSR complexity |
+| Frontend | Vite + React | Single-workspace SPA without SSR complexity |
 | Database | SQLite | Zero-ops; single-file backup |
 | Vectors | NumPy + JSON in SQLite | Adequate for home libraries |
 | Container | Multi-stage Docker | Node build + Python slim |
@@ -284,7 +284,7 @@ See [DOCKER.md](DOCKER.md) for Mac Colima, Unraid, and Compose details.
 
 | Topic | Behavior |
 |-------|----------|
-| Authentication | **None by default** — single implicit owner; use trusted LAN or reverse proxy. Optional multi-user auth (`features.multi_user_enabled`) adds Plex/OIDC/local login |
+| Authentication | **None by default** — single implicit owner; use trusted LAN or reverse proxy. Optional multi-user auth (`features.multi_user_enabled`) adds **Plex login** (OIDC/local not shipped in 1.0) |
 | Feature gates | `GET /api/features` exposes enabled flags; auth UI, Seerr, and Plex collection tools stay hidden until opted in |
 | Webhooks | Optional `webhook_secret` / `CURATORX_WEBHOOK_SECRET`; validates `X-CuratorX-Webhook-Secret` when set |
 | Destructive actions | Confirmation tokens for all *arr writes; owner role gates apply when multi-user is on |
@@ -294,24 +294,27 @@ See [DOCKER.md](DOCKER.md) for Mac Colima, Unraid, and Compose details.
 
 ---
 
-## Extension points (Phase 1+)
+## Extension points (1.0+)
 
 | Extension | Status |
 |-----------|--------|
 | Curation lenses | **Implemented** — CRUD, active lens, chat filter |
-| Persona sliders | **Implemented** — DB-backed, hot-reload prompt |
-| Dual UI | **Removed** — single chat workspace (see [WEB_UI.md](WEB_UI.md)) |
+| Persona sliders / presets | **Implemented** — DB-backed, hot-reload prompt |
+| Single chat workspace | **Implemented** — see [WEB_UI.md](WEB_UI.md) |
+| Durable sync jobs | **Implemented** — `jobs_state.json` + restart recovery |
 | Reviews + Plex sync | **Implemented** — personal stars, conflict detection, webhook prompts |
 | Plex webhooks | **Implemented** — near-completion rating queue; optional auth secret |
 | Agent blueprints | Schema present; scheduler wiring **Future** |
 | Interaction telemetry | Schema present; ingestion **Future** |
 | True LLM SSE streaming | **Future** |
+| OIDC / local auth | **Future** (not in 1.0) |
 
 ---
 
 ## Related documentation
 
-- [DESIGN.md](DESIGN.md) — UX, Turnstyle vs Immersive, agent tools
+- [DESIGN.md](DESIGN.md) — UX principles, agent tools
 - [DATA_MODEL.md](DATA_MODEL.md) — SQLite and PRD tables
-- [curatorx_prd.md](curatorx_prd.md) — source PRD
+- [wiki/Home.md](wiki/Home.md) — operator wiki
 - [CONFIGURATION.md](CONFIGURATION.md) — settings reference
+- [FAQ.md](FAQ.md) — common questions

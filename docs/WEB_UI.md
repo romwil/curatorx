@@ -13,7 +13,7 @@ This guide describes what you see after opening CuratorX in a browser — whethe
 3. **Top bar** — You always see **CuratorX**, a small **agent pulse** dot (idle / running / error), library counts like `142 movies · 38 shows` when stats are loaded, and a **Config** link.
 4. **Conversation sidebar** — On the left, past chats are listed. Use **New** to start a fresh thread. On smaller screens, collapse the sidebar with the `«` / `»` toggle.
 5. **Main chat** — The center area is full-width chat: thread title, ambient context tag (e.g. `⧉ Neo-noir exploration`), scrollable messages, and a composer at the bottom.
-6. **Status dock** — Bottom-left corner shows background jobs (library sync, etc.) and add-to-Radarr/Sonarr confirmations — not a center-screen modal.
+6. **Status dock** — Bottom-left (in the chat column) shows background jobs (library sync, etc.) and add-to-Radarr/Sonarr confirmations. Drop a title card onto the dock while dragging to queue an add — the drop hint appears only during drag.
 
 There is **one workspace layout**. The old Turnstyle compact view and Immersive split view are removed.
 
@@ -42,9 +42,9 @@ There is **one workspace layout**. The old Turnstyle compact view and Immersive 
 | **Sidebar** | Thread list only — switch or create conversations |
 | **Chat workspace** | Full-width thread, scroll region, composer |
 | **Status dock** | Running jobs, bulk-add progress, Radarr/Sonarr confirm prompts, drag-to-queue drop target |
-| **Turnstyle overlay** | Optional expand-in-overlay for large title-card result sets |
+| **Results overlay** | Optional expand-in-overlay for large title-card result sets |
 
-**Sync library** lives on the **Config** page (not the main chat sidebar). After onboarding, the maintenance dashboard shows a **Library sync** card with movie/show counts, last sync time, and live job status while a sync runs.
+**Sync library** lives on the **Config** page (not the main chat sidebar). After onboarding, the maintenance dashboard shows a **Library sync** card with movie/show counts, last sync time, and live progress (phase name, friendly detail, percent, and counts) while a sync runs.
 
 ### Single workspace (default)
 
@@ -83,11 +83,11 @@ On `/config` load, the UI fetches certification status and sequentially tests an
 - **Keyboard shortcuts** — Press `?` anywhere outside a text field for the cheat sheet:
   - `/` — focus composer
   - `Cmd/Ctrl+N` — new conversation
-  - `Esc` — close Turnstyle results overlay
+  - `Esc` — close results overlay
 - **Ambient tint** — The workspace background subtly shifts based on inferred conversation context (e.g. neo-noir, 1970s).
 - **Watchlist shelf** — Pin titles from any title card with the ☆ button. Pinned count appears in the top bar; open the list from the sidebar footer or the top-bar chip.
 - **Card hover backdrop** — Hover a title card to see a blurred backdrop image when art is available.
-- **Cinema mode** — In the Turnstyle overlay, toggle **Cinema mode** to enlarge cards and dim surrounding chrome.
+- **Cinema mode** — In the results overlay, toggle **Cinema mode** to enlarge cards and dim surrounding chrome.
 - **TV progress rings** — Show cards display a small ring for watched vs total episodes when that data is available.
 - **Curator streaks** — After three or more conversations in the last 30 days, a subtle streak chip appears in the top bar.
 - **Sync completion chime** — When a library sync job finishes, a short chime plays (toggle mute with the bell in the status dock).
@@ -120,7 +120,7 @@ What changes when you switch presets:
 Presets hot-reload: change persona in Config and return to chat — no server restart needed.
 - Inline **title cards** — poster, rating, genres, `recommendation_reason`, and **Why this?** to expand facet-match detail when the query engine provided it
 - **Confirm all** — bulk Radarr/Sonarr adds via in-chat buttons (not a center modal)
-- **Turnstyle overlay** — horizontal scroll overlay for expanded result sets (`Expand N titles…`); title cards support the same drag-to-dock behavior as inline chat cards
+- **Results overlay** — horizontal scroll overlay for expanded result sets (`Expand N titles…`); title cards support the same drag-to-dock behavior as inline chat cards
 - **Add to Radarr/Sonarr** — confirm in the status dock; server confirmation token required. Drag a movie or show card onto the dock to start the same confirm flow without clicking **Add to Radarr/Sonarr**
 - **Remove from Radarr/Sonarr** — purge/removal proposals use the same status-dock confirm flow with removal-specific copy (not “proposed adds”). Confirm executes the matching pending action type.
 - **Not interested** — `POST /api/preferences` with `dismiss` signal

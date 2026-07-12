@@ -73,9 +73,22 @@ test.describe("Drag title cards to status dock", () => {
     await page.getByTestId("composer-input").waitFor();
   });
 
-  test("shows drop hint when Radarr and Sonarr are connected", async ({ page }) => {
+  test("shows drop hint only while dragging a title card", async ({ page }) => {
     await page.getByTestId("composer-input").fill("recommend titles");
     await page.getByTestId("send-button").click();
+
+    await expect(page.getByTestId("status-dock-drop-hint")).toHaveCount(0);
+
+    const movieCard = page.getByTestId("chat-message-assistant").getByTestId("title-card").first();
+    await expect(movieCard).toContainText("Blade Runner");
+
+    await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="title-card"]');
+      if (!card) throw new Error("title card not found");
+      const dataTransfer = new DataTransfer();
+      dataTransfer.setData("application/x-curatorx-title-card", "{}");
+      card.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer }));
+    });
 
     const hint = page.getByTestId("status-dock-drop-hint");
     await expect(hint).toBeVisible();
@@ -88,6 +101,16 @@ test.describe("Drag title cards to status dock", () => {
 
     const movieCard = page.getByTestId("chat-message-assistant").getByTestId("title-card").first();
     await expect(movieCard).toContainText("Blade Runner");
+
+    // Reveal dock drop target via dragstart, then drop.
+    await page.evaluate(() => {
+      const card = document.querySelector('[data-testid="title-card"]');
+      if (!card) throw new Error("title card not found");
+      const dataTransfer = new DataTransfer();
+      dataTransfer.setData("application/x-curatorx-title-card", "{}");
+      card.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer }));
+    });
+    await expect(page.getByTestId("status-dock")).toBeVisible();
     await dragTitleCardToDock(page, MOCK_MOVIE);
 
     const banner = page.getByTestId("add-action-banner");
@@ -102,6 +125,15 @@ test.describe("Drag title cards to status dock", () => {
 
     const showCard = page.getByTestId("chat-message-assistant").getByTestId("title-card").nth(1);
     await expect(showCard).toContainText("The Wire");
+
+    await page.evaluate(() => {
+      const card = document.querySelectorAll('[data-testid="title-card"]')[1];
+      if (!card) throw new Error("show card not found");
+      const dataTransfer = new DataTransfer();
+      dataTransfer.setData("application/x-curatorx-title-card", "{}");
+      card.dispatchEvent(new DragEvent("dragstart", { bubbles: true, dataTransfer }));
+    });
+    await expect(page.getByTestId("status-dock")).toBeVisible();
     await dragTitleCardToDock(page, MOCK_SHOW);
 
     const banner = page.getByTestId("add-action-banner");

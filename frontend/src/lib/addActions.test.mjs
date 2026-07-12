@@ -58,3 +58,33 @@ test("summarizePendingTokenActions counts mixed action types", () => {
     { add: 1, remove: 1, plex: 1, other: 0 },
   );
 });
+
+test("token confirm copy uses generic actions for mixed tokens", () => {
+  const mixed = [
+    { token: "a", action: "remove_arr" },
+    { token: "b", action: "add_radarr" },
+  ];
+  assert.equal(tokenConfirmPrompt(2, mixed), "Confirm all 2 proposed actions?");
+  assert.equal(tokenConfirmButtonLabel(2, mixed), "Confirm all 2");
+  assert.equal(tokenConfirmSuccessMessage(2, mixed), "Confirmed 2 actions.");
+  assert.equal(tokenConfirmFailureMessage(mixed), "Could not confirm proposed actions.");
+});
+
+test("token confirm copy for single removal and plex-only batches", () => {
+  const oneRemoval = [{ token: "a", action: "remove_arr" }];
+  assert.equal(tokenConfirmPrompt(1, oneRemoval), "Confirm all 1 proposed removal?");
+  assert.equal(tokenConfirmSuccessMessage(1, oneRemoval), "Confirmed 1 removal.");
+
+  const plexOnly = [
+    { token: "a", action: "create_plex_collection" },
+    { token: "b", action: "add_to_plex_collection" },
+  ];
+  assert.equal(tokenConfirmPrompt(2, plexOnly), "Confirm all 2 proposed Plex actions?");
+  assert.equal(tokenConfirmButtonLabel(2, plexOnly), "Confirm all 2 Plex actions");
+});
+
+test("normalizePendingTokens drops empty entries", () => {
+  assert.deepEqual(normalizePendingTokens([null, {}, { token: "ok", action: "remove_arr" }]), [
+    { token: "ok", action: "remove_arr" },
+  ]);
+});

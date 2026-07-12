@@ -616,6 +616,61 @@ export async function mockPlexLogin(page: Page, user = { id: "user-1", display_n
   });
 }
 
+/** Mock GET /api/jobs (and optional library stats) for Config sync progress UI. */
+export async function mockLibrarySyncJobs(
+  page: Page,
+  jobs: Array<Record<string, unknown>> = [],
+  stats: { movies?: number; shows?: number; last_sync?: unknown } | null = {
+    movies: 12,
+    shows: 3,
+    last_sync: null,
+  },
+) {
+  await page.route("**/api/jobs**", async (route: Route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(jobs),
+    });
+  });
+
+  if (stats !== null) {
+    await page.route("**/api/library/stats", async (route: Route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(stats),
+      });
+    });
+  }
+}
+
+export function runningLibrarySyncJob(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "sync-job-1",
+    job_type: "library_sync",
+    status: "running",
+    created_at: Date.now() / 1000,
+    started_at: Date.now() / 1000,
+    finished_at: null,
+    summary: {},
+    progress: {
+      phase: "movies",
+      label: "Scanning movies",
+      current: 120,
+      total: 500,
+      percent: 18,
+      message: "Scanning Plex movies…",
+    },
+    error: null,
+    ...overrides,
+  };
+}
+
 export async function mockReviewConflictChat(page: Page) {
   await page.route("**/api/chat", async (route: Route) => {
     if (route.request().method() !== "POST") {

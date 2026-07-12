@@ -128,6 +128,11 @@ a.app-topbar-link:focus-visible,
   min-height: 0;
   display: flex;
   overflow: hidden;
+  --workspace-sidebar-offset: clamp(200px, 18vw, 240px);
+}
+
+.workspace-body:has(.workspace-sidebar.sidebar-collapsed) {
+  --workspace-sidebar-offset: 48px;
 }
 
 .workspace-sidebar {
@@ -408,14 +413,18 @@ a.app-topbar-link:focus-visible,
 
 .status-dock {
   position: fixed;
-  left: 16px;
-  bottom: 16px;
+  /* Sit in the chat column, clear of the sidebar rail */
+  left: max(12px, calc(var(--workspace-sidebar-offset, 220px) + 12px));
+  bottom: max(16px, env(safe-area-inset-bottom, 0px));
   z-index: 50;
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  gap: 10px;
-  width: min(380px, calc(100vw - 32px));
+  gap: 8px;
+  width: min(360px, calc(100vw - var(--workspace-sidebar-offset, 220px) - 28px));
+  max-height: min(42vh, calc(100vh - 140px));
+  overflow-x: hidden;
+  overflow-y: auto;
   pointer-events: none;
 }
 
@@ -449,10 +458,13 @@ a.app-topbar-link:focus-visible,
 .status-dock-job-body {
   display: grid;
   gap: 2px;
+  min-width: 0;
 }
 
 .status-dock-job-label {
   font-weight: 500;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .status-dock-job-time {
@@ -495,15 +507,35 @@ a.app-topbar-link:focus-visible,
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
+.status-dock-drop-target {
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px dashed var(--accent);
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+
 .status-dock-drop-hint {
   margin: 0;
   font-size: 12px;
+  line-height: 1.35;
   color: var(--muted);
 }
 
+.status-dock-drop-hint-inline {
+  margin-top: 4px;
+  display: block;
+}
+
+.status-dock.drop-ready .status-dock-drop-target,
 .status-dock.drop-active {
   outline: 1px dashed var(--accent);
   outline-offset: 2px;
+}
+
+.status-dock.drop-active .status-dock-drop-target {
+  border-color: var(--accent);
+  background: rgba(110, 168, 255, 0.08);
 }
 
 .library-health-grid {
@@ -511,6 +543,46 @@ a.app-topbar-link:focus-visible,
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
   margin-top: 12px;
+}
+
+.library-sync-progress {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-elevated, var(--surface));
+  display: grid;
+  gap: 6px;
+}
+
+.library-sync-progress-headline {
+  margin: 0;
+  font-size: 14px;
+}
+
+.library-sync-progress-detail {
+  margin: 0;
+  font-size: 13px;
+}
+
+.library-sync-progress-bar {
+  margin-top: 4px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.library-sync-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  transition: width 0.25s ease;
+}
+
+.status.status-error {
+  color: var(--danger, #ff6b6b);
 }
 
 .library-health-metric {
@@ -2188,6 +2260,7 @@ button.ghost.inline-link {
   }
 
   .status-dock {
+    --workspace-sidebar-offset: 0px;
     width: min(340px, calc(100vw - 24px));
     left: 12px;
     bottom: 12px;

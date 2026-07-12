@@ -38,6 +38,7 @@ import {
   tokenConfirmSuccessMessage,
 } from "./lib/addActions.js";
 import { blendAmbientAccent } from "./lib/ambientAccent.js";
+import { createId } from "./lib/id.js";
 import { executeSlashCommand, parseSlashCommand } from "./lib/slashCommands.js";
 import {
   createKonamiTracker,
@@ -439,7 +440,7 @@ export default function App() {
     setMessages((prev) => [
       ...prev,
       {
-        id: crypto.randomUUID(),
+        id: createId(),
         role: "error",
         blocks: [{ type: "error", content: message }],
       },
@@ -451,7 +452,7 @@ export default function App() {
     setLoading(true);
     setChatError("");
     const userMessage = {
-      id: crypto.randomUUID(),
+      id: createId(),
       role: "user",
       blocks: [{ type: "text", content: text }],
     };
@@ -464,7 +465,7 @@ export default function App() {
       setMessages((prev) => [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: createId(),
           role: "assistant",
           blocks: [{ type: "text", content: easterEggResponse("reversed_name", curatorName) }],
         },
@@ -985,7 +986,7 @@ export default function App() {
                     setMessages((prev) => [
                       ...prev,
                       {
-                        id: crypto.randomUUID(),
+                        id: createId(),
                         role: "assistant",
                         blocks: [{ type: "text", content: easterEggResponse(kind, name) }],
                       },
