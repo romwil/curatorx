@@ -15,7 +15,7 @@ No. **1.0 is a single workspace**: sidebar conversations + full-width chat + sta
 | Tag | When |
 |-----|------|
 | `romwil/curatorx:1.0` | Everyday Unraid / Compose |
-| `romwil/curatorx:1.0.0` | Pin an exact release |
+| `romwil/curatorx:1.0.1` | Pin an exact release |
 | `romwil/curatorx:latest` | Newest stable |
 
 Images are multi-arch (**amd64 + arm64**). See [wiki/Installation.md](wiki/Installation.md).
@@ -61,4 +61,4 @@ CuratorX is a **taste-aware curator** (RAG, lenses, persona, purge advice, confi
 - [wiki/Home.md](wiki/Home.md) — wiki index
 - [ONBOARDING.md](ONBOARDING.md) — first-run wizard
 - [TROUBLESHOOTING via wiki](wiki/Troubleshooting.md) — common failures
-- [CHANGELOG.md](../CHANGELOG.md) — 1.0.0 notes
+- [CHANGELOG.md](../CHANGELOG.md) — release notes

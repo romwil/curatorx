@@ -1,58 +1,60 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-
-const SCROLL_PADDING = 16;
-const NEW_REPLY_THRESHOLD_PX = 120;
+import {
+  CHAT_SCROLL_PADDING,
+  computeFollowScrollTop,
+  isScrolledAwayFromBottom,
+} from "../lib/chatScroll.js";
 
 export default function useChatScroll({ messages, loading, sessionId }) {
   const scrollRef = useRef(null);
   const prevSessionRef = useRef(sessionId);
   const prevCountRef = useRef(0);
+  const followingRef = useRef(true);
   const [showNewReplyChip, setShowNewReplyChip] = useState(false);
 
   const isScrolledUp = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return false;
-    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    return distanceFromBottom > NEW_REPLY_THRESHOLD_PX;
+    return isScrolledAwayFromBottom({
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+      clientHeight: el.clientHeight,
+    });
   }, []);
 
   const scrollToBottom = useCallback((behavior = "auto") => {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior });
+    followingRef.current = true;
     setShowNewReplyChip(false);
   }, []);
 
-  const scrollToMessage = useCallback((messageId, block = "start", behavior = "smooth") => {
+  /**
+   * Keep the latest user question near the top of the viewport so the
+   * assistant reply (or typing indicator) can grow beneath it without
+   * yanking the question off-screen.
+   */
+  const scrollToLatestTurn = useCallback((behavior = "smooth") => {
     const el = scrollRef.current;
     if (!el) return;
-    const node = el.querySelector(`[data-message-id="${messageId}"]`);
-    if (!node) {
+
+    const userNodes = el.querySelectorAll('[data-message-role="user"]');
+    const userNode = userNodes.length ? userNodes[userNodes.length - 1] : null;
+    if (!userNode) {
       scrollToBottom(behavior);
       return;
     }
 
-    const nodeTop = node.offsetTop;
-    const nodeBottom = nodeTop + node.offsetHeight;
-
-    if (block === "end") {
-      el.scrollTo({ top: Math.max(0, nodeBottom - el.clientHeight + SCROLL_PADDING), behavior });
-      return;
-    }
-
-    if (block === "anchor") {
-      const userNodes = el.querySelectorAll('[data-message-role="user"]');
-      const prevUser = userNodes.length ? userNodes[userNodes.length - 1] : null;
-      if (prevUser) {
-        const userBottom = prevUser.offsetTop + prevUser.offsetHeight;
-        const minScroll = userBottom - el.clientHeight + SCROLL_PADDING;
-        const targetScroll = Math.min(nodeTop - SCROLL_PADDING, Math.max(minScroll, 0));
-        el.scrollTo({ top: Math.max(0, targetScroll), behavior });
-        return;
-      }
-    }
-
-    el.scrollTo({ top: Math.max(0, nodeTop - SCROLL_PADDING), behavior });
+    const top = computeFollowScrollTop({
+      viewportHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+      userTop: userNode.offsetTop,
+      padding: CHAT_SCROLL_PADDING,
+    });
+    el.scrollTo({ top, behavior });
+    followingRef.current = true;
+    setShowNewReplyChip(false);
   }, [scrollToBottom]);
 
   useEffect(() => {
@@ -60,19 +62,26 @@ export default function useChatScroll({ messages, loading, sessionId }) {
     if (!el) return undefined;
 
     function handleScroll() {
-      if (!isScrolledUp()) {
+      const away = isScrolledAwayFromBottom({
+        scrollHeight: el.scrollHeight,
+        scrollTop: el.scrollTop,
+        clientHeight: el.clientHeight,
+      });
+      followingRef.current = !away;
+      if (!away) {
         setShowNewReplyChip(false);
       }
     }
 
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
-  }, [isScrolledUp]);
+  }, []);
 
   useEffect(() => {
     if (prevSessionRef.current !== sessionId) {
       prevSessionRef.current = sessionId;
       prevCountRef.current = messages.length;
+      followingRef.current = true;
       setShowNewReplyChip(false);
       requestAnimationFrame(() => scrollToBottom("auto"));
     }
@@ -90,35 +99,33 @@ export default function useChatScroll({ messages, loading, sessionId }) {
     if (!isNewMessage && !loading) return;
 
     const last = messages[count - 1];
-    const wasScrolledUp = isScrolledUp();
-    prevCountRef.current = count;
+    // Capture follow state before the DOM grows from the new message / typing row.
+    const wasFollowing = followingRef.current && !isScrolledUp();
+    if (isNewMessage) {
+      prevCountRef.current = count;
+    }
 
     requestAnimationFrame(() => {
+      if (!wasFollowing) {
+        // User scrolled up intentionally — soft affordance only.
+        if (isNewMessage || loading) {
+          setShowNewReplyChip(true);
+        }
+        return;
+      }
+
+      // Following: pin the latest user turn near the top so the question
+      // stays visible while the reply / typing indicator grows below.
+      if (isNewMessage && (last.role === "user" || last.role === "assistant" || last.role === "error")) {
+        scrollToLatestTurn("smooth");
+        return;
+      }
+
       if (loading) {
-        if (wasScrolledUp) {
-          setShowNewReplyChip(true);
-        } else {
-          scrollToBottom("smooth");
-        }
-        return;
-      }
-      if (isNewMessage && last.role === "user") {
-        if (wasScrolledUp) {
-          setShowNewReplyChip(true);
-        } else {
-          scrollToMessage(last.id, "end");
-        }
-        return;
-      }
-      if (isNewMessage && last.role === "assistant") {
-        if (wasScrolledUp) {
-          setShowNewReplyChip(true);
-        } else {
-          scrollToMessage(last.id, "anchor");
-        }
+        scrollToLatestTurn("smooth");
       }
     });
-  }, [messages, loading, scrollToMessage, scrollToBottom, isScrolledUp]);
+  }, [messages, loading, scrollToLatestTurn, isScrolledUp]);
 
-  return { scrollRef, showNewReplyChip, scrollToBottom };
+  return { scrollRef, showNewReplyChip, scrollToBottom, scrollToLatestTurn };
 }

@@ -6,6 +6,7 @@ const MOCK_SECTIONS = [
 ];
 
 const certifiedServices = new Set<string>();
+let forceWizardIncomplete = false;
 
 type MockThread = {
   id: string;
@@ -54,9 +55,15 @@ function ensureMockThread(sessionId: string, title = "New conversation") {
 
 export function resetMockCertifications() {
   certifiedServices.clear();
+  forceWizardIncomplete = false;
   mockThreads.clear();
   mockMessages.clear();
   mockFeedback.clear();
+}
+
+/** Keep Config in the onboarding wizard even when the shared e2e server already completed setup. */
+export function setForceWizardIncomplete(value = true) {
+  forceWizardIncomplete = value;
 }
 
 function certificationEntry(certified: boolean) {
@@ -298,6 +305,15 @@ export async function mockCuratorApis(page: Page) {
     }
     if (certifiedServices.has("sonarr")) {
       body.steps.infrastructure.sonarr_verified = true;
+    }
+
+    if (forceWizardIncomplete) {
+      body.onboarding_complete = false;
+      if (body.current_step === -1) {
+        if (!body.steps?.identity_seed?.complete) body.current_step = 0;
+        else if (!body.steps?.infrastructure?.complete) body.current_step = 1;
+        else body.current_step = 2;
+      }
     }
 
     await route.fulfill({

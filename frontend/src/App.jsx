@@ -134,7 +134,7 @@ export default function App() {
     }
   });
 
-  const { scrollRef, showNewReplyChip, scrollToBottom } = useChatScroll({
+  const { scrollRef, showNewReplyChip, scrollToLatestTurn } = useChatScroll({
     messages,
     loading,
     sessionId: activeSessionId,
@@ -960,7 +960,7 @@ export default function App() {
               onReviewConflictResolved={handleReviewConflictResolved}
             />
             {loading ? <TypingIndicator label={typingLabel || `${curatorName} is thinking`} /> : null}
-            <NewReplyChip visible={showNewReplyChip} onClick={() => scrollToBottom("smooth")} />
+            <NewReplyChip visible={showNewReplyChip} onClick={() => scrollToLatestTurn("smooth")} />
           </div>
 
           <form

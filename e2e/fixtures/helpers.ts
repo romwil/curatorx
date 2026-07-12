@@ -1,9 +1,14 @@
 import type { APIRequestContext } from "@playwright/test";
 
-const baseURL = process.env.E2E_BASE_URL || `http://127.0.0.1:${process.env.E2E_PORT || "8788"}`;
+function e2eBaseURL() {
+  return process.env.E2E_BASE_URL || `http://127.0.0.1:${process.env.E2E_PORT || "8788"}`;
+}
 
 export async function resetOnboarding(request: APIRequestContext, complete = false) {
-  await request.put(`${baseURL}/api/settings`, {
+  // Note: once onboarding_complete is true, the API preserves it (merge_secret_fields).
+  // Wizard tests should open the UI via "Re-run onboarding wizard" when needed.
+  // Setup-banner tests should mock /api/setup/status instead of relying on this flag alone.
+  await request.put(`${e2eBaseURL()}/api/settings`, {
     data: {
       onboarding_complete: complete,
       plex_url: "",
@@ -24,10 +29,10 @@ export async function resetOnboarding(request: APIRequestContext, complete = fal
 }
 
 export async function completeOnboardingViaApi(request: APIRequestContext) {
-  await request.put(`${baseURL}/api/persona`, {
+  await request.put(`${e2eBaseURL()}/api/persona`, {
     data: { curator_name: "Test Curator" },
   });
-  await request.put(`${baseURL}/api/settings`, {
+  await request.put(`${e2eBaseURL()}/api/settings`, {
     data: {
       onboarding_complete: true,
       llm_provider: "openai",

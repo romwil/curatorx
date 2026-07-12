@@ -22,4 +22,4 @@ In-repo documentation for operators deploying CuratorX 1.0 on Docker or Unraid.
 - [../WEB_UI.md](../WEB_UI.md) — single workspace UI
 - [../DOCKER.md](../DOCKER.md) — Mac / Compose / Unraid notes
 - [../TESTING.md](../TESTING.md) — CA release test checklist
-- [../../CHANGELOG.md](../../CHANGELOG.md) — 1.0.0 release notes
+- [../../CHANGELOG.md](../../CHANGELOG.md) — release notes

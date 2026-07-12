@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { mockCuratorApis, mockServiceFailure, resetMockCertifications } from "./fixtures/api-mocks";
+import { mockCuratorApis, mockServiceFailure, resetMockCertifications, setForceWizardIncomplete } from "./fixtures/api-mocks";
 import { resetOnboarding } from "./fixtures/helpers";
 import { certifyInfrastructureStep } from "./fixtures/selectors";
 
@@ -11,6 +11,7 @@ async function goToInfrastructureStep(page: import("@playwright/test").Page) {
 test.describe("Config onboarding wizard", () => {
   test.beforeEach(async ({ page, request }) => {
     resetMockCertifications();
+    setForceWizardIncomplete(true);
     await resetOnboarding(request, false);
     await mockCuratorApis(page);
     await page.goto("/config");

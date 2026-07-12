@@ -2,6 +2,17 @@
 
 All notable changes to CuratorX are documented in this file.
 
+## [1.0.1] — 2026-07-12
+
+Patch for Community Applications: chat scroll pins the latest user turn while replies grow, plus e2e onboarding isolation when a shared server already completed setup.
+
+### Changed
+- Chat scroll follows the latest user turn near the top of the viewport (instead of yanking to absolute bottom) so questions stay visible while the assistant reply / typing indicator grows
+- Wizard and setup-banner e2e suites force incomplete onboarding via mocks so they stay reliable against a shared e2e server
+
+### Fixed
+- E2E onboarding isolation when `onboarding_complete` cannot be unset by the API
+
 ## [1.0.0] — 2026-07-12
 
 Community Applications–ready release: single chat workspace, durable library sync jobs, and Unraid/Docker Hub images.

@@ -1,12 +1,19 @@
 import { expect, test } from "@playwright/test";
-import { mockCuratorApis, resetMockCertifications } from "./fixtures/api-mocks";
-import { resetOnboarding } from "./fixtures/helpers";
+import {
+  mockCuratorApis,
+  mockSetupStatus,
+  resetMockCertifications,
+  setForceWizardIncomplete,
+} from "./fixtures/api-mocks";
 
 test.describe("Setup incomplete banner", () => {
-  test.beforeEach(async ({ page, request }) => {
+  test.beforeEach(async ({ page }) => {
     resetMockCertifications();
-    await resetOnboarding(request, false);
+    setForceWizardIncomplete(true);
     await mockCuratorApis(page);
+    // Mock status so this suite stays isolated when a shared e2e server already
+    // completed onboarding (API refuses to unset onboarding_complete).
+    await mockSetupStatus(page, { onboardingComplete: false });
     await page.goto("/");
     await page.getByTestId("composer-input").waitFor();
   });

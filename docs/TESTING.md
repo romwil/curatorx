@@ -84,7 +84,9 @@ If you already have Docker running on port 8788, Playwright reuses it locally (`
 | `e2e/live.spec.ts` | Opt-in real-stack smoke (`CURATORX_E2E_LIVE=1`) |
 
 Mocked suites intercept `/api/chat`, `/api/setup/test/*`, `/api/plex/sections`, `/api/features`,
-`/api/auth/*`, and (for sync UI) `/api/jobs` so CI passes without Anthropic or Plex credentials.
+`/api/auth/*`, `/api/setup/status`, and (for sync UI) `/api/jobs` so CI passes without Anthropic or
+Plex credentials. Wizard/setup-banner suites use `setForceWizardIncomplete` so a shared e2e server
+that already finished onboarding still shows the wizard (the API preserves `onboarding_complete`).
 
 ## Live service integrations (optional)
 

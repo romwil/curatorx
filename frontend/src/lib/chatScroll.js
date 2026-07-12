@@ -1,0 +1,47 @@
+/** Padding (px) between the pinned user message and the top of the viewport. */
+export const CHAT_SCROLL_PADDING = 16;
+
+/**
+ * Distance from the bottom (px) below which we treat the user as "following"
+ * the conversation (auto-scroll allowed).
+ */
+export const NEW_REPLY_THRESHOLD_PX = 120;
+
+/**
+ * Compute scrollTop so the latest user turn stays near the top of the viewport
+ * while as much of the reply below it as practical remains visible.
+ *
+ * Priority when the reply is long:
+ * 1. Keep the user message visible (pinned near top)
+ * 2. Show the start of the assistant reply beneath it
+ * 3. Do not yank so hard that the question scrolls off
+ *
+ * @param {{ viewportHeight: number, scrollHeight: number, userTop: number, padding?: number }} opts
+ * @returns {number}
+ */
+export function computeFollowScrollTop({
+  viewportHeight,
+  scrollHeight,
+  userTop,
+  padding = CHAT_SCROLL_PADDING,
+}) {
+  const maxScroll = Math.max(0, scrollHeight - viewportHeight);
+  // Pin the user message near the top so the reply can grow below it.
+  const pinUserNearTop = Math.max(0, userTop - padding);
+  // Never scroll past the end of the thread.
+  return Math.min(pinUserNearTop, maxScroll);
+}
+
+/**
+ * True when the user has scrolled up far enough that we should not force-scroll.
+ * @param {{ scrollHeight: number, scrollTop: number, clientHeight: number, threshold?: number }} opts
+ */
+export function isScrolledAwayFromBottom({
+  scrollHeight,
+  scrollTop,
+  clientHeight,
+  threshold = NEW_REPLY_THRESHOLD_PX,
+}) {
+  const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+  return distanceFromBottom > threshold;
+}
